@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"ai-gateway/internal/catalog"
 	"ai-gateway/internal/db"
+	"ai-gateway/internal/middleware"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -24,15 +26,19 @@ func (h *CatalogHandler) Routes(r chi.Router) {
 	r.Get("/catalog/by-id", h.GetByQuery)
 	r.Get("/catalog/{id}", h.Get)
 	r.Get("/catalog/*", h.GetWildcard)
-	r.Post("/sync", h.Sync)
+	// Mutating catalog routes are admin-only: without this gate even
+	// "readonly" could trigger upstream syncs, rewrite aliases and edit
+	// system settings.
+	r.With(middleware.RequireRole("admin")).Post("/sync", h.Sync)
 	r.Get("/status", h.Status)
 	// aliases
 	r.Get("/aliases", h.ListAliases)
-	r.Post("/aliases", h.CreateAlias)
-	r.Delete("/aliases/{alias}", h.DeleteAlias)
+	r.With(middleware.RequireRole("admin")).Post("/aliases", h.CreateAlias)
+	r.With(middleware.RequireRole("admin")).Delete("/aliases/{alias}", h.DeleteAlias)
 	// settings
 	r.Get("/settings", h.GetSettings)
-	r.Put("/settings", h.PutSettings)
+	r.With(middleware.RequireRole("admin")).Put("/settings", h.PutSettings)
+	r.With(middleware.RequireRole("admin")).Delete("/settings/{key}", h.DeleteSetting)
 }
 
 func (h *CatalogHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +192,12 @@ func (h *CatalogHandler) DeleteAlias(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+// internalSettingKey reports keys managed by the system itself that must not
+// be surfaced as editable rows (or overwritten via the settings API).
+func internalSettingKey(k string) bool {
+	return strings.HasPrefix(k, "models_") || strings.HasPrefix(k, "_")
+}
+
 func (h *CatalogHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	rows, _ := h.DB.Query(`SELECT key, value FROM system_config`)
 	out := map[string]string{}
@@ -194,6 +206,9 @@ func (h *CatalogHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var k, v string
 			rows.Scan(&k, &v)
+			if internalSettingKey(k) {
+				continue
+			}
 			out[k] = v
 		}
 	}
@@ -212,12 +227,38 @@ func (h *CatalogHandler) PutSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"too many keys"}`, 400)
 		return
 	}
+	skipped := []string{}
 	for k, v := range body {
+		if internalSettingKey(k) {
+			skipped = append(skipped, k)
+			continue
+		}
 		if len(k) > 128 || len(v) > 4096 {
+			skipped = append(skipped, k)
 			continue
 		}
 		h.DB.Exec(db.Q(`INSERT INTO system_config(key,value,updated_at) VALUES(?,?,?)`)+db.UpsertEnd([]string{"key"}, []string{"value", "updated_at"}), k, v, time.Now().UTC())
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(body)
+	json.NewEncoder(w).Encode(map[string]any{"saved": len(body) - len(skipped), "skipped": skipped})
+}
+
+// DeleteSetting removes a key from system_config. Previously PUT only
+// upserted, so "Remove → Save" in the dashboard silently resurrected the key
+// on reload; removals now have a real endpoint the UI calls per key.
+func (h *CatalogHandler) DeleteSetting(w http.ResponseWriter, r *http.Request) {
+	key := chi.URLParam(r, "key")
+	if key == "" || internalSettingKey(key) {
+		http.Error(w, `{"error":"invalid key"}`, 400)
+		return
+	}
+	if len(key) > 128 {
+		http.Error(w, `{"error":"invalid key"}`, 400)
+		return
+	}
+	if _, err := h.DB.Exec(db.Q(`DELETE FROM system_config WHERE key=?`), key); err != nil {
+		http.Error(w, `{"error":"delete failed"}`, 500)
+		return
+	}
+	w.WriteHeader(204)
 }

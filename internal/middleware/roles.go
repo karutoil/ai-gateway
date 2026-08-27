@@ -50,31 +50,13 @@ func RequireRole(roles ...string) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			// Special handling: member can do most writes, but not org deletion unless admin
-			if role == "member" {
-				// Member cannot delete orgs
-				if r.Method == http.MethodDelete && contains(r.URL.Path, "/orgs/") {
-					log.Warn().Str("role", role).Str("path", r.URL.Path).Msg("RequireRole: forbid member org delete")
-					http.Error(w, `{"error":{"message":"forbidden: member cannot delete organization","type":"permission_error"}}`, http.StatusForbidden)
-					return
-				}
-				// Member allowed for other endpoints
-				next.ServeHTTP(w, r)
-				return
-			}
+			// SECURITY: no implicit fall-through. A role passes only when it
+			// is explicitly listed (admin is always allowed). The previous
+			// "member can do most writes" special case let members through
+			// every admin-only gate (routing rules, discovery, org writes,
+			// settings), which was a privilege-escalation hole.
 			log.Warn().Str("role", role).Strs("required", roles).Str("path", r.URL.Path).Msg("RequireRole: forbid")
 			http.Error(w, `{"error":{"message":"forbidden: insufficient role","type":"permission_error"}}`, http.StatusForbidden)
 		})
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (func() bool {
-		for i := 0; i <= len(s)-len(substr); i++ {
-			if s[i:i+len(substr)] == substr {
-				return true
-			}
-		}
-		return false
-	})()
 }

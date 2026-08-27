@@ -113,6 +113,15 @@ type SessionChecker interface {
 	TokenVersionFor(subject string) (int64, bool)
 }
 
+// RoleResolver is an optional SessionChecker extension: when the checker can
+// resolve a subject's live role, middleware uses the STORED role instead of
+// the token claim. This closes two holes: (1) an external OIDC id_token whose
+// "role" claim says "admin" must never grant admin, and (2) role changes take
+// effect immediately without waiting for token expiry.
+type RoleResolver interface {
+	RoleFor(subject string) (string, bool)
+}
+
 // AdminMiddleware authenticates dashboard JWTs with fail-closed defaults:
 //   - tokens must carry a valid role claim; unknown/empty roles are rejected
 //   - when checker is non-nil, the subject must still exist and the token's
@@ -191,6 +200,12 @@ func adminMiddleware(secret []byte, checker SessionChecker) func(http.Handler) h
 				if !exists || tv != current {
 					http.Error(w, `{"error":"session revoked"}`, http.StatusUnauthorized)
 					return
+				}
+				// Live role always wins over the claim when resolvable.
+				if resolver, ok := checker.(RoleResolver); ok {
+					if storedRole, found := resolver.RoleFor(subject); found && ValidTokenRoles[storedRole] {
+						role = storedRole
+					}
 				}
 			}
 			ctx := context.WithValue(r.Context(), contextKeyOrgID, orgID)
@@ -306,17 +321,15 @@ func VerifyOIDCToken(tokenStr, expectedIssuer string) (jwt.MapClaims, error) {
 	return jwt.MapClaims(claims), nil
 }
 
+// GetOrgID returns the caller's org scope from the VERIFIED JWT claim only.
+// SECURITY: never fall back to client-supplied headers (X-Org /
+// X-Organization-Id) — that let any authenticated caller spoof another
+// tenant's scope and read/mutate its data.
 func GetOrgID(r *http.Request) string {
 	if v := r.Context().Value(contextKeyOrgID); v != nil {
 		if s, ok := v.(string); ok && s != "" {
 			return s
 		}
-	}
-	if org := r.Header.Get("X-Org"); org != "" {
-		return org
-	}
-	if org := r.Header.Get("X-Organization-Id"); org != "" {
-		return org
 	}
 	return ""
 }

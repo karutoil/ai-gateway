@@ -347,6 +347,32 @@ func (s *Store) TokenVersionFor(subject string) (int64, bool) {
 	return v, true
 }
 
+// RoleFor implements auth.RoleResolver: it reports the user's CURRENT stored
+// role so middleware never has to trust a role claim (in particular one that
+// arrived inside an external OIDC token). exists=false when the user is
+// missing or disabled — callers fail closed.
+func (s *Store) RoleFor(subject string) (string, bool) {
+	var role string
+	var disabled int
+	err := s.db.QueryRow(db.Q(`SELECT role, COALESCE(disabled,0) FROM dashboard_users WHERE username=?`), strings.ToLower(subject)).Scan(&role, &disabled)
+	if err != nil || disabled == 1 {
+		return "", false
+	}
+	return role, true
+}
+
+// PrimaryOrgID returns the user's first org membership (the org claim minted
+// into dashboard JWTs). Missing memberships table or no membership → "".
+// Control-plane traffic is low-volume, so a direct query per mint is fine.
+func (s *Store) PrimaryOrgID(userID string) string {
+	var orgID string
+	err := s.db.QueryRow(db.Q(`SELECT org_id FROM memberships WHERE user_id=? ORDER BY created_at ASC LIMIT 1`), userID).Scan(&orgID)
+	if err != nil {
+		return ""
+	}
+	return orgID
+}
+
 func (s *Store) VerifyPassword(username, password string) (*DashboardUser, bool) {
 	u, hash, err := s.GetByUsername(username)
 	if err != nil || u.Disabled {
@@ -366,6 +392,13 @@ func (s *Store) VerifyPassword(username, password string) (*DashboardUser, bool)
 // token_version (the just-presented credential stays valid).
 func (s *Store) UpgradePasswordHash(id, password string) error {
 	_, err := s.db.Exec(db.Q(`UPDATE dashboard_users SET password_hash=? WHERE id=?`), auth.HashPassword(password), id)
+	return err
+}
+
+// BumpTokenVersion revokes every outstanding session for the user (dashboard
+// JWTs and proxy-plane session tokens carry the old version).
+func (s *Store) BumpTokenVersion(id string) error {
+	_, err := s.db.Exec(db.Q(`UPDATE dashboard_users SET token_version=COALESCE(token_version,0)+1, updated_at=? WHERE id=?`), time.Now().UTC(), id)
 	return err
 }
 

@@ -162,8 +162,20 @@ func (h *OrgHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	if body.Role == "" {
 		body.Role = "member"
 	}
-	if body.Role != "admin" && body.Role != "member" && body.Role != "readonly" {
-		http.Error(w, `{"error":{"message":"role must be admin|member|readonly","type":"invalid_request_error"}}`, http.StatusBadRequest)
+	if body.Role != "admin" && body.Role != "member" && body.Role != "support" && body.Role != "readonly" {
+		http.Error(w, `{"error":{"message":"role must be admin|member|support|readonly","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		return
+	}
+	// Validate the target user exists (prevents ghost memberships that can
+	// never resolve to a JWT org claim) and reject duplicates.
+	var ucnt int
+	if err := h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM dashboard_users WHERE id=?`), body.UserID).Scan(&ucnt); err != nil || ucnt == 0 {
+		http.Error(w, `{"error":{"message":"user not found","type":"not_found_error"}}`, http.StatusNotFound)
+		return
+	}
+	var dup int
+	if err := h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM memberships WHERE org_id=? AND user_id=?`), orgID, body.UserID).Scan(&dup); err == nil && dup > 0 {
+		http.Error(w, `{"error":{"message":"user is already a member of this organization","type":"invalid_request_error"}}`, http.StatusConflict)
 		return
 	}
 	if h.Recorder != nil {

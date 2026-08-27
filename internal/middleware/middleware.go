@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/models"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
@@ -144,8 +146,16 @@ func GatewayAuth(store *apikey.Store) func(http.Handler) http.Handler {
 
 // GatewayAuthWithJWT accepts sk-gw-* keys and, when jwtSecret is set, admin session JWTs
 // (Playground logged-in user). Session tokens never bypass provider routing; they only
-// authenticate the gateway hop.
+// authenticate the gateway hop. No revocation checking (tests).
 func GatewayAuthWithJWT(store *apikey.Store, jwtSecret []byte) func(http.Handler) http.Handler {
+	return GatewayAuthWithJWTRevocation(store, jwtSecret, nil)
+}
+
+// GatewayAuthWithJWTRevocation is the production entry point: JWT-shaped
+// tokens are additionally validated against the live user table, so revoked
+// (password-changed, disabled, deleted) dashboard users lose proxy access
+// immediately instead of at token expiry.
+func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker auth.SessionChecker) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodOptions {
@@ -197,6 +207,17 @@ func GatewayAuthWithJWT(store *apikey.Store, jwtSecret []byte) func(http.Handler
 					if v, ok := claims["org_id"].(string); ok {
 						orgID = v
 					}
+					// Revocation: mirror the dashboard middleware — a session
+					// whose token_version no longer matches (password change,
+					// role change, disable, delete) must not keep spending
+					// provider quota until expiry.
+					if checker != nil {
+						current, exists := checker.TokenVersionFor(subject)
+						if !exists || claimsTV(claims) != current {
+							http.Error(w, `{"error":{"message":"session revoked","type":"authentication_error"}}`, http.StatusUnauthorized)
+							return
+						}
+					}
 					key := sessionGatewayKey(subject, orgID)
 					attachGatewayKey(next, w, r, key)
 					return
@@ -246,4 +267,22 @@ func sessionPrefix(subject string) string {
 		out = "admin"
 	}
 	return "sess" + out
+}
+
+// claimsTV extracts the token_version claim ("tv") from a dashboard JWT.
+func claimsTV(claims jwt.MapClaims) int64 {
+	if raw, ok := claims["tv"]; ok {
+		switch n := raw.(type) {
+		case float64:
+			return int64(n)
+		case int64:
+			return n
+		case int:
+			return int64(n)
+		case json.Number:
+			i, _ := n.Int64()
+			return i
+		}
+	}
+	return 0
 }

@@ -50,20 +50,22 @@ func (h *AdminHandler) Routes(r chi.Router) {
 	}
 	r.Post("/auth/logout", h.Logout)
 	r.Get("/health", h.Health)
-	// protected
+	// protected — WithRevocation so password/role/disable changes invalidate
+	// outstanding sessions on THIS route group too (previously only group B
+	// of the dashboard API checked revocation).
 	r.Group(func(r chi.Router) {
-		r.Use(auth.AdminMiddleware(h.Config.JWTSecret))
+		r.Use(auth.AdminMiddlewareWithRevocation(h.Config.JWTSecret, h.UserStore))
 		r.Get("/providers", h.ListProviders)
-		r.With(middleware.RequireRole("admin", "member")).Post("/providers", h.CreateProvider)
-		r.With(middleware.RequireRole("admin", "member")).Delete("/providers/{id}", h.DeleteProvider)
-		r.With(middleware.RequireRole("admin", "member", "readonly")).Post("/providers/test", h.TestProvider)
+		r.With(middleware.RequireRole("admin", "member", "support")).Post("/providers", h.CreateProvider)
+		r.With(middleware.RequireRole("admin", "member", "support")).Delete("/providers/{id}", h.DeleteProvider)
+		r.With(middleware.RequireRole("admin", "member", "support", "readonly")).Post("/providers/test", h.TestProvider)
 
 		r.Get("/keys", h.ListKeys)
-		r.With(middleware.RequireRole("admin", "member")).Post("/keys", h.CreateKey)
-		r.With(middleware.RequireRole("admin", "member")).Put("/keys/{id}", h.UpdateKey)
-		r.With(middleware.RequireRole("admin", "member")).Delete("/keys/{id}", h.DeleteKey)
-		r.With(middleware.RequireRole("admin", "member")).Put("/keys/{id}/rate-limit", h.UpdateKeyRateLimit)
-		r.With(middleware.RequireRole("admin", "member")).Put("/keys/{id}/limits", h.UpdateKeyLimits)
+		r.With(middleware.RequireRole("admin", "member", "support")).Post("/keys", h.CreateKey)
+		r.With(middleware.RequireRole("admin", "member", "support")).Put("/keys/{id}", h.UpdateKey)
+		r.With(middleware.RequireRole("admin", "member", "support")).Delete("/keys/{id}", h.DeleteKey)
+		r.With(middleware.RequireRole("admin", "member", "support")).Put("/keys/{id}/rate-limit", h.UpdateKeyRateLimit)
+		r.With(middleware.RequireRole("admin", "member", "support")).Put("/keys/{id}/limits", h.UpdateKeyLimits)
 		r.Get("/stats", h.Stats)
 		r.Get("/logs", h.Logs)
 		r.Get("/logs/{id}", h.GetLog)
@@ -81,6 +83,17 @@ func (h *AdminHandler) Health(w http.ResponseWriter, r *http.Request) {
 // credential changes covers the abuse window.
 func (h *AdminHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	clearSessionCookie(w, r)
+	// Best-effort session revocation: bump the user's token_version so the
+	// just-logged-out JWT (and any copies) stop working on both the dashboard
+	// and the proxy plane, instead of living until expiry. Stateless-JWT
+	// logouts previously only cleared the cookie.
+	if h.UserStore != nil {
+		if subject := auth.GetSubject(r); subject != "" {
+			if u, _, err := h.UserStore.GetByUsername(subject); err == nil {
+				_ = h.UserStore.BumpTokenVersion(u.ID)
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -106,7 +119,7 @@ func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
 			return false
 		}
 		tv, _ := h.UserStore.TokenVersionFor(u.Username)
-		token, err := auth.MakeTokenFull(h.Config.JWTSecret, u.Username, orgForUser(u), string(u.Role), tv)
+		token, err := auth.MakeTokenFull(h.Config.JWTSecret, u.Username, h.orgClaimFor(u), string(u.Role), tv)
 		if err != nil {
 			return false
 		}
@@ -151,7 +164,7 @@ func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
 			tv, _ = h.UserStore.TokenVersionFor(u.Username)
 			subject = u.Username
 			role = string(u.Role)
-			orgID = orgForUser(u)
+			orgID = h.orgClaimFor(u)
 		}
 	}
 	token, err := auth.MakeTokenFull(h.Config.JWTSecret, subject, orgID, role, tv)
@@ -164,9 +177,16 @@ func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"token": token, "username": subject, "role": role})
 }
 
-// orgForUser returns the user's stored org scope (empty = global); kept as a
-// helper so login/OIDC share one org-resolution path.
-func orgForUser(u *user.DashboardUser) string { return "" }
+// orgClaimFor resolves the org scope minted into a dashboard JWT for a user:
+// the user's first org membership ("" = global). Login, OIDC and passkey
+// flows all share this path so tokens can never carry an org the user does
+// not belong to.
+func (h *AdminHandler) orgClaimFor(u *user.DashboardUser) string {
+	if h.UserStore == nil || u == nil {
+		return ""
+	}
+	return h.UserStore.PrimaryOrgID(u.ID)
+}
 
 func (h *AdminHandler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -242,7 +262,7 @@ func (h *AdminHandler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tv, _ := h.UserStore.TokenVersionFor(subject)
-	token, err := auth.MakeTokenFull(h.Config.JWTSecret, subject, "", string(u.Role), tv)
+	token, err := auth.MakeTokenFull(h.Config.JWTSecret, subject, h.orgClaimFor(u), string(u.Role), tv)
 	if err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "failed to create token", httperr.TypeProxy)
 		return
@@ -256,20 +276,36 @@ func (h *AdminHandler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 // resolveScope returns the org scope for the request and whether it may
 // proceed. Rules (fail-closed):
 //   - role admin  → global scope unless their JWT carries an org_id
-//   - other roles → MUST carry a non-empty org_id; global visibility is denied
+//   - other roles → the JWT's org claim when present
+//   - other roles WITHOUT an org claim → global READ scope is allowed only
+//     when the deployment has no organizations at all (single-tenant
+//     installs); once any org exists, unscoped non-admins are denied so they
+//     can never see cross-org data. Mutations stay gated by
+//     requireWriteTarget regardless.
 //
-// This prevents a member/support/readonly token without an org claim from
-// reading or mutating cross-org data.
-func resolveScope(r *http.Request) (string, bool) {
+// The scope derives exclusively from the verified JWT claim — never from
+// client headers.
+func (h *AdminHandler) resolveScope(r *http.Request) (string, bool) {
 	role := auth.GetRole(r)
 	org := auth.GetOrgID(r)
 	if role == "admin" {
 		return org, true
 	}
-	if org == "" {
-		return "", false
+	if org != "" {
+		return org, true
 	}
-	return org, true
+	return "", h.globalScopeAllowed()
+}
+
+// globalScopeAllowed reports whether unscoped non-admin reads may proceed:
+// true only while no organizations exist (single-tenant deployment).
+func (h *AdminHandler) globalScopeAllowed() bool {
+	var cnt int
+	// Missing table (org feature never used) → no orgs → allow.
+	if err := h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM organizations`)).Scan(&cnt); err != nil {
+		return true
+	}
+	return cnt == 0
 }
 
 // requireWriteTarget enforces ownership of an id-addressed resource for
@@ -292,7 +328,7 @@ func (h *AdminHandler) requireWriteTarget(w http.ResponseWriter, r *http.Request
 }
 
 func (h *AdminHandler) ListProviders(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := resolveScope(r)
+	orgID, ok := h.resolveScope(r)
 	if !ok {
 		httperr.Forbidden(w, "org scope required")
 		return
@@ -410,7 +446,7 @@ func (h *AdminHandler) TestProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := resolveScope(r)
+	orgID, ok := h.resolveScope(r)
 	if !ok {
 		httperr.Forbidden(w, "org scope required")
 		return
@@ -511,7 +547,7 @@ func (h *AdminHandler) DeleteKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := resolveScope(r)
+	orgID, ok := h.resolveScope(r)
 	if !ok {
 		httperr.Forbidden(w, "org scope required")
 		return
@@ -762,7 +798,7 @@ func percentile(sorted []int64, p int) int64 {
 }
 
 func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := resolveScope(r)
+	orgID, ok := h.resolveScope(r)
 	if !ok {
 		httperr.Forbidden(w, "org scope required")
 		return
@@ -1043,7 +1079,7 @@ func (h *AdminHandler) UpdateKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := resolveScope(r)
+	orgID, ok := h.resolveScope(r)
 	if !ok {
 		httperr.Forbidden(w, "org scope required")
 		return

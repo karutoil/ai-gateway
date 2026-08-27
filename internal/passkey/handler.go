@@ -56,6 +56,28 @@ func (h *Handler) cleanupSessions() {
 	}
 }
 
+// orgForID resolves the org claim minted into a dashboard JWT for a user:
+// their first org membership ("" = global). All passkey/recovery login paths
+// share this helper so tokens can never carry an org the user is not in.
+func (h *Handler) orgForID(userID string) string {
+	if h.UserStore == nil || userID == "" {
+		return ""
+	}
+	return h.UserStore.PrimaryOrgID(userID)
+}
+
+// ownUserID maps the JWT subject to the local dashboard user id ("" if
+// unknown); used for self-scoping checks.
+func (h *Handler) ownUserID(subject string) string {
+	if h.UserStore == nil || subject == "" {
+		return ""
+	}
+	if u, _, err := h.UserStore.GetByUsername(subject); err == nil {
+		return u.ID
+	}
+	return ""
+}
+
 func (h *Handler) loadWebAuthnUser(userID string) (WebAuthnUser, error) {
 	u, err := h.UserStore.GetByID(userID)
 	if err != nil {
@@ -203,7 +225,18 @@ func (h *Handler) BeginLogin(w http.ResponseWriter, r *http.Request) {
 	if username != "" {
 		u, _, err := h.UserStore.GetByUsername(username)
 		if err != nil {
-			http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+			// Anti-enumeration: unknown usernames get the SAME discoverable-
+			// login options shape as a real begin (never a 404 oracle). The
+			// stored session belongs to no user, so FinishLogin always fails.
+			options, session, derr := h.WebAuthn.BeginDiscoverableLogin()
+			if derr != nil {
+				http.Error(w, `{"error":"failed to begin login"}`, http.StatusInternalServerError)
+				return
+			}
+			sessionID := "decoy:" + time.Now().Format(time.RFC3339Nano)
+			h.sessions.Store(sessionID, sessionEntry{Data: *session, UserID: "", ExpiresAt: time.Now().Add(5 * time.Minute)})
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"options": options, "session": sessionID})
 			return
 		}
 		waUser, _ := h.loadWebAuthnUser(u.ID)
@@ -357,7 +390,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 			_ = h.UserStore.UpdateLastLogin(ownerID)
 		}
 		tv, _ := h.UserStore.TokenVersionFor(username)
-		token, err := auth.MakeTokenFull(h.Config.JWTSecret, username, "", role, tv)
+		token, err := auth.MakeTokenFull(h.Config.JWTSecret, username, h.orgForID(u.ID), role, tv)
 		if err != nil {
 			http.Error(w, `{"error":"failed to create token"}`, http.StatusInternalServerError)
 			return
@@ -386,7 +419,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 	_ = h.PassStore.UpdateCounter(cred.ID, cred.Authenticator.SignCount)
 	_ = h.UserStore.UpdateLastLogin(waUser.ID)
 	tv, _ := h.UserStore.TokenVersionFor(waUser.Username)
-	token, err := auth.MakeTokenFull(h.Config.JWTSecret, waUser.Username, "", string(waUser.Role), tv)
+	token, err := auth.MakeTokenFull(h.Config.JWTSecret, waUser.Username, h.orgForID(waUser.ID), string(waUser.Role), tv)
 	if err != nil {
 		http.Error(w, `{"error":"failed to create token"}`, http.StatusInternalServerError)
 		return
@@ -428,7 +461,7 @@ func (h *Handler) VerifyRecovery(w http.ResponseWriter, r *http.Request) {
 	_ = h.UserStore.ConsumeRecoveryCode(u.ID)
 	_ = h.UserStore.UpdateLastLogin(u.ID)
 	tv, _ := h.UserStore.TokenVersionFor(u.Username)
-	token, err := auth.MakeTokenFull(h.Config.JWTSecret, u.Username, "", string(u.Role), tv)
+	token, err := auth.MakeTokenFull(h.Config.JWTSecret, u.Username, h.orgForID(u.ID), string(u.Role), tv)
 	if err != nil {
 		http.Error(w, `{"error":"failed to create token"}`, http.StatusInternalServerError)
 		return
@@ -495,6 +528,14 @@ func (h *Handler) ListCredentials(w http.ResponseWriter, r *http.Request) {
 	if targetID == "" {
 		if u, _, err := h.UserStore.GetByUsername(subject); err == nil {
 			targetID = u.ID
+		}
+	}
+	// SECURITY: self-or-admin only. Without this check any authenticated user
+	// could enumerate any other user's WebAuthn credential IDs.
+	if ownID := h.ownUserID(subject); targetID != ownID {
+		if auth.GetRole(r) != "admin" {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
 		}
 	}
 	creds, _ := h.PassStore.ListCredentials(targetID)

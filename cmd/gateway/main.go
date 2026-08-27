@@ -325,7 +325,7 @@ func main() {
 	})
 
 	r.Group(func(r chi.Router) {
-		r.Use(middleware.GatewayAuthWithJWT(apiKeyStore, cfg.JWTSecret))
+		r.Use(middleware.GatewayAuthWithJWTRevocation(apiKeyStore, cfg.JWTSecret, userStore))
 		r.Use(budget.Middleware(limiter))
 		r.Use(middleware.GatewayRateLimitWithLimits(rl, func(req *http.Request) middleware.RateLimits {
 			if k, ok := middleware.GatewayKeyFromContext(req.Context()); ok && k != nil {
