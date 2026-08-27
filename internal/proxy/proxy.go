@@ -1585,6 +1585,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !h.checkTPM(w, r, body) {
 		return
 	}
+	if !chatMessagesPresent(body) {
+		httperr.Invalid(w, "messages: required non-empty array of chat messages")
+		return
+	}
 	isStream := translate.IsStreaming(body)
 	if model != rawModel {
 		body = replaceModelInBody(body, model)

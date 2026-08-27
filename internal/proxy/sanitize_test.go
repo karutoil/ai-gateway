@@ -186,6 +186,191 @@ func TestSanitizePlaceholderForUnknownToolBlocks(t *testing.T) {
 	}
 }
 
+// --- probe battery round 2: legacy/unknown roles, tool_calls repair, part fixes ---
+
+func TestSanitizeLegacyFunctionRoleToTool(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"user","content":"weather?"},` +
+		`{"role":"function","name":"get_weather","content":"15C"}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	if role, _ := msgs[1]["role"].(string); role != "tool" {
+		t.Fatalf("role = %q, want tool", role)
+	}
+	if id, _ := msgs[1]["tool_call_id"].(string); id != "get_weather" {
+		t.Fatalf("tool_call_id = %q, want synthesized from name", id)
+	}
+}
+
+func TestSanitizeUnknownRoleToUser(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[{"role":"agent","content":"hi"}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	if role, _ := msgs[0]["role"].(string); role != "user" {
+		t.Fatalf("role = %q, want user", role)
+	}
+	if content, _ := msgs[0]["content"].(string); content != "hi" {
+		t.Fatalf("content = %q, want preserved", content)
+	}
+}
+
+func TestSanitizeCanonicalRolesUntouched(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"system","content":"s"},{"role":"user","content":"u"},` +
+		`{"role":"assistant","content":"a"},{"role":"tool","tool_call_id":"c","content":"t"}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	var orig, got map[string]interface{}
+	_ = json.Unmarshal(in, &orig)
+	_ = json.Unmarshal(out, &got)
+	if !reflect.DeepEqual(orig, got) {
+		t.Fatalf("canonical body mutated:\n orig=%v\n got =%v", orig, got)
+	}
+}
+
+func TestSanitizeDropsToolCallWithoutFunction(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"user","content":"hi"},` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function"},{"id":"c2","type":"function","function":{"name":"f","arguments":"{}"}}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	calls, _ := msgs[1]["tool_calls"].([]interface{})
+	if len(calls) != 1 {
+		t.Fatalf("want 1 surviving tool_call, got %d", len(calls))
+	}
+	c := calls[0].(map[string]interface{})
+	fn := c["function"].(map[string]interface{})
+	if fn["name"] != "f" {
+		t.Fatalf("wrong survivor: %v", c)
+	}
+}
+
+func TestSanitizeCustomToolCallToFunction(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"custom","custom":{"name":"browser"}}]},` +
+		`{"role":"user","content":"hi"}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	calls, _ := msgs[0]["tool_calls"].([]interface{})
+	if len(calls) != 1 {
+		t.Fatalf("want 1 tool_call, got %d", len(calls))
+	}
+	c := calls[0].(map[string]interface{})
+	if c["type"] != "function" {
+		t.Fatalf("type = %v, want function", c["type"])
+	}
+	fn := c["function"].(map[string]interface{})
+	if fn["name"] != "browser" {
+		t.Fatalf("name = %v, want browser", fn["name"])
+	}
+	if fn["arguments"] != "{}" {
+		t.Fatalf("arguments = %v, want {}", fn["arguments"])
+	}
+}
+
+func TestSanitizeAddsMissingToolCallArguments(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f"}}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	calls, _ := msgs[0]["tool_calls"].([]interface{})
+	fn := calls[0].(map[string]interface{})["function"].(map[string]interface{})
+	if fn["arguments"] != "{}" {
+		t.Fatalf("arguments = %v, want synthesized {}", fn["arguments"])
+	}
+}
+
+func TestSanitizeDropsAllOrphanToolCalls(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function"}]},` +
+		`{"role":"user","content":"hi"}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	if _, present := msgs[0]["tool_calls"]; present {
+		t.Fatal("all-invalid tool_calls should be removed entirely")
+	}
+}
+
+// input_text / input_image (Responses-style) parts are silently DROPPED by
+// the upstream — content loss, or "Prompt must contain at least one message"
+// when nothing remains. The sanitizer must re-type them.
+func TestSanitizeReTypesResponsesStyleParts(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[{"role":"user","content":[` +
+		`{"type":"input_text","text":"see this"},` +
+		`{"type":"input_image","image_url":"data:image/png;base64,iVBOR"}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	content, _ := msgs[0]["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("want 2 parts, got %d", len(content))
+	}
+	p0 := content[0].(map[string]interface{})
+	if p0["type"] != "text" || p0["text"] != "see this" {
+		t.Fatalf("part0 = %v, want re-typed text", p0)
+	}
+	p1 := content[1].(map[string]interface{})
+	if p1["type"] != "image_url" {
+		t.Fatalf("part1 type = %v, want image_url", p1["type"])
+	}
+	iu := p1["image_url"].(map[string]interface{})
+	if iu["url"] != "data:image/png;base64,iVBOR" {
+		t.Fatalf("url = %v", iu["url"])
+	}
+}
+
+func TestSanitizeUnTypedTextPart(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[{"role":"user","content":[{"text":"hi"}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	content, _ := msgs[0]["content"].([]interface{})
+	p := content[0].(map[string]interface{})
+	if p["type"] != "text" || p["text"] != "hi" {
+		t.Fatalf("part = %v, want {type:text,text:hi}", p)
+	}
+}
+
+// audio/file parts are hard-rejected (400 Invalid input) — must become text
+// placeholders, not forwarded.
+func TestSanitizeAudioAndFilePartsOmitted(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"listen"},` +
+		`{"type":"input_audio","input_audio":{"data":"c29tZQ==","format":"wav"}},` +
+		`{"type":"file","file":{"filename":"a.txt","file_data":"data:text/plain;base64,SGk="}}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	content, _ := msgs[0]["content"].([]interface{})
+	if len(content) != 3 {
+		t.Fatalf("want 3 parts, got %d", len(content))
+	}
+	for i, want := range []string{"listen", "[audio attachment omitted", "[file attachment omitted"} {
+		p := content[i].(map[string]interface{})
+		if p["type"] != "text" {
+			t.Fatalf("part%d type = %v, want text", i, p["type"])
+		}
+		txt, _ := p["text"].(string)
+		if len(txt) < len(want) || txt[:len(want)] != want {
+			t.Fatalf("part%d text = %q, want prefix %q", i, txt, want)
+		}
+	}
+}
+
+func TestChatMessagesPresent(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"model":"m","messages":[{"role":"user","content":"hi"}]}`, true},
+		{`{"model":"m","messages":[]}`, false},
+		{`{"model":"m"}`, false},
+		{`{"messages":"weird"}`, false},
+		{`not json`, true}, // opaque bodies are not this check's business
+	}
+	for _, c := range cases {
+		if got := chatMessagesPresent([]byte(c.body)); got != c.want {
+			t.Errorf("chatMessagesPresent(%s) = %v, want %v", c.body, got, c.want)
+		}
+	}
+}
+
 func TestSanitizePassthroughOpaqueBody(t *testing.T) {
 	// Not an object with a messages array — relay byte-for-byte.
 	for _, in := range []string{

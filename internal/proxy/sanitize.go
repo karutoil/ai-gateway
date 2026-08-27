@@ -8,26 +8,36 @@ import (
 
 // sanitizeOpenAICompatBody normalizes legal-but-sloppy OpenAI chat shapes that
 // strict OpenAI-compatible upstreams (new-api style proxies fronting Claude
-// with Zod request validation) reject with 400 "…: Invalid input" or a role
-// discriminator error. The gateway relays upstream error bodies verbatim, so
-// these shapes surface to clients as unfixed 400s even though the request is
-// legal OpenAI.
+// with Zod request validation) reject with 400 "…: Invalid input", a role
+// discriminator error, or silently drop. The gateway relays upstream error
+// bodies verbatim, so these shapes surface to clients as unfixed 400s (or
+// silent content loss) even though the request is legal OpenAI.
 //
-// Evidence-backed rewrites (reproduced live against ckff.dev, see
+// Evidence-backed rewrites (each reproduced live against ckff.dev, see
 // sanitize_test.go):
 //  1. role:"tool" without a usable tool_call_id → synthesize one from name,
 //     else a deterministic placeholder. Upstream validators require the key;
 //     a synthesized id beats a guaranteed 400.
-//  1b. tool content arrays may contain ONLY text parts — image parts and
-//     unknown blocks 400. Images DO reach the model from a following user
-//     message (verified live), so they are relocated into a synthetic user
-//     message right after the tool message instead of being dropped. Unknown
+//     1b. tool content arrays accept ONLY text parts — image parts and unknown
+//     blocks 400. Images DO reach the model from a following user message
+//     (verified live), so they are relocated into a synthetic user message
+//     right after the tool message instead of being dropped. Unknown
 //     non-image blocks become text placeholders on the tool message itself.
-//  2. role:"developer" → "system" (same semantics; compat upstreams haven't
-//     adopted the newer discriminator value).
+//  2. role:"developer" → "system"; legacy role:"function" → "tool" (its name
+//     field then feeds the tool_call_id synthesis in 1); any other unknown
+//     role → "user" (a 400 "Invalid discriminator" is guaranteed worse).
 //  3. assistant content:null with no tool_calls → drop the key. Missing
 //     content is universally accepted; explicit null is rejected by some
 //     dialects.
+//  4. assistant tool_calls entries missing their function object → dropped
+//     (orphaned tool results are accepted upstream); type:"custom" entries →
+//     converted to function shape; function entries without arguments →
+//     arguments:"{}".
+//  5. content-array part fixes across all roles: Responses-style input_text →
+//     text and input_image → image_url (upstream silently DROPS both, losing
+//     content and 400ing "Prompt must contain at least one message" when
+//     nothing remains); a part with text but no type → type:"text"; audio and
+//     file parts (hard-rejected) → text placeholders.
 //
 // Anything unparseable — or a body without a messages array — is returned
 // unchanged, so opaque or non-chat bodies relay exactly as before.
@@ -56,18 +66,36 @@ func sanitizeOpenAICompatBody(body []byte) []byte {
 		msgChanged := false
 		var synthetic json.RawMessage
 
-		// 2. developer → system
-		if r, ok := m["role"]; ok && bytes.Equal(bytes.TrimSpace(r), []byte(`"developer"`)) {
-			m["role"] = json.RawMessage(`"system"`)
-			msgChanged = true
+		// 2. role fixes
+		if r, ok := m["role"]; ok {
+			switch role, _ := stringValue(r); role {
+			case "system", "user", "assistant", "tool":
+				// canonical — keep
+			case "developer":
+				m["role"] = json.RawMessage(`"system"`)
+				msgChanged = true
+			case "function":
+				m["role"] = json.RawMessage(`"tool"`)
+				msgChanged = true
+			default:
+				m["role"] = json.RawMessage(`"user"`)
+				msgChanged = true
+			}
 		}
-
 		role := ""
 		if r, ok := m["role"]; ok {
-			_ = json.Unmarshal(r, &role)
+			role, _ = stringValue(r)
 		}
 
-		// 1. tool message needs a non-empty string tool_call_id
+		// 5. content part fixes (all roles)
+		if c, ok := m["content"]; ok {
+			if nc, did := normalizeContentParts(c); did {
+				m["content"] = nc
+				msgChanged = true
+			}
+		}
+
+		// 1/1b. tool message: id synthesis + image relocation
 		if role == "tool" {
 			if needsToolCallID(m["tool_call_id"]) {
 				if id, ok := stringValue(m["name"]); ok {
@@ -77,8 +105,6 @@ func sanitizeOpenAICompatBody(body []byte) []byte {
 				}
 				msgChanged = true
 			}
-			// 1b. tool content: keep text, relocate images into a synthetic
-			// user message appended right after this one.
 			if tc, syn, did := splitToolContent(m["content"]); did {
 				m["content"] = tc
 				synthetic = syn
@@ -86,8 +112,18 @@ func sanitizeOpenAICompatBody(body []byte) []byte {
 			}
 		}
 
-		// 3. assistant content:null without tool_calls → drop the key
+		// 4/3. assistant message: tool_calls repair + content:null drop
 		if role == "assistant" {
+			if tc, ok := m["tool_calls"]; ok {
+				if fixed, did := fixToolCalls(tc); did {
+					if fixed == nil {
+						delete(m, "tool_calls")
+					} else {
+						m["tool_calls"] = fixed
+					}
+					msgChanged = true
+				}
+			}
 			if c, ok := m["content"]; ok && bytes.Equal(bytes.TrimSpace(c), []byte(`null`)) {
 				if _, hasCalls := m["tool_calls"]; !hasCalls {
 					delete(m, "content")
@@ -124,6 +160,27 @@ func sanitizeOpenAICompatBody(body []byte) []byte {
 	return out
 }
 
+// chatMessagesPresent reports whether the chat body carries a non-empty
+// messages array. Strict upstreams answer a missing/empty array with an
+// opaque 500 "field messages is required"; failing fast here gives clients a
+// clean 400 with a standard error envelope instead. Only bodies that are not
+// JSON objects at all are considered opaque (relayed as before).
+func chatMessagesPresent(body []byte) bool {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return true // opaque body: let the existing pipeline deal with it
+	}
+	msgsRaw, ok := top["messages"]
+	if !ok {
+		return false
+	}
+	var msgs []json.RawMessage
+	if err := json.Unmarshal(msgsRaw, &msgs); err != nil {
+		return false // present but not an array
+	}
+	return len(msgs) > 0
+}
+
 // needsToolCallID reports whether the raw JSON value for tool_call_id is
 // absent, null, non-string, or the empty string.
 func needsToolCallID(raw json.RawMessage) bool {
@@ -147,6 +204,80 @@ func stringValue(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// normalizeContentParts fixes content-array parts that strict upstreams
+// reject or silently drop, across all roles:
+//   - input_text → text (Responses-style alias; silently dropped otherwise)
+//   - input_image / Anthropic image → image_url (silently dropped otherwise)
+//   - part with text but no type → type:"text" (silently dropped otherwise)
+//   - audio/file parts → text placeholders (hard 400 "content: Invalid input")
+//   - an array that ends up (or starts) empty → one empty text part, since
+//     empty content 400s "Prompt must contain at least one message"
+//
+// String content and non-arrays pass through unchanged. Unknown part types
+// observed to be tolerated upstream are left as-is to keep valid bodies
+// byte-identical.
+func normalizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
+	var parts []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &parts); err != nil || parts == nil {
+		return raw, false
+	}
+	changed := false
+	for j, p := range parts {
+		typ, _ := stringValue(p["type"])
+		switch typ {
+		case "text", "image_url":
+			// canonical — keep
+		case "input_text":
+			p["type"] = json.RawMessage(`"text"`)
+			changed = true
+		case "input_image", "image":
+			if norm, ok := normalizeImagePart(p); ok {
+				parts[j] = norm
+			} else {
+				parts[j] = omittedPart("image")
+			}
+			changed = true
+		case "input_audio", "audio":
+			parts[j] = omittedPart("audio")
+			changed = true
+		case "file":
+			parts[j] = omittedPart("file")
+			changed = true
+		default:
+			// No type at all but a text field: upstream drops the part;
+			// re-typing it preserves the content.
+			if _, hasText := p["text"]; hasText {
+				p["type"] = json.RawMessage(`"text"`)
+				changed = true
+			}
+			// Other unknown types are tolerated upstream — leave as-is.
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	if len(parts) == 0 {
+		parts = append(parts, map[string]json.RawMessage{
+			"type": json.RawMessage(`"text"`),
+			"text": json.RawMessage(`""`),
+		})
+	}
+	out, err := json.Marshal(parts)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
+
+// omittedPart builds a text placeholder replacing an attachment type the
+// upstream rejects outright.
+func omittedPart(kind string) map[string]json.RawMessage {
+	return map[string]json.RawMessage{
+		"type": json.RawMessage(`"text"`),
+		"text": mustJSON(fmt.Sprintf("[%s attachment omitted: not supported by this provider]", kind)),
+	}
 }
 
 // splitToolContent normalizes a tool message's raw content value.
@@ -266,7 +397,80 @@ func normalizeImagePart(p map[string]json.RawMessage) (map[string]json.RawMessag
 	return nil, false
 }
 
-// mustJSON marshals v or panics; only called with JSON-safe values built here.
+// fixToolCalls repairs assistant tool_calls arrays:
+//   - entries with type:"custom" (OpenAI custom tools) → function shape with
+//     the custom tool's name and empty arguments
+//   - entries whose function object is missing or nameless → dropped
+//     (orphaned tool results are accepted upstream, verified live)
+//   - function entries without arguments → arguments:"{}"
+//
+// Returns (nil, true) when every entry was dropped and the key should be
+// removed entirely.
+func fixToolCalls(raw json.RawMessage) (json.RawMessage, bool) {
+	var calls []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &calls); err != nil || calls == nil {
+		return raw, false
+	}
+	changed := false
+	out := make([]map[string]json.RawMessage, 0, len(calls))
+	for _, c := range calls {
+		typ, _ := stringValue(c["type"])
+		if fn, ok := c["custom"]; ok && (typ == "custom" || typ == "") {
+			name, _ := stringValue(fn)
+			if name == "" {
+				var cm map[string]json.RawMessage
+				if json.Unmarshal(fn, &cm) == nil {
+					name, _ = stringValue(cm["name"])
+				}
+			}
+			if name == "" {
+				changed = true
+				continue
+			}
+			out = append(out, map[string]json.RawMessage{
+				"id":   c["id"],
+				"type": json.RawMessage(`"function"`),
+				"function": mustJSON(map[string]json.RawMessage{
+					"name":      mustJSON(name),
+					"arguments": json.RawMessage(`"{}"`),
+				}),
+			})
+			changed = true
+			continue
+		}
+		fnRaw, hasFn := c["function"]
+		if !hasFn {
+			changed = true
+			continue // entry without function object: guaranteed 400 upstream
+		}
+		var fn map[string]json.RawMessage
+		if json.Unmarshal(fnRaw, &fn) != nil {
+			changed = true
+			continue
+		}
+		name, _ := stringValue(fn["name"])
+		if name == "" {
+			changed = true
+			continue
+		}
+		if _, hasArgs := fn["arguments"]; !hasArgs {
+			fn["arguments"] = json.RawMessage(`"{}"`)
+			c["function"] = mustJSON(fn)
+			changed = true
+		}
+		out = append(out, c)
+	}
+	if !changed {
+		return raw, false
+	}
+	if len(out) == 0 {
+		return nil, true
+	}
+	return mustJSON(out), true
+}
+
+// mustJSON marshals v or returns an empty JSON string on failure; only called
+// with JSON-safe values built here.
 func mustJSON(v interface{}) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {
