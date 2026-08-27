@@ -33,16 +33,6 @@ func NewMemoryLimiter(limit int) *MemoryLimiter {
 	return &MemoryLimiter{DailyTokenLimit: limit, tokensUsed: make(map[string]int), lastReset: make(map[string]time.Time)}
 }
 
-func emitBillingOverQuota(prefix string, limit, used int64) {
-	if webhook.Global != nil {
-		webhook.Global.Emit("billing.over_quota", map[string]any{
-			"prefix": prefix,
-			"limit":  limit,
-			"used":   used,
-		})
-	}
-}
-
 func (m *MemoryLimiter) Check(prefix string, promptTokens int) error {
 	if m.DailyTokenLimit <= 0 {
 		return nil
@@ -54,8 +44,8 @@ func (m *MemoryLimiter) Check(prefix string, promptTokens int) error {
 	}
 	if m.tokensUsed[prefix]+promptTokens > m.DailyTokenLimit {
 		used := int64(m.tokensUsed[prefix] + promptTokens)
-		emitBillingOverQuota(prefix, int64(m.DailyTokenLimit), used)
-		return fmt.Errorf("over_quota: daily_token_limit %d exceeded", m.DailyTokenLimit)
+		quotaErr("daily_token", int64(m.DailyTokenLimit), used, prefix, "")
+		return fmt.Errorf("%w: daily_token_limit %d exceeded", ErrOverQuota, m.DailyTokenLimit)
 	}
 	return nil
 }
@@ -353,16 +343,13 @@ func (d *DBLimiter) Check(prefix string, promptTokens int) error {
 	}
 
 	if k.dailyTokens > 0 && dayTok+int64(promptTokens) > k.dailyTokens {
-		emitBillingOverQuota(prefix, k.dailyTokens, dayTok+int64(promptTokens))
-		return &QuotaError{LimitKind: "daily_token", Limit: k.dailyTokens, Used: dayTok, Prefix: prefix}
+		return quotaErr("daily_token", k.dailyTokens, dayTok, prefix, "")
 	}
 	if k.dailyCostC > 0 && dayCents > k.dailyCostC {
-		emitBillingOverQuota(prefix, k.dailyCostC, dayCents)
-		return &QuotaError{LimitKind: "daily_cost", Limit: k.dailyCostC, Used: dayCents, Prefix: prefix}
+		return quotaErr("daily_cost", k.dailyCostC, dayCents, prefix, "")
 	}
 	if k.monthlyCostC > 0 && monthCents > k.monthlyCostC {
-		emitBillingOverQuota(prefix, k.monthlyCostC, monthCents)
-		return &QuotaError{LimitKind: "monthly_cost", Limit: k.monthlyCostC, Used: monthCents, Prefix: prefix}
+		return quotaErr("monthly_cost", k.monthlyCostC, monthCents, prefix, "")
 	}
 	if k.orgMonthlyC > 0 && k.orgID != "" {
 		_, orgMonthCents, oerr := d.usageFor(orgCountersKey(k.orgID), "month", month)
@@ -370,11 +357,27 @@ func (d *DBLimiter) Check(prefix string, promptTokens int) error {
 			return fmt.Errorf("%w: org snapshot read failed: %v", ErrBudgetUnavailable, oerr)
 		}
 		if orgMonthCents > k.orgMonthlyC {
-			emitBillingOverQuota(k.orgID, k.orgMonthlyC, orgMonthCents)
-			return &QuotaError{LimitKind: "org_monthly_cost", Limit: k.orgMonthlyC, Used: orgMonthCents, OrgID: k.orgID}
+			return quotaErr("org_monthly_cost", k.orgMonthlyC, orgMonthCents, prefix, k.orgID)
 		}
 	}
 	return nil
+}
+
+// quotaErr builds the over-quota error and emits exactly ONE billing.over_quota
+// webhook. Emission lives here (not also in Middleware) — the previous
+// double-emit sent consumers duplicate events for every blocked request.
+func quotaErr(kind string, limit, used int64, prefix, orgID string) *QuotaError {
+	qe := &QuotaError{LimitKind: kind, Limit: limit, Used: used, Prefix: prefix, OrgID: orgID}
+	if webhook.Global != nil {
+		webhook.Global.Emit("billing.over_quota", map[string]any{
+			"prefix":     qe.Prefix,
+			"org_id":     qe.OrgID,
+			"limit_kind": qe.LimitKind,
+			"limit":      qe.Limit,
+			"used":       qe.Used,
+		})
+	}
+	return qe
 }
 
 func firstErr(errs ...error) error {
@@ -469,15 +472,9 @@ func Middleware(l Limiter) func(http.Handler) http.Handler {
 				err := l.Check(prefix, estimate)
 				switch {
 				case IsOverQuota(err):
-					var quota *QuotaError
-					if errors.As(err, &quota) {
-						webhook.Global.Emit("billing.over_quota", map[string]any{
-							"prefix": quota.Prefix, "org_id": quota.OrgID,
-							"limit_kind": quota.LimitKind, "limit": quota.Limit, "used": quota.Used,
-						})
-					} else if webhook.Global != nil {
-						webhook.Global.Emit("billing.over_quota", map[string]any{"prefix": prefix, "error": err.Error()})
-					}
+					// Webhook emission happens inside quotaErr (single emit —
+					// the middleware previously emitted a SECOND duplicate
+					// event for every blocked request).
 					WriteOverQuota(w)
 					return
 				case errors.Is(err, ErrBudgetUnavailable):

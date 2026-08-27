@@ -307,6 +307,48 @@ func (s *Store) CreateWithOrg(name string, typ models.ProviderType, baseURL stri
 	return &copyP, nil
 }
 
+// Update edits an existing provider in place — the credential-rotation path.
+// nil pointers mean "leave unchanged"; a non-nil apiKey (even empty → error)
+// is re-encrypted. Keeping the provider ID stable preserves lb_rules member
+// references and usage-history joins.
+func (s *Store) Update(id string, name, baseURL, apiKey *string) (*models.Provider, error) {
+	p, err := s.GetByID(id)
+	if err != nil {
+		return nil, fmt.Errorf("provider not found")
+	}
+	if name != nil {
+		trimmed := strings.TrimSpace(*name)
+		if trimmed == "" || len(trimmed) > 128 {
+			return nil, fmt.Errorf("invalid provider name")
+		}
+		p.Name = trimmed
+	}
+	if baseURL != nil {
+		normalized := normalizeBaseURL(*baseURL)
+		if err := validateBaseURL(normalized); err != nil {
+			return nil, err
+		}
+		p.BaseURL = normalized
+	}
+	if apiKey != nil {
+		if *apiKey == "" {
+			return nil, fmt.Errorf("api_key cannot be empty (omit the field to keep the current credential)")
+		}
+		enc, err := Encrypt([]byte(*apiKey), s.masterKey)
+		if err != nil {
+			return nil, err
+		}
+		p.APIKeyEnc = enc
+	}
+	if _, err := s.db.Exec(db.Q(`UPDATE providers SET name=?, base_url=?, api_key_enc=? WHERE id=?`), p.Name, p.BaseURL, p.APIKeyEnc, id); err != nil {
+		return nil, err
+	}
+	copyP := *p
+	copyP.APIKey = "***"
+	copyP.APIKeyEnc = nil
+	return &copyP, nil
+}
+
 // ListForOrg returns providers filtered by org_id. If orgID=="" returns all (bootstrap admin).
 // For Phase 3 strict isolation, only exact org_id is returned (global NULL not shared).
 func (s *Store) ListForOrg(orgID string) ([]models.Provider, error) {

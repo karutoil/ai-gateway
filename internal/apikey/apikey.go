@@ -228,15 +228,15 @@ func (s *Store) Verify(raw string) (*models.GatewayKey, bool) {
 	var rpm, rph, rpd, tpm sql.NullInt64
 	var org sql.NullString
 	var allowed sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id FROM gateway_keys WHERE hash=? AND revoked_at IS NULL`), hash).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org)
+	err := s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org)
 	if err != nil && (strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph") || strings.Contains(err.Error(), "rate_limit_tpm")) {
-		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,org_id FROM gateway_keys WHERE hash=? AND revoked_at IS NULL`), hash).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &org)
+		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,org_id FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &org)
 		if err != nil && strings.Contains(err.Error(), "org_id") {
-			err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys WHERE hash=? AND revoked_at IS NULL`), hash).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm)
+			err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm)
 		}
 	}
 	if err != nil && strings.Contains(err.Error(), "org_id") {
-		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys WHERE hash=? AND revoked_at IS NULL`), hash).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm)
+		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm)
 	}
 	if err != nil {
 		return nil, false

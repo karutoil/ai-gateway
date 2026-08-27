@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"math"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/apikey"
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/db"
@@ -36,9 +38,33 @@ type AdminHandler struct {
 	Discovery     *discovery.Service
 	UserStore     *user.Store
 	Breaker       resilience.CircuitBreaker
+	// Recorder, when set, writes audit rows (logins, credential changes).
+	Recorder audit.Recorder
 	// AuthLimiter, when set, rate-limits the public credential endpoints.
 	AuthLimiter *middleware.AuthRateLimiter
 }
+
+// auditLogin writes an action=login audit row for the given username. The
+// Profile "Logins" feed queries exactly these rows; without them it silently
+// fell back to a single last_login timestamp.
+func (h *AdminHandler) auditLogin(username string) {
+	if h.Recorder == nil || username == "" {
+		return
+	}
+	_ = h.Recorder.Log(username, "login", "session", username, "dashboard login")
+}
+
+// GatewayVersion is the single source of truth for the reported app version
+// (/health, /api/health, startup banner). It previously drifted: code said
+// 1.6.0 while openapi.yaml said 1.7.0.
+//
+// Release builds inject the git tag via:
+//
+//	-ldflags "-X ai-gateway/internal/handler.GatewayVersion=v1.8.0"
+//
+// Source builds fall back to "dev" (+ short commit when available via the
+// make target). The install.sh updater also reads this through `gateway version`.
+var GatewayVersion = "dev"
 
 func (h *AdminHandler) Routes(r chi.Router) {
 	if h.AuthLimiter != nil {
@@ -57,6 +83,7 @@ func (h *AdminHandler) Routes(r chi.Router) {
 		r.Use(auth.AdminMiddlewareWithRevocation(h.Config.JWTSecret, h.UserStore))
 		r.Get("/providers", h.ListProviders)
 		r.With(middleware.RequireRole("admin", "member", "support")).Post("/providers", h.CreateProvider)
+		r.With(middleware.RequireRole("admin", "member", "support")).Put("/providers/{id}", h.UpdateProvider)
 		r.With(middleware.RequireRole("admin", "member", "support")).Delete("/providers/{id}", h.DeleteProvider)
 		r.With(middleware.RequireRole("admin", "member", "support", "readonly")).Post("/providers/test", h.TestProvider)
 
@@ -75,7 +102,7 @@ func (h *AdminHandler) Routes(r chi.Router) {
 
 func (h *AdminHandler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "1.6.0"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": GatewayVersion})
 }
 
 // Logout clears the HttpOnly session cookie client-side control cannot
@@ -128,6 +155,7 @@ func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
 			_ = h.UserStore.UpgradePasswordHash(u.ID, body.Password)
 		}
 		_ = h.UserStore.UpdateLastLogin(u.ID)
+		h.auditLogin(u.Username)
 		w.Header().Set("Content-Type", "application/json")
 		setSessionCookie(w, r, token)
 		json.NewEncoder(w).Encode(map[string]string{"token": token, "username": u.Username, "role": string(u.Role)})
@@ -174,6 +202,7 @@ func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	setSessionCookie(w, r, token)
+	h.auditLogin(subject)
 	json.NewEncoder(w).Encode(map[string]string{"token": token, "username": subject, "role": role})
 }
 
@@ -268,6 +297,7 @@ func (h *AdminHandler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.UserStore.UpdateLastLogin(u.ID)
+	h.auditLogin(subject)
 	w.Header().Set("Content-Type", "application/json")
 	setSessionCookie(w, r, token)
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
@@ -418,6 +448,100 @@ func (h *AdminHandler) DeleteProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// UpdateProvider edits an existing provider (name, base_url, api_key). This
+// is the credential-rotation path: previously the only way to replace a
+// provider key was delete+recreate, which changed the provider ID and broke
+// lb_rules member references and history joins. api_key is optional — when
+// empty the stored credential is kept.
+func (h *AdminHandler) UpdateProvider(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if !h.requireWriteTarget(w, r, "providers", id) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var body struct {
+		Name    *string `json:"name"`
+		BaseURL *string `json:"base_url"`
+		APIKey  *string `json:"api_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httperr.Invalid(w, "invalid json")
+		return
+	}
+	if body.Name != nil {
+		if strings.TrimSpace(*body.Name) == "" || len(*body.Name) > 128 {
+			httperr.Invalid(w, "invalid name")
+			return
+		}
+	}
+	if body.BaseURL != nil && len(*body.BaseURL) > 2048 {
+		httperr.Invalid(w, "base_url too long")
+		return
+	}
+	p, err := h.ProviderStore.Update(id, body.Name, body.BaseURL, body.APIKey)
+	if err != nil {
+		httperr.Write(w, http.StatusBadRequest, err.Error(), httperr.TypeInvalid)
+		return
+	}
+	p.APIKey = "***"
+	p.APIKeyEnc = nil
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p)
+}
+
+// ListAudit exposes the audit trail to admins (the trail previously had NO
+// read API — rows were only reachable via the per-user profile feed).
+// Params: limit (1-500, default 100), offset, actor.
+func (h *AdminHandler) ListAudit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 100
+	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 && v <= 500 {
+		limit = v
+	}
+	offset := 0
+	if v, err := strconv.Atoi(q.Get("offset")); err == nil && v >= 0 {
+		offset = v
+	}
+	where := ""
+	args := []any{}
+	if a := strings.TrimSpace(q.Get("actor")); a != "" {
+		where = " WHERE actor=?"
+		args = append(args, a)
+	}
+	var total int64
+	_ = h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM audit_logs`+where), args...).Scan(&total)
+	w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
+	rows, err := h.DB.Query(db.Q(`SELECT id, actor, action, target_type, target_id, meta, created_at FROM audit_logs`+where+` ORDER BY created_at DESC LIMIT ? OFFSET ?`), append(args, limit, offset)...)
+	if err != nil {
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	type auditRow struct {
+		ID         string    `json:"id"`
+		Actor      string    `json:"actor"`
+		Action     string    `json:"action"`
+		TargetType string    `json:"target_type"`
+		TargetID   string    `json:"target_id"`
+		Meta       string    `json:"meta"`
+		CreatedAt  time.Time `json:"created_at"`
+	}
+	out := []auditRow{}
+	for rows.Next() {
+		var a auditRow
+		var created sql.NullTime
+		var targetID, meta sql.NullString
+		if err := rows.Scan(&a.ID, &a.Actor, &a.Action, &a.TargetType, &targetID, &meta, &created); err == nil && created.Valid {
+			a.TargetID = targetID.String
+			a.Meta = meta.String
+			a.CreatedAt = created.Time.UTC()
+			out = append(out, a)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
 }
 
 func (h *AdminHandler) TestProvider(w http.ResponseWriter, r *http.Request) {
@@ -797,52 +921,102 @@ func percentile(sorted []int64, p int) int64 {
 	return sorted[idx]
 }
 
+// Logs lists recent request logs with pagination and filters. Response stays
+// a JSON array (backward compatible); the total matching row count is exposed
+// via the X-Total-Count header so clients can paginate without shape churn.
+// Query params: limit (1-500, default 100), offset, model (substring),
+// key (key_prefix prefix), endpoint (substring), status ("failed" or code),
+// since (RFC3339 timestamp or Go duration like 24h).
 func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 	orgID, ok := h.resolveScope(r)
 	if !ok {
 		httperr.Forbidden(w, "org scope required")
 		return
 	}
-	var rows *sql.Rows
-	var err error
-	if orgID != "" {
-		rows, err = h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE p.org_id=? ORDER BY rl.created_at DESC LIMIT 100`), orgID)
-	} else {
-		rows, err = h.DB.Query(`SELECT id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,error FROM request_logs ORDER BY created_at DESC LIMIT 100`)
+	q := r.URL.Query()
+	limit := 100
+	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 && v <= 500 {
+		limit = v
 	}
-	if err != nil {
-		// Fallback for DBs without ttft_ms column
-		if orgID != "" {
-			rows, err = h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE p.org_id=? ORDER BY rl.created_at DESC LIMIT 100`), orgID)
-		} else {
-			rows, err = h.DB.Query(`SELECT id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream FROM request_logs ORDER BY created_at DESC LIMIT 100`)
+	offset := 0
+	if v, err := strconv.Atoi(q.Get("offset")); err == nil && v >= 0 {
+		offset = v
+	}
+
+	where := []string{}
+	args := []any{}
+	if orgID != "" {
+		where = append(where, "p.org_id=?")
+		args = append(args, orgID)
+	}
+	if m := strings.TrimSpace(q.Get("model")); m != "" {
+		where = append(where, "(rl.model LIKE ? OR rl.model = ?)")
+		args = append(args, "%"+m+"%", m)
+	}
+	if k := strings.TrimSpace(q.Get("key")); k != "" {
+		where = append(where, "rl.key_prefix LIKE ?")
+		args = append(args, k+"%")
+	}
+	if ep := strings.TrimSpace(q.Get("endpoint")); ep != "" {
+		where = append(where, "rl.endpoint LIKE ?")
+		args = append(args, "%"+ep+"%")
+	}
+	if s := strings.TrimSpace(q.Get("status")); s != "" {
+		if s == "failed" {
+			where = append(where, "rl.status >= 400")
+		} else if code, err := strconv.Atoi(s); err == nil {
+			where = append(where, "rl.status=?")
+			args = append(args, code)
 		}
+	}
+	if sv := strings.TrimSpace(q.Get("since")); sv != "" {
+		if t, err := time.Parse(time.RFC3339, sv); err == nil {
+			where = append(where, "rl.created_at >= ?")
+			args = append(args, t.UTC())
+		} else if d, err := time.ParseDuration(sv); err == nil && d > 0 {
+			where = append(where, "rl.created_at >= ?")
+			args = append(args, time.Now().UTC().Add(-d))
+		}
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + strings.Join(where, " AND ")
+	}
+	from := " FROM request_logs rl LEFT JOIN providers p ON rl.provider_id = p.id" + whereSQL
+
+	var total int64
+	if err := h.DB.QueryRow(db.Q(`SELECT COUNT(*)`+from), args...).Scan(&total); err == nil {
+		w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
+	}
+
+	limArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error`+from+` ORDER BY rl.created_at DESC LIMIT ? OFFSET ?`), limArgs...)
+	if err != nil {
+		// Fallback for DBs without ttft_ms/error columns.
+		rows, err = h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream`+from+` ORDER BY rl.created_at DESC LIMIT ? OFFSET ?`), limArgs...)
 		if err != nil {
 			http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
-		var logs []models.RequestLog
+		logs := []models.RequestLog{}
 		for rows.Next() {
 			var l models.RequestLog
-			rows.Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream)
-			logs = append(logs, l)
-		}
-		if logs == nil {
-			logs = []models.RequestLog{}
+			if rows.Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream) == nil {
+				logs = append(logs, l)
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(logs)
 		return
 	}
 	defer rows.Close()
-	var logs []models.RequestLog
+	logs := []models.RequestLog{}
 	for rows.Next() {
 		var l models.RequestLog
 		var ttft sql.NullInt64
 		var errStr sql.NullString
 		if err := rows.Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &ttft, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream, &errStr); err != nil {
-			// Try without error column for backward compat
 			continue
 		}
 		if ttft.Valid {
@@ -853,18 +1027,20 @@ func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 		}
 		logs = append(logs, l)
 	}
-	if logs == nil {
-		logs = []models.RequestLog{}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(logs)
 }
 
 func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	orgID := auth.GetOrgID(r)
-	// Tenant-scoped callers may only read their own org's log rows — this
-	// detail view uniquely carries stored request/response bodies.
+	// resolveScope (not the raw claim) so unscoped non-admins are denied once
+	// organizations exist — this detail view uniquely carries stored
+	// request/response bodies.
+	orgID, scopeOK := h.resolveScope(r)
+	if !scopeOK {
+		httperr.Forbidden(w, "org scope required")
+		return
+	}
 	var l models.RequestLog
 	var ttft sql.NullInt64
 	var errStr, reqBody, respBody sql.NullString

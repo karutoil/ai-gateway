@@ -158,7 +158,11 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	fail := func(reason string, clientGone bool) nativeStreamResult {
 		resp.Body.Close()
 		drainChan(chunks)
-		breaker.Record(providerID, responsesMidStreamFailStatus)
+		// Client disconnects are not the provider's fault — only genuine
+		// upstream deaths feed the breaker the synthetic 599 failure.
+		if !clientGone {
+			breaker.Record(providerID, responsesMidStreamFailStatus)
+		}
 		logStatus := http.StatusBadGateway
 		if clientGone {
 			logStatus = 499 // nginx convention: client closed request

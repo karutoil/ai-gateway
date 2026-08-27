@@ -47,13 +47,27 @@ func (r *DBRecorder) Log(actor, action, targetType, targetID, meta string) error
 
 var _ Recorder = (*DBRecorder)(nil)
 
-// ShouldAudit reports whether a request should create an audit row (write methods on providers/keys/aliases).
+// ShouldAudit reports whether a request should create an audit row. All
+// mutating methods on the control plane (/api/…) are audited — previously
+// only paths containing providers/keys/aliases were, so user CRUD, routing
+// rules, org and settings changes escaped the trail entirely. Auth endpoints
+// are excluded here because login handlers write richer rows themselves
+// (with the authenticated username, not "anonymous").
 func ShouldAudit(r *http.Request) bool {
 	if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodDelete && r.Method != http.MethodPatch {
 		return false
 	}
 	p := r.URL.Path
-	return strings.Contains(p, "/providers") || strings.Contains(p, "/keys") || strings.Contains(p, "/aliases")
+	if !strings.HasPrefix(p, "/api/") {
+		return false
+	}
+	if strings.HasPrefix(p, "/api/auth/") || p == "/api/auth/login" || p == "/api/auth/oidc" {
+		return false
+	}
+	// The SPA + dashboard API live under /api; the proxy plane (/v1/*,
+	// /chat/completions, …) is intentionally not audited per-request — usage
+	// rows in request_logs already cover it.
+	return true
 }
 
 // targetFromPath derives a coarse target type from the URL path.
@@ -65,6 +79,18 @@ func targetFromPath(p string) string {
 		return "key"
 	case strings.Contains(p, "/aliases"):
 		return "alias"
+	case strings.Contains(p, "/users"):
+		return "user"
+	case strings.Contains(p, "/orgs"):
+		return "organization"
+	case strings.Contains(p, "/lb/") || strings.Contains(p, "/routing"):
+		return "routing_rule"
+	case strings.Contains(p, "/settings"):
+		return "setting"
+	case strings.Contains(p, "/models"):
+		return "model"
+	case strings.Contains(p, "/profile"):
+		return "profile"
 	default:
 		return "unknown"
 	}

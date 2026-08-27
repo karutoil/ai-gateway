@@ -66,6 +66,36 @@ async function req(path: string, opts: RequestInit = {}) {
   try { return await res.json() } catch { return null }
 }
 
+/**
+ * Extract a readable error message from a raw fetch response body — mirrors
+ * the envelope handling in req() so callers using raw fetch() (login,
+ * passkey flows) render the same clean messages instead of raw JSON.
+ */
+export function extractApiError(text: string, fallback = 'request failed'): string {
+  const t = (text || '').trim()
+  if (!t) return fallback
+  try {
+    const j = JSON.parse(t)
+    if (typeof j?.error === 'string') return j.error
+    else if (j?.error && typeof j.error.message === 'string') return j.error.message
+    else if (typeof j?.message === 'string') return j.message
+  } catch {}
+  return t.length > 400 ? t.slice(0, 400) + '…' : t
+}
+
+/** Query params accepted by GET /api/logs. */
+export type LogsQuery = {
+  limit?: number
+  offset?: number
+  model?: string
+  key?: string
+  endpoint?: string
+  /** "failed" or an HTTP status code as a string */
+  status?: string
+  /** e.g. "1h", "24h", "7d", "30d" */
+  since?: string
+}
+
 // Load-balancer routing rules: per-model ordered provider groups.
 // Rotation happens across requests; a failing member returns its own error
 // (no automatic failover) until an admin removes/reorders it. Qualified
@@ -86,6 +116,8 @@ export const api = {
   providers: {
     list: () => req('/api/providers'),
     create: (data: any) => req('/api/providers', { method:'POST', body: JSON.stringify(data)}),
+    update: (id: string, data: { name?: string; base_url?: string; api_key?: string }) =>
+      req(`/api/providers/${encodeURIComponent(id)}`, { method:'PUT', body: JSON.stringify(data)}),
     remove: (id: string) => req(`/api/providers/${id}`, { method:'DELETE'}),
     discover: (id: string) => req(`/api/providers/${id}/discover`, { method:'POST'}),
   },
@@ -108,6 +140,29 @@ export const api = {
   },
   stats: () => req('/api/stats'),
   logs: () => req('/api/logs'),
+  /**
+   * Paginated/filtered request logs. Response stays a JSON array; the total
+   * matching row count rides on the X-Total-Count header.
+   */
+  logsQuery: async (params: LogsQuery = {}): Promise<{ rows: any[]; total: number | null }> => {
+    const p = new URLSearchParams()
+    if (params.limit != null) p.set('limit', String(params.limit))
+    if (params.offset != null) p.set('offset', String(params.offset))
+    if (params.model) p.set('model', params.model)
+    if (params.key) p.set('key', params.key)
+    if (params.endpoint) p.set('endpoint', params.endpoint)
+    if (params.status) p.set('status', params.status)
+    if (params.since) p.set('since', params.since)
+    const res = await fetch(apiUrl(`/api/logs?${p.toString()}`), { credentials: 'same-origin' })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(extractApiError(text, `log query failed (${res.status})`))
+    }
+    const rows = await res.json()
+    const totalHdr = res.headers.get('X-Total-Count')
+    const total = totalHdr != null && totalHdr !== '' && !Number.isNaN(Number(totalHdr)) ? Number(totalHdr) : null
+    return { rows: Array.isArray(rows) ? rows : [], total }
+  },
   health: () => fetch(apiUrl('/health')).then(r=>r.json()),
   catalog: {
     list: (q?: string, provider?: string, reasoning?: boolean, limit?: number) => {
@@ -126,6 +181,8 @@ export const api = {
     deleteAlias: (alias:string) => req(`/api/models/aliases/${encodeURIComponent(alias)}`, { method:'DELETE'}),
     settings: () => req('/api/models/settings'),
     putSettings: (data:any) => req('/api/models/settings', { method:'PUT', body: JSON.stringify(data)}),
+    /** DELETE /api/models/settings/{key} — 204 on success. */
+    deleteSetting: (key: string) => req(`/api/models/settings/${encodeURIComponent(key)}`, { method:'DELETE'}),
   },
   providerModels: {
     list: (providerId?: string, q?: string) => {
@@ -164,6 +221,24 @@ export const api = {
     update: (id:string, data:any) => req(`/api/admin/users/${id}`, { method:'PUT', body: JSON.stringify(data)}),
     remove: (id:string) => req(`/api/admin/users/${id}`, { method:'DELETE'}),
     resetPassword: (id:string, password:string) => req(`/api/admin/users/${id}/reset-password`, { method:'POST', body: JSON.stringify({password})}),
+  },
+  /** Admin-only audit trail: GET /api/audit?limit=&offset=&actor= */
+  audit: {
+    list: async (params: { limit?: number; offset?: number; actor?: string } = {}): Promise<{ rows: any[]; total: number | null }> => {
+      const p = new URLSearchParams()
+      if (params.limit != null) p.set('limit', String(params.limit))
+      if (params.offset != null) p.set('offset', String(params.offset))
+      if (params.actor) p.set('actor', params.actor)
+      const res = await fetch(apiUrl(`/api/audit?${p.toString()}`), { credentials: 'same-origin' })
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(extractApiError(text, `audit query failed (${res.status})`))
+      }
+      const rows = await res.json()
+      const totalHdr = res.headers.get('X-Total-Count')
+      const total = totalHdr != null && totalHdr !== '' && !Number.isNaN(Number(totalHdr)) ? Number(totalHdr) : null
+      return { rows: Array.isArray(rows) ? rows : [], total }
+    },
   },
   passkey: {
     registerBegin: (userId?: string) => req(`/api/auth/passkey/register/begin${userId ? `?user_id=${userId}` : ''}`, { method:'POST' }),

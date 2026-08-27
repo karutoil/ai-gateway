@@ -276,21 +276,61 @@ export function Textarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement
 /* Copyable value                                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Best-effort clipboard write with a plain-HTTP fallback (navigator.clipboard
+ * is only available on secure origins, so LAN installs need the textarea +
+ * execCommand path). Returns 'copied' | 'failed'.
+ */
+function copyText(value: string): Promise<'copied' | 'failed'> {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(value).then(
+      () => 'copied' as const,
+      () => legacyCopy(value),
+    )
+  }
+  return Promise.resolve(legacyCopy(value))
+}
+
+function legacyCopy(value: string): 'copied' | 'failed' {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = value
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.left = '-9999px'
+    document.body.appendChild(ta)
+    ta.select()
+    ta.setSelectionRange(0, value.length)
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok ? 'copied' : 'failed'
+  } catch {
+    return 'failed'
+  }
+}
+
 export function CopyButton({ value, label, size = 'sm' }: { value: string; label?: string; size?: 'sm' | 'md' }) {
   const [done, setDone] = useState(false)
+  const [failed, setFailed] = useState(false)
   return (
     <Button
       size={size} variant="ghost"
       title={label || 'Copy'}
       onClick={() => {
-        navigator.clipboard?.writeText(value).then(
-          () => { setDone(true); setTimeout(() => setDone(false), 1200) },
-          () => {/* clipboard unavailable */},
-        )
+        copyText(value).then((result) => {
+          if (result === 'copied') {
+            setFailed(false)
+            setDone(true)
+            setTimeout(() => setDone(false), 1200)
+          } else {
+            setFailed(true)
+            setTimeout(() => setFailed(false), 3000)
+          }
+        })
       }}
     >
-      <Icon name={done ? 'check' : 'copy'} size={size === 'sm' ? 13 : 15} className={done ? 'text-teal' : ''} />
-      {done ? 'Copied' : ''}
+      <Icon name={failed ? 'alert' : done ? 'check' : 'copy'} size={size === 'sm' ? 13 : 15} className={done ? 'text-teal' : failed ? 'text-red-400' : ''} />
+      {done ? 'Copied' : failed ? 'Copy failed — select manually' : ''}
     </Button>
   )
 }
@@ -383,7 +423,7 @@ export function Modal({ open, onClose, title, children, width = 'max-w-lg' }: {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm animate-fade" onClick={onClose} />
-      <div className={`relative w-full ${width} card-modal rounded-xl border border-stone bg-surface shadow-2xl`}>
+      <div role="dialog" aria-modal="true" aria-label={title} className={`relative w-full ${width} card-modal rounded-xl border border-stone bg-surface shadow-2xl`}>
         <div className="flex items-center justify-between px-5 py-4 border-b border-stone">
           <h2 className="font-semibold tracking-tight">{title}</h2>
           <button onClick={onClose} aria-label="Close"

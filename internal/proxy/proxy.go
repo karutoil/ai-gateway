@@ -478,6 +478,12 @@ type attemptOutcome struct {
 	status int
 	// retriable: caller may advance to another candidate/provider.
 	retriable bool
+	// errSnippet: bounded upstream error body (5xx/429) or transport error
+	// text, for operator diagnostics on terminal failure. Empty on success.
+	errSnippet string
+	// errText: transport-level error string (Client.Do failure). Empty when
+	// the upstream answered with a status.
+	errText string
 }
 
 // proxyWithMetrics handles both anthropic and openai upstreams correctly.
@@ -525,8 +531,8 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		return attemptOutcome{committed: true, status: http.StatusServiceUnavailable}
 	}
 
-	ctx := r.Context()
-	var cancelFn context.CancelFunc
+		ctx := r.Context()
+		var cancelFn context.CancelFunc
 	if h.Timeouts.RequestTotal > 0 {
 		ctx, cancelFn = context.WithTimeout(ctx, h.Timeouts.RequestTotal)
 		defer cancelFn()
@@ -548,6 +554,9 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		lastErr    error
 		lastHdr    http.Header
 		lastBody   []byte
+		// lastErrSnippet holds a bounded sample of the most recent upstream
+		// error body so terminal failures can say WHY the provider 5xx'd.
+		lastErrSnippet []byte
 	)
 
 	for attempt := 0; ; attempt++ {
@@ -562,18 +571,20 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			// streams and buffered requests can recover here.
 			status := 0
 			var retryHdr http.Header
+			var retryBody []byte
 			if err == nil {
 				status = resp.StatusCode
-				// Capture Retry-After before the body is discarded so the
-				// backoff honors the provider's requested delay.
+				// Retain headers + body: the terminal response after the last
+				// attempt must relay the upstream's real error (quota message,
+				// Retry-After) instead of a generic gateway envelope.
 				retryHdr = resp.Header.Clone()
-				io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+				retryBody, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 				resp.Body.Close()
 				breaker.Record(providerID, status)
 			} else {
 				breaker.Record(providerID, 0)
 			}
-			lastErr, lastStatus, lastHdr, lastBody = err, status, nil, nil
+			lastErr, lastStatus, lastHdr, lastBody = err, status, retryHdr, retryBody
 			if retry.ShouldRetry(attempt, retryableCode(status)) {
 				sleepCtx(ctx, retryAfterDelay(retryHdr, retry.Backoff(attempt)))
 				continue
@@ -1444,7 +1455,16 @@ func (h *Handler) getReasoningConfig(providerID, modelID string) (reasoning bool
 	}
 	var r bool
 	var rt, rl, rol sql.NullString
-	err := h.DB.QueryRow(db.Q(`SELECT reasoning, reasoning_type, reasoning_levels, reasoning_output_limits FROM provider_models WHERE provider_id=? AND model_id=?`), providerID, modelID).Scan(&r, &rt, &rl, &rol)
+	pmQuery := db.Q(`SELECT reasoning, reasoning_type, reasoning_levels, reasoning_output_limits FROM provider_models WHERE provider_id=? AND model_id=?`)
+	err := h.DB.QueryRow(pmQuery, providerID, modelID).Scan(&r, &rt, &rl, &rol)
+	if err != nil {
+		// /v1/models advertises qualified ids ("provider/model") but rows are
+		// stored unqualified. Retry with the suffix; the lookup is already
+		// scoped to the pinned provider, so stripping is safe.
+		if short := shortModelID(modelID); short != modelID {
+			err = h.DB.QueryRow(pmQuery, providerID, short).Scan(&r, &rt, &rl, &rol)
+		}
+	}
 	if err != nil {
 		// fallback to catalog
 		if h.CatalogStore != nil {
@@ -1453,7 +1473,7 @@ func (h *Handler) getReasoningConfig(providerID, modelID string) (reasoning bool
 				rt.String, rt.Valid = cm.ReasoningType, cm.ReasoningType != ""
 				rl.String, rl.Valid = cm.ReasoningLevels, cm.ReasoningLevels != ""
 				rol.String, rol.Valid = cm.ReasoningOutputLimits, cm.ReasoningOutputLimits != ""
-			} else if cm, err := h.CatalogStore.GetByShortID(modelID); err == nil {
+			} else if cm, err := h.CatalogStore.GetByShortID(shortModelID(modelID)); err == nil {
 				r = cm.Reasoning
 				rt.String, rt.Valid = cm.ReasoningType, cm.ReasoningType != ""
 				rl.String, rl.Valid = cm.ReasoningLevels, cm.ReasoningLevels != ""

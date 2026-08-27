@@ -49,6 +49,20 @@ var embeddedWeb embed.FS
 var embeddedOpenAPI []byte
 
 func main() {
+	// `gateway version` / `gateway --version`: print version and exit.
+	// Used by install.sh to detect the currently installed release.
+	if len(os.Args) > 1 {
+		arg := os.Args[1]
+		if arg == "version" || arg == "--version" || arg == "-v" {
+			commit := "unknown"
+			if c := os.Getenv("GATEWAY_COMMIT"); c != "" {
+				commit = c
+			}
+			fmt.Printf("ai-gateway %s (commit %s)\n", handler.GatewayVersion, commit)
+			return
+		}
+	}
+
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
@@ -56,6 +70,10 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
 	}
+	// config.Load loads .env files, but webhook.Global was already built in
+	// package init() from the (then-empty) process env — rebuild it so
+	// WEBHOOK_URL/WEBHOOK_SECRET configured via .env actually take effect.
+	webhook.ReinitFromEnv()
 	cfgTrustedProxies = cfg.TrustedProxies
 
 	// Phase 3 dialect toggle: postgres:// uses lib/pq; sqlite remains default
@@ -214,15 +232,20 @@ func main() {
 		}
 		resp := map[string]any{
 			"status":    "ok",
-			"version":   "1.6.0",
+			"version":   handler.GatewayVersion,
 			"config_ok": cfg.ConfigOK(),
 			"db":        dbStatus,
 		}
-		if cfg.PublicURL != "" {
-			resp["public_url"] = cfg.PublicURL
+		// Configuration/deployment detail (cors origins, public URL) is only
+		// disclosed to loopback callers — orchestrator probes and the launch
+		// gate run locally; unauthenticated remote callers get the minimal set.
+		if isLoopbackRequest(r) {
+			if cfg.PublicURL != "" {
+				resp["public_url"] = cfg.PublicURL
+			}
+			// expose cors for tunnel debugging (not sensitive locally)
+			resp["cors"] = cfg.AllowedOrigins()
 		}
-		// expose cors for tunnel debugging (not sensitive)
-		resp["cors"] = cfg.AllowedOrigins()
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	// readiness: checks db.Ping, returns 503 when DB down
@@ -254,6 +277,7 @@ func main() {
 		Discovery:     discoveryService,
 		UserStore:     userStore,
 		Breaker:       proxyHandler.Breaker,
+		Recorder:      rec,
 		AuthLimiter:   middleware.NewAuthRateLimiter(),
 	}
 	usersHandler := &handler.UsersHandler{
@@ -306,6 +330,7 @@ func main() {
 				r.Post("/auth/passkey/recovery/generate", passkeyHandler.GenerateRecovery)
 				r.Post("/auth/passkey/disable", passkeyHandler.DisablePasskey)
 			}
+			r.With(middleware.RequireRole("admin")).Get("/audit", admin.ListAudit)
 			r.Route("/models", catalogHandler.Routes)
 			// Load-balancer rule management (admin-only).
 			routingHandler := handler.NewRoutingHandler(lbStore)
@@ -376,7 +401,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info().Str("addr", addr).Str("public_url", cfg.PublicURL).Strs("cors", cfg.AllowedOrigins()).Msg("starting AI Gateway 1.6 (tunnel-ready)")
+		log.Info().Str("addr", addr).Str("public_url", cfg.PublicURL).Strs("cors", cfg.AllowedOrigins()).Msg("starting AI Gateway " + handler.GatewayVersion + " (tunnel-ready)")
 		if cfg.PublicURL != "" {
 			log.Info().Str("public_url", cfg.PublicURL).Msg("Cloudflare Tunnel: ensure cloudflared points to http://localhost:" + cfg.Port + " and PUBLIC_URL matches tunnel hostname")
 		}
@@ -484,8 +509,26 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-XSS-Protection", "0")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		// Baseline CSP: same-origin resources; inline kept because the Vite
+		// build injects inline styles/bootstrap script. Still blocks external
+		// script/object/iframe injection paths an XSS payload relies on.
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isLoopbackRequest reports whether the request originates from a loopback
+// address (directly or via a TRUSTED proxy header resolution already applied).
+func isLoopbackRequest(r *http.Request) bool {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // cfgTrustedProxies is set in main() from config before the router starts.

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rs/zerolog/log"
+
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -233,10 +235,23 @@ func Migrate(db *sql.DB) error {
 		}
 		trimmed := strings.TrimSpace(m.sql)
 		if trimmed != "" {
-			if _, err := db.Exec(trimmed); err != nil {
-				// mark dirty so operator can inspect; return error
+			// Run each migration file inside a transaction so a mid-file
+			// failure cannot leave partial DDL: SQLite supports transactional
+			// DDL; Postgres too. On failure the rollback leaves the DB at the
+			// previous version and we mark dirty for the operator.
+			tx, txErr := db.Begin()
+			if txErr != nil {
+				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
+				return fmt.Errorf("migration %d: begin transaction failed: %w", m.version, txErr)
+			}
+			if _, err := tx.Exec(trimmed); err != nil {
+				tx.Rollback()
 				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
 				return fmt.Errorf("migration %d failed: %w", m.version, err)
+			}
+			if err := tx.Commit(); err != nil {
+				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
+				return fmt.Errorf("migration %d commit failed: %w", m.version, err)
 			}
 		}
 		// Run idempotent ALTERs for hardening (budget columns etc). Ignores duplicate-column errors.
@@ -374,6 +389,22 @@ func Migrate(db *sql.DB) error {
 
 // applyHardeningV2Alters adds production-hardening columns idempotently.
 // All statements are tolerant of duplicate-column errors (existing DBs).
+// execAlterIdempotent runs an additive ALTER, tolerating "column already
+// exists" errors but LOGGING anything else — the old blanket `_, _ =` swallow
+// hid genuine failures (disk full, permissions, locks) that only surfaced
+// later as runtime query errors.
+func execAlterIdempotent(db *sql.DB, stmt string) {
+	if _, err := db.Exec(stmt); err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "duplicate column") || // sqlite
+			strings.Contains(msg, "already exists") || // postgres 42710
+			strings.Contains(msg, "duplicate name") { // sqlite alt form
+			return
+		}
+		log.Error().Err(err).Str("stmt", stmt).Msg("schema ALTER failed (non-duplicate)")
+	}
+}
+
 func applyHardeningV2Alters(db *sql.DB) {
 	cols := []string{
 		"ALTER TABLE dashboard_users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0",
@@ -383,7 +414,7 @@ func applyHardeningV2Alters(db *sql.DB) {
 		"ALTER TABLE gateway_keys ADD COLUMN metadata TEXT",
 	}
 	for _, stmt := range cols {
-		_, _ = db.Exec(stmt)
+		execAlterIdempotent(db, stmt)
 	}
 	// Best-effort UNIQUE on gateway_keys.prefix. Refuses (with a warning) when
 	// legacy rows already contain duplicate prefixes instead of deleting data.
@@ -430,7 +461,7 @@ func applyLegacyAlters(db *sql.DB) {
 		"ALTER TABLE provider_models ADD COLUMN structured_output BOOLEAN",
 	}
 	for _, stmt := range cols {
-		_, _ = db.Exec(stmt) // ignore error if exists
+		execAlterIdempotent(db, stmt) // ignore error if exists
 	}
 }
 
@@ -442,7 +473,7 @@ func applyHardeningAlters(db *sql.DB) {
 		"ALTER TABLE system_config ADD COLUMN description TEXT",
 	}
 	for _, stmt := range cols {
-		_, _ = db.Exec(stmt)
+		execAlterIdempotent(db, stmt)
 	}
 }
 

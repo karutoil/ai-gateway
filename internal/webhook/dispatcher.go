@@ -2,6 +2,9 @@ package webhook
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -34,6 +37,11 @@ const WebhookTimeout = 5 * time.Second
 type HTTPDispatcher struct {
 	URL    string
 	Client *http.Client
+	// Secret, when non-empty, signs deliveries:
+	// X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the raw body> — lets
+	// consumers verify authenticity instead of trusting any caller that
+	// knows the URL.
+	Secret string
 
 	queue    chan queuedEvent
 	stop     chan struct{}
@@ -58,16 +66,22 @@ func NewFromEnv() Dispatcher {
 	if url == "" {
 		return &EmptyDispatcher{}
 	}
-	return New(url)
+	return NewSigned(url, os.Getenv("WEBHOOK_SECRET"))
 }
 
 // New returns dispatcher based on explicit URL (empty => Empty).
 func New(url string) Dispatcher {
+	return NewSigned(url, "")
+}
+
+// NewSigned is New with optional HMAC signing secret (WEBHOOK_SECRET).
+func NewSigned(url, secret string) Dispatcher {
 	if url == "" {
 		return &EmptyDispatcher{}
 	}
 	return &HTTPDispatcher{
 		URL:    url,
+		Secret: secret,
 		Client: &http.Client{Timeout: WebhookTimeout},
 		queue:  make(chan queuedEvent, QueueDepth),
 		stop:   make(chan struct{}),
@@ -159,6 +173,11 @@ func (h *HTTPDispatcher) deliver(event string, body []byte) bool {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Webhook-Event", event)
+	if h.Secret != "" {
+		mac := hmac.New(sha256.New, []byte(h.Secret))
+		mac.Write(body)
+		req.Header.Set("X-Webhook-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
 	resp, err := h.Client.Do(req)
 	if err != nil {
 		log.Error().Err(err).Str("event", event).Str("url", h.URL).Msg("webhook emit failed")
@@ -173,8 +192,14 @@ func (h *HTTPDispatcher) deliver(event string, body []byte) bool {
 var Global Dispatcher = &EmptyDispatcher{}
 
 func init() {
-	// Initialize Global from env at startup; audit recorder will call Global.Emit.
+	ReinitFromEnv()
+}
+
+// ReinitFromEnv (re)creates Global from the environment. init() runs BEFORE
+// config.Load() loads .env files, so WEBHOOK_URL set only via .env was
+// silently ignored — production wiring calls this again after config.Load.
+func ReinitFromEnv() {
 	if url := os.Getenv("WEBHOOK_URL"); url != "" {
-		Global = New(url)
+		Global = NewSigned(url, os.Getenv("WEBHOOK_SECRET"))
 	}
 }

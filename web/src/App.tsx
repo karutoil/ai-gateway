@@ -11,8 +11,10 @@ import Analytics from './pages/Analytics'
 import Settings from './pages/Settings'
 import Teams from './pages/Teams'
 import Users from './pages/Users'
+import Audit from './pages/Audit'
 import Profile from './pages/Profile'
 import { authenticatePasskey } from './lib/webauthn'
+import { extractApiError } from './lib/api'
 import {
   Icon, Button, Input, Card, ErrorNote, SegmentedControl,
   useClickOutside, useToastStore, Toaster, type IconName,
@@ -25,6 +27,9 @@ function useAuth() {
   // "gw_token" session cookie — the JWT is never stored client-side.
   const [user, setUser] = useState<SessionUser|null>(null)
   const [checking, setChecking] = useState(true)
+  // One-line message shown above the login form (e.g. after a password change
+  // revoked the session, or after a 401 mid-session).
+  const [notice, setNotice] = useState('')
   const isAuthed = !!user
 
   useEffect(() => {
@@ -42,6 +47,16 @@ function useAuth() {
     return () => { cancelled = true }
   }, [])
 
+  // api.ts dispatches "gw:unauthorized" whenever any request comes back 401
+  // (expired/revoked session cookie). Clear identity so the login screen
+  // renders — previously this event had no listener and pages kept failing
+  // silently behind a stale "signed-in" shell.
+  useEffect(() => {
+    const onUnauthorized = () => setUser(null)
+    window.addEventListener('gw:unauthorized', onUnauthorized)
+    return () => window.removeEventListener('gw:unauthorized', onUnauthorized)
+  }, [])
+
   const applyIdentity = (u: Partial<SessionUser>|undefined) => {
     setUser({ username: u?.username || '', role: u?.role || '' })
   }
@@ -52,7 +67,7 @@ function useAuth() {
     const res = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify(body)})
     if (!res.ok) {
       const t = await res.text()
-      throw new Error(t || 'login failed')
+      throw new Error(extractApiError(t, 'login failed'))
     }
     const data = await res.json()
     try {
@@ -74,12 +89,15 @@ function useAuth() {
       .catch(()=>{})
   }
 
-  const logout = () => {
+  const logout = (message?: string) => {
     fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(()=>{})
     setUser(null)
+    setNotice(message || '')
   }
 
-  return { isAuthed, checking, login, loginWithToken, logout, role: user?.role||'', username: user?.username||'' }
+  const clearNotice = () => setNotice('')
+
+  return { isAuthed, checking, login, loginWithToken, logout, clearNotice, notice, role: user?.role||'', username: user?.username||'' }
 }
 
 function useTheme() {
@@ -122,8 +140,9 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
     title: 'Access',
     items: [
       { to: '/keys', label: 'API Keys', icon: 'key' },
-      { to: '/teams', label: 'Teams', icon: 'users' },
+      { to: '/teams', label: 'Teams', icon: 'users', adminOnly: true },
       { to: '/users', label: 'Users', icon: 'userCog', adminOnly: true },
+      { to: '/audit', label: 'Audit', icon: 'shield', adminOnly: true },
     ],
   },
   {
@@ -221,7 +240,7 @@ function BrandMark({ collapsed }: { collapsed?: boolean }) {
 /* ------------------------------------------------------------------ */
 
 export default function App() {
-  const { isAuthed, checking, login, loginWithToken, logout, role, username: accountName } = useAuth()
+  const { isAuthed, checking, login, loginWithToken, logout, clearNotice, notice, role, username: accountName } = useAuth()
   const { theme, toggle } = useTheme()
   const loc = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(false)     // mobile drawer
@@ -250,7 +269,16 @@ export default function App() {
   }
 
   if (!isAuthed) {
-    return <LoginScreen theme={theme} toggle={toggle} login={login} loginWithToken={loginWithToken} />
+    return (
+      <>
+        <LoginScreen
+          theme={theme} toggle={toggle} login={login} loginWithToken={loginWithToken}
+          notice={notice} onNoticeConsumed={clearNotice}
+        />
+        {/* Mounted outside the auth branch so login-screen toasts are visible. */}
+        <Toaster />
+      </>
+    )
   }
 
   /* ---------------- Authenticated shell ---------------- */
@@ -340,17 +368,18 @@ export default function App() {
         <main key={loc.pathname} className="max-w-[1240px] mx-auto px-4 lg:px-6 py-6 lg:py-8 animate-page min-h-[calc(100vh-56px)]">
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/providers" element={<Providers />} />
-            <Route path="/routing" element={<Routing />} />
-            <Route path="/keys" element={<Keys />} />
-            <Route path="/models" element={<Models />} />
+            <Route path="/providers" element={<Providers role={role} />} />
+            <Route path="/routing" element={<Routing role={role} />} />
+            <Route path="/keys" element={<Keys role={role} />} />
+            <Route path="/models" element={<Models role={role} />} />
             <Route path="/playground" element={<Playground />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/analytics" element={<Analytics />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/teams" element={<Teams />} />
+            <Route path="/settings" element={<Settings role={role} />} />
+            <Route path="/teams" element={<Teams role={role} />} />
             <Route path="/users" element={role==='admin' ? <Users /> : <Navigate to="/" replace />} />
-            <Route path="/profile" element={<Profile />} />
+            <Route path="/audit" element={role==='admin' ? <Audit /> : <Navigate to="/" replace />} />
+            <Route path="/profile" element={<Profile onSessionRevoked={() => logout('Password changed — please sign in again')} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>
@@ -368,6 +397,12 @@ export default function App() {
 function UserMenu({ accountName, role, onLogout }: { accountName: string; role: string; onLogout: () => void }) {
   const [open, setOpen] = useState(false)
   const ref = useClickOutside(() => setOpen(false))
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [open])
   return (
     <div className="relative" ref={ref}>
       <button onClick={() => setOpen(o => !o)}
@@ -417,10 +452,11 @@ function Avatar({ name, size = 7 }: { name: string; size?: number }) {
 /* Login                                                               */
 /* ------------------------------------------------------------------ */
 
-function LoginScreen({ theme, toggle, login, loginWithToken }: {
+function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeConsumed }: {
   theme: string; toggle: () => void
   login: (u: string, p: string) => Promise<void>
   loginWithToken: (tok?: string, extra?: { username?: string; role?: string }) => void
+  notice?: string; onNoticeConsumed?: () => void
 }) {
   const [username, setUsername] = useState('')
   const [pw, setPw] = useState('')
@@ -431,6 +467,7 @@ function LoginScreen({ theme, toggle, login, loginWithToken }: {
   const toastErr = useToastStore((s) => s.push)
 
   const doLogin = async () => {
+    onNoticeConsumed?.()
     setErr(''); setBusy(true)
     try { await login(username, pw) }
     catch (e:any){ const m = e.message||String(e); setErr(m); toastErr('error','Login failed') }
@@ -441,11 +478,11 @@ function LoginScreen({ theme, toggle, login, loginWithToken }: {
     setErr(''); setBusy(true)
     try{
       const r = await fetch('/api/auth/passkey/login/begin', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify({ username })})
-      if(!r.ok) throw new Error(await r.text())
+      if(!r.ok) throw new Error(extractApiError(await r.text(), 'passkey login failed'))
       const begin = await r.json()
       const {session, credential} = await authenticatePasskey(begin)
       const r2 = await fetch('/api/auth/passkey/login/finish', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify({ session, credential })})
-      if(!r2.ok) throw new Error(await r2.text())
+      if(!r2.ok) throw new Error(extractApiError(await r2.text(), 'passkey login failed'))
       const data = await r2.json()
       loginWithToken(data.token, {username: data.username, role: data.role})
     }catch(e:any){ const m = e.message||String(e); setErr(m); toastErr('error','Passkey login failed') }
@@ -456,7 +493,7 @@ function LoginScreen({ theme, toggle, login, loginWithToken }: {
     setErr(''); setBusy(true)
     try{
       const r = await fetch('/api/auth/recovery/verify', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify({ username, code: recoveryCode })})
-      if(!r.ok) throw new Error(await r.text())
+      if(!r.ok) throw new Error(extractApiError(await r.text(), 'recovery failed'))
       const data = await r.json()
       loginWithToken(data.token, {username: data.username, role: data.role})
     }catch(e:any){ const m = e.message||String(e); setErr(m); toastErr('error','Recovery failed') }
@@ -517,18 +554,31 @@ function LoginScreen({ theme, toggle, login, loginWithToken }: {
             ]}
           />
 
+          {notice && (
+            <div className="mt-4 flex items-start gap-2 rounded-lg border border-teal/30 bg-teal/10 px-3 py-2.5 text-sm text-teal">
+              <Icon name="check" size={15} className="mt-0.5 shrink-0" />
+              <span>{notice}</span>
+            </div>
+          )}
+
           <div className="mt-5 space-y-4">
             {mode !== 'recovery' && (
               <Input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} autoComplete="username" />
             )}
             {mode==='password' && (
               <>
+                <Input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} autoComplete="username" />
                 <Input placeholder="Password" type="password" value={pw} onChange={e=>setPw(e.target.value)}
                   autoComplete="current-password" onKeyDown={e=>{ if(e.key==='Enter') doLogin() }} />
                 <ErrorNote message={err} />
                 <Button variant="primary" disabled={busy} onClick={doLogin} className="w-full">
                   {busy ? 'Signing in…' : 'Sign in'}
                 </Button>
+                <p className="text-[11px] text-muted leading-relaxed text-center">
+                  Default sign-in: username <code className="font-mono text-muted">admin</code> with the{' '}
+                  <code className="font-mono text-muted">ADMIN_PASSWORD</code> you configured (default{' '}
+                  <code className="font-mono text-muted">admin123</code>). Change it after first login.
+                </p>
               </>
             )}
             {mode==='passkey' && (
