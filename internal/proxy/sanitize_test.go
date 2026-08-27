@@ -99,6 +99,93 @@ func TestSanitizeKeepsAssistantNullContentWithToolCalls(t *testing.T) {
 	}
 }
 
+// Images in tool-result content arrays 400 on strict upstreams, but the SAME
+// image reaches the model from a user message right after the tool message
+// (verified live). The sanitizer must relocate, not drop.
+func TestSanitizeRelocatesToolResultImageToUserMessage(t *testing.T) {
+	const png = "data:image/png;base64,iVBORw0KGgo="
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"user","content":"screenshot?"},` +
+		`{"role":"tool","tool_call_id":"c1","content":[` +
+		`{"type":"text","text":"captured"},` +
+		`{"type":"image_url","image_url":{"url":"` + png + `"}}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 messages (tool + synthetic user), got %d", len(msgs))
+	}
+	tool := msgs[1]
+	if role, _ := tool["role"].(string); role != "tool" {
+		t.Fatalf("msgs[1] role = %v, want tool", tool["role"])
+	}
+	content, _ := tool["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("tool content should keep only the text part, got %v", content)
+	}
+	syn := msgs[2]
+	if role, _ := syn["role"].(string); role != "user" {
+		t.Fatalf("synthetic message role = %v, want user", syn["role"])
+	}
+	synContent, _ := syn["content"].([]interface{})
+	if len(synContent) != 2 {
+		t.Fatalf("synthetic user content should be [text, image], got %d parts", len(synContent))
+	}
+	img, _ := synContent[1].(map[string]interface{})
+	if img["type"] != "image_url" {
+		t.Fatalf("synthetic image part type = %v", img["type"])
+	}
+	iu, _ := img["image_url"].(map[string]interface{})
+	if iu["url"] != png {
+		t.Fatalf("image url not preserved: %v", iu["url"])
+	}
+}
+
+// Anthropic-style base64 image leaks in tool results must be converted to the
+// OpenAI image_url shape in the synthetic user message.
+func TestSanitizeRelocatesAnthropicStyleToolImage(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"tool","tool_call_id":"c1","content":[` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	if len(msgs) != 2 {
+		t.Fatalf("want tool + synthetic user, got %d messages", len(msgs))
+	}
+	// Empty-after-strip tool content keeps a breadcrumb instead of [].
+	toolContent, _ := msgs[0]["content"].([]interface{})
+	if len(toolContent) != 1 {
+		t.Fatalf("tool content should hold one breadcrumb text part, got %v", toolContent)
+	}
+	synContent, _ := msgs[1]["content"].([]interface{})
+	if len(synContent) != 2 {
+		t.Fatalf("synthetic content should be [text, image], got %d", len(synContent))
+	}
+	img, _ := synContent[1].(map[string]interface{})
+	iu, _ := img["image_url"].(map[string]interface{})
+	want := "data:image/png;base64,iVBOR"
+	if iu["url"] != want {
+		t.Fatalf("converted url = %v, want %v", iu["url"], want)
+	}
+}
+
+// Unknown non-image blocks in tool content become text placeholders on the
+// tool message itself (no synthetic user message needed).
+func TestSanitizePlaceholderForUnknownToolBlocks(t *testing.T) {
+	in := []byte(`{"model":"m","messages":[` +
+		`{"role":"tool","tool_call_id":"c1","content":[` +
+		`{"type":"text","text":"a"},` +
+		`{"type":"tool_result","content":[{"type":"text","text":"nested"}]}]}]}`)
+	out := sanitizeOpenAICompatBody(in)
+	msgs := parseMsgs(t, out)
+	if len(msgs) != 1 {
+		t.Fatalf("no synthetic message expected, got %d total", len(msgs))
+	}
+	content, _ := msgs[0]["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("tool content = %v, want [text, placeholder-text]", content)
+	}
+}
+
 func TestSanitizePassthroughOpaqueBody(t *testing.T) {
 	// Not an object with a messages array — relay byte-for-byte.
 	for _, in := range []string{
