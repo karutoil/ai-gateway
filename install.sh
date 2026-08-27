@@ -15,6 +15,7 @@
 #   GATEWAY_INSTALL_DIR=/opt/ai-gateway
 #   GATEWAY_REPO=karutoil/ai-gateway
 #   GATEWAY_YES=1             accept every default without prompting
+#   GATEWAY_PURGE_DATA=1      `uninstall` defaults to wiping data (still shown)
 #
 # The installed binary is fully self-contained (web UI embedded, SQLite
 # statically linked): no Go, Node or system packages needed at install time.
@@ -198,7 +199,9 @@ download_release() {
 # Locate an existing installation
 # ---------------------------------------------------------------------------
 find_install_dir() {
-  if [ -n "${GATEWAY_INSTALL_DIR:-}" ]; then
+  # Explicit override only counts if something is actually installed there
+  # (otherwise a fresh GATEWAY_INSTALL_DIR would look like an "existing install").
+  if [ -n "${GATEWAY_INSTALL_DIR:-}" ] && [ -x "${GATEWAY_INSTALL_DIR}/gateway" ]; then
     printf '%s' "$GATEWAY_INSTALL_DIR"
     return
   fi
@@ -293,6 +296,38 @@ service_start() { # returns non-zero if the restart failed (callers rely on this
 
 service_active() {
   have_systemd && [ -f "$SERVICE_FILE" ] && systemctl is-active --quiet "$SERVICE_NAME"
+}
+
+# gateway processes whose executable lives in <dir> — matched via /proc/<pid>/exe
+# (command-line matching misses runs started as `cd <dir> && ./gateway`).
+find_gateway_pids() { # find_gateway_pids <dir> -> space-separated pids
+  local pid exe pids=""
+  if [ -d /proc ] && command -v pgrep >/dev/null 2>&1; then
+    for pid in $(pgrep -x gateway 2>/dev/null); do
+      exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+      case "$exe" in
+        "$1/gateway"|"$1/gateway.bak"|"$1/gateway.new") pids="$pids $pid" ;;
+      esac
+    done
+  fi
+  printf '%s' "$pids"
+}
+
+# stop_gateway_processes <dir> — TERM, wait, then KILL if still alive
+stop_gateway_processes() {
+  local pids pid
+  pids="$(find_gateway_pids "$1")"
+  [ -n "$pids" ] || return 0
+  # shellcheck disable=SC2086
+  kill -TERM $pids 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -z "$(find_gateway_pids "$1")" ] && return 0
+    sleep 1
+  done
+  pids="$(find_gateway_pids "$1")"
+  # shellcheck disable=SC2086
+  [ -n "$pids" ] && kill -KILL $pids 2>/dev/null || true
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -496,15 +531,14 @@ cmd_update() {
 
   local was_active=0 was_running=0
   if service_active; then was_active=1; fi
-  if [ "$was_active" = "0" ] && pgrep -f "${dir}/gateway" >/dev/null 2>&1; then
+  if [ -n "$(find_gateway_pids "$dir")" ]; then
     was_running=1
   fi
 
   info "Stopping gateway..."
   if [ "$was_active" = "1" ]; then service_stop; fi
   if [ "$was_running" = "1" ]; then
-    pkill -TERM -f "${dir}/gateway" 2>/dev/null || true
-    sleep 2
+    stop_gateway_processes "$dir"
   fi
 
   # Backup -> swap -> verify; roll back if the new binary cannot even start.
@@ -543,22 +577,23 @@ cmd_uninstall() {
   dir="$(find_install_dir)"
   [ -n "$dir" ] || die "no installation found"
 
-  local current
+  local current confirm_default="n" wipe_default="n"
+  [ "${1:-}" = "explicit" ] && confirm_default="y"
+  [ "${GATEWAY_PURGE_DATA:-0}" = "1" ] && wipe_default="y"
   current="$(installed_version "$dir" || true)"
   banner
   printf '%b\n' "  Install dir : ${dir}"
   printf '%b\n' "  Version     : ${current:-unknown}"
   hr
 
-  if ! ask_yes_no "Uninstall AI Gateway from ${dir}?" "n"; then
+  if ! ask_yes_no "Uninstall AI Gateway from ${dir}?" "$confirm_default"; then
     info "Cancelled."
     return
   fi
 
   info "Stopping gateway..."
   service_stop
-  pkill -TERM -f "${dir}/gateway" 2>/dev/null || true
-  sleep 1
+  stop_gateway_processes "$dir"
 
   if [ -f "$SERVICE_FILE" ]; then
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -569,7 +604,7 @@ cmd_uninstall() {
 
   rm -f "${dir}/gateway" "${dir}/gateway.bak" "${dir}/gateway.new" "${dir}/VERSION" "${dir}/.env.example" "${dir}/gateway.log"
 
-  if ask_yes_no "Remove ALL data too (SQLite DB, provider keys, .env)? This cannot be undone" "n"; then
+  if ask_yes_no "Remove ALL data too (SQLite DB, provider keys, .env)? This cannot be undone" "$wipe_default"; then
     rm -rf "$dir"
     if id "$SERVICE_USER" >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
       userdel "$SERVICE_USER" 2>/dev/null || true
@@ -599,7 +634,7 @@ cmd_status() {
   printf '%b\n' "  Version     : ${current:-unknown}"
   if service_active; then
     printf '%b\n' "  Service     : ${C_G}running (systemd)${C_0}"
-  elif pgrep -f "${dir}/gateway" >/dev/null 2>&1; then
+  elif [ -n "$(find_gateway_pids "$dir")" ]; then
     printf '%b\n' "  Process     : ${C_G}running${C_0}"
   else
     printf '%b\n' "  Service     : ${C_Y}not running${C_0}"
@@ -668,7 +703,7 @@ case "${1:-}" in
   ""|menu) menu ;;
   install) cmd_install ;;
   update) cmd_update ;;
-  uninstall) cmd_uninstall ;;
+  uninstall) cmd_uninstall explicit ;;
   status) cmd_status ;;
   -h|--help|help) usage ;;
   *) err "unknown command: $1"; usage; exit 2 ;;

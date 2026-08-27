@@ -64,7 +64,7 @@ func (h *AdminHandler) auditLogin(username string) {
 //
 // Source builds fall back to "dev" (+ short commit when available via the
 // make target). The install.sh updater also reads this through `gateway version`.
-var GatewayVersion = "dev"
+var GatewayVersion = "1.7.0"
 
 // GatewayCommit is injected at build time with the release's git SHA
 // (-ldflags "-X ai-gateway/internal/handler.GatewayCommit=<sha>").

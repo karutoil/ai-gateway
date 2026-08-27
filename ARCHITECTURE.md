@@ -69,7 +69,7 @@ ai-gateway/
     discovery/  # provider model discovery (OpenAI/Anthropic /models, models.dev enrich)
     e2e/        # live E2E (build tag: live; GATEWAY_URL/GATEWAY_KEY/MODEL/ADMIN_PASSWORD)
   web/          # Vite + React + Tailwind dashboard source (built into embed.FS)
-  scripts/      # smoke.sh, muse-harness.sh, mock upstreams, version.sh
+  scripts/      # smoke.sh, muse-harness.sh, mock upstreams
   ARCHITECTURE.md  README.md  openapi.yaml  Makefile  Dockerfile  docker-compose.yml
 ```
 

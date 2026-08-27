@@ -41,18 +41,6 @@
 
 ## Quick Start
 
-### Install a release (no Go needed)
-
-Every push to `main` is versioned from commit history (conventional commits: `feat:` → minor, `fix:` → patch, `BREAKING CHANGE`/`!:` → major), built into a self-contained binary — web UI embedded, SQLite statically linked — and published as a [GitHub release](https://github.com/karutoil/ai-gateway/releases).
-
-```bash
-# interactive TUI: install (.env wizard) / update / uninstall / status
-curl -fsSL https://raw.githubusercontent.com/karutoil/ai-gateway/main/install.sh | bash
-# or: git clone && ./install.sh
-```
-
-The installer prompts for configuration with secure defaults (bare **Enter** accepts), can register a hardened systemd service, and `update` / `uninstall` never touch your `.env` and data unless you explicitly ask for a wipe. Scripted usage: `./install.sh install|update|uninstall|status` with optional `GATEWAY_VERSION`, `GATEWAY_INSTALL_DIR`, `GATEWAY_YES` overrides.
-
 ### Build from source
 
 Requires Go 1.25+. `go build` needs **CGO with a C compiler (gcc/clang)** — the SQLite driver is `mattn/go-sqlite3`. On a bare container install `gcc` (Debian/Alpine: `apt-get install -y gcc` / `apk add gcc musl-dev`) or use the Dockerfile, which builds with CGO enabled. The repository ships prebuilt UI assets, so you don't need Node unless you want to modify the web UI.
