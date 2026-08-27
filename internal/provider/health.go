@@ -1,0 +1,180 @@
+package provider
+
+import (
+	"database/sql"
+	"net/http"
+	"strings"
+	"time"
+
+	gatewaydb "ai-gateway/internal/db"
+
+	"github.com/rs/zerolog/log"
+)
+
+func StartHealthChecker(db *sql.DB, store *Store, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		// run once at start after short delay
+		time.Sleep(10 * time.Second)
+		checkAll(db, store)
+		for range ticker.C {
+			checkAll(db, store)
+		}
+	}()
+}
+
+func checkAll(db *sql.DB, store *Store) {
+	providers, err := store.List()
+	if err != nil {
+		log.Error().Err(err).Msg("health: list providers failed")
+		return
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, p := range providers {
+		status := "unknown"
+		msg := ""
+		target := p.BaseURL
+		switch p.Type {
+		case "anthropic":
+			// anthropic: try to ping /v1/models with x-api-key if possible, otherwise mark unknown
+			key, err := store.DecryptKey(&p)
+			if err == nil {
+				targetModels := strings.TrimRight(target, "/") + "/v1/models"
+				if strings.HasSuffix(target, "/v1/models") {
+					targetModels = target
+				}
+				req, _ := http.NewRequest("GET", targetModels, nil)
+				req.Header.Set("x-api-key", key)
+				req.Header.Set("anthropic-version", "2023-06-01")
+				resp, err := client.Do(req)
+				if err != nil {
+					status = "down"
+					msg = err.Error()
+				} else {
+					resp.Body.Close()
+					if resp.StatusCode == 200 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+						status = "up"
+						msg = http.StatusText(resp.StatusCode)
+					} else if resp.StatusCode >= 500 {
+						status = "down"
+						msg = http.StatusText(resp.StatusCode)
+					} else {
+						status = "up"
+						msg = http.StatusText(resp.StatusCode)
+					}
+				}
+			} else {
+				status = "unknown"
+				msg = "no key"
+			}
+		case "azure":
+			key, err := store.DecryptKey(&p)
+			if err != nil {
+				status = "down"
+				msg = "decrypt failed"
+			} else {
+				// Azure OpenAI: GET {baseURL}/models?api-version=2024-02-01 with api-key
+				base := strings.TrimRight(target, "/")
+				urls := []string{base + "/models?api-version=2024-02-01", base + "/models"}
+				if !strings.Contains(base, "api-version") && !strings.Contains(target, "/v1") {
+					urls = append(urls, base+"/v1/models?api-version=2024-02-01")
+				}
+				success := false
+				for _, u := range urls {
+					req, _ := http.NewRequest("GET", u, nil)
+					req.Header.Set("api-key", key)
+					resp, err := client.Do(req)
+					if err != nil {
+						status = "down"
+						msg = err.Error()
+						continue
+					}
+					resp.Body.Close()
+					if resp.StatusCode == 200 {
+						status = "up"
+						msg = "OK"
+						success = true
+						break
+					} else if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 {
+						status = "up"
+						msg = http.StatusText(resp.StatusCode) + " (auth ok, reachable)"
+						success = true
+						break
+					} else if resp.StatusCode >= 500 {
+						status = "down"
+						msg = http.StatusText(resp.StatusCode)
+					} else if resp.StatusCode == 404 {
+						status = "down"
+						msg = "404 models not found (check base_url)"
+					} else {
+						status = "up"
+						msg = http.StatusText(resp.StatusCode)
+						success = true
+						break
+					}
+				}
+				if !success && status == "unknown" {
+					status = "down"
+					msg = "unreachable"
+				}
+			}
+		default:
+			key, err := store.DecryptKey(&p)
+			if err != nil {
+				status = "down"
+				msg = "decrypt failed"
+			} else {
+				urls := []string{strings.TrimRight(target, "/") + "/models"}
+				if !strings.Contains(target, "/v1") {
+					urls = append(urls, strings.TrimRight(target, "/")+"/v1/models")
+				}
+				success := false
+				for _, u := range urls {
+					req, _ := http.NewRequest("GET", u, nil)
+					req.Header.Set("Authorization", "Bearer "+key)
+					resp, err := client.Do(req)
+					if err != nil {
+						status = "down"
+						msg = err.Error()
+						continue
+					}
+					resp.Body.Close()
+					// Consider 200, 401, 403 as "up" (reachable), 5xx as down, 404 as config error
+					if resp.StatusCode == 200 {
+						status = "up"
+						msg = "OK"
+						success = true
+						break
+					} else if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 {
+						status = "up"
+						msg = http.StatusText(resp.StatusCode) + " (auth ok, reachable)"
+						success = true
+						break
+					} else if resp.StatusCode >= 500 {
+						status = "down"
+						msg = http.StatusText(resp.StatusCode)
+					} else if resp.StatusCode == 404 {
+						status = "down"
+						msg = "404 models not found (check base_url)"
+					} else {
+						status = "up"
+						msg = http.StatusText(resp.StatusCode)
+						success = true
+						break
+					}
+				}
+				if !success && status == "unknown" {
+					status = "down"
+					msg = "unreachable"
+				}
+			}
+		}
+		if _, err := db.Exec(gatewaydb.Q(`UPDATE providers SET health_status=?, last_health=? WHERE id=?`), status, msg, p.ID); err != nil {
+			log.Error().Err(err).Str("provider", p.Name).Msg("health update failed")
+		}
+	}
+}

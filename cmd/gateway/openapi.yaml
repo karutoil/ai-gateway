@@ -1,0 +1,907 @@
+openapi: 3.0.3
+info:
+  title: AI Gateway
+  version: 1.7.0
+  description: |
+    Unified AI Gateway — OpenAI / Anthropic / Responses under one domain.
+    Gateway auth: Bearer sk-gw-* or admin session JWT on /v1/*.
+    Admin: Bearer JWT on /api/*. Errors: {error:{message,type}}.
+servers:
+  - url: http://localhost:8080
+    description: local
+  - url: https://ai.example.com
+    description: production
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      operationId: getHealth
+      tags: [ops]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string, example: "1.6.0" }
+                  db: { type: string, example: up }
+                  config_ok: { type: boolean, example: true }
+  /ready:
+    get:
+      summary: Readiness probe (Phase 2.5)
+      tags: [ops]
+      responses:
+        '200': { description: ready }
+        '503': { description: not ready }
+  /metrics:
+    get:
+      summary: Prometheus metrics exposition (admin-auth gated when METRICS_PROTECT=true)
+      tags: [ops]
+      responses:
+        '200':
+          description: prometheus exposition
+          content:
+            text/plain:
+              schema: { type: string }
+  /api/auth/login:
+    post:
+      summary: Admin login
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, example: admin123 }
+      responses:
+        '200':
+          description: JWT token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '401': { description: invalid credentials }
+  /api/providers:
+    get:
+      summary: List providers
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: list }
+    post:
+      summary: Create provider (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProvider' }
+      responses:
+        '201': { description: created }
+  /api/providers/{id}:
+    delete:
+      summary: Delete provider (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: deleted }
+  /api/keys:
+    get:
+      summary: List gateway keys
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: list }
+    post:
+      summary: Create gateway key (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '201': { description: created }
+  /api/keys/{id}:
+    delete:
+      summary: Revoke gateway key (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: revoked }
+    put:
+      summary: Update key name
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, example: my-key }
+      responses:
+        '200': { description: updated }
+  /api/keys/{id}/rate-limit:
+    put:
+      summary: Update per-key RPM (audited, legacy)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rpm: { type: integer, example: 60 }
+                rph: { type: integer, example: 1000 }
+                rpd: { type: integer, example: 10000 }
+                tpm: { type: integer, example: 50000 }
+      responses:
+        '200': { description: updated }
+  /api/keys/{id}/limits:
+    put:
+      summary: Update per-key limits and model allowlist (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rpm: { type: integer, example: 60 }
+                rph: { type: integer, example: 1000 }
+                rpd: { type: integer, example: 10000 }
+                tpm: { type: integer, example: 50000 }
+                rate_limit_rpm: { type: integer, example: 60 }
+                rate_limit_rph: { type: integer, example: 1000 }
+                rate_limit_rpd: { type: integer, example: 10000 }
+                rate_limit_tpm: { type: integer, example: 50000 }
+                allowed_models: { type: array, items: { type: string }, example: ["gpt-4o-mini", "gpt-4*"] , description: "Allowlist with * wildcard; empty = all models" }
+      responses:
+        '200': { description: updated }
+  /api/models/catalog:
+    get:
+      summary: List models catalog
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: provider
+          in: query
+          schema: { type: string }
+        - name: reasoning
+          in: query
+          schema: { type: boolean }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200': { description: catalog }
+  /api/models/aliases:
+    get:
+      summary: List aliases
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: aliases }
+    post:
+      summary: Create alias (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias, target]
+              properties:
+                alias: { type: string, example: fast, pattern: '^[a-zA-Z0-9._/-]{1,64}$' }
+                target: { type: string, example: openai/gpt-4o-mini }
+      responses:
+        '201': { description: created }
+  /api/models/aliases/{alias}:
+    delete:
+      summary: Delete alias (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: alias
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: deleted }
+  /api/models/settings:
+    get:
+      summary: Get system config
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: settings }
+    put:
+      summary: Update system config (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: updated }
+  /v1/chat/completions:
+    post:
+      summary: Chat completions (OpenAI compat, gateway auth)
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              properties:
+                model: { type: string, example: openai/gpt-4o-mini, maxLength: 256, description: "Prefer provider/model. Short ids still resolve." }
+                messages: { type: array, items: { type: object } }
+                stream: { type: boolean, default: false }
+                temperature: { type: number }
+      responses:
+        '200': { description: completion }
+        '401': { description: authentication_error }
+        '429': { description: rate_limit_error }
+  /v1/completions:
+    post:
+      summary: Completions (OpenAI compat)
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: completion }
+  /v1/embeddings:
+    post:
+      summary: Embeddings
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: embeddings }
+  /v1/messages:
+    post:
+      summary: Anthropic Messages compat
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: message }
+  /v1/responses:
+    post:
+      summary: OpenAI Responses API (native or translated)
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: response }
+  /v1/models:
+    get:
+      summary: Models with id=provider/model (aliases remain bare)
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200':
+          description: models
+          headers:
+            X-Cache: { schema: { type: string, enum: [HIT, MISS] } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, example: list }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, example: openai/gpt-4o-mini }
+                        model_id: { type: string, example: gpt-4o-mini }
+                        owned_by: { type: string, example: openai }
+  /api/orgs:
+    get:
+      summary: List organizations
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: orgs }
+  /api/auth/passkey/login/begin:
+    post:
+      summary: Begin passkey login (public, brute-force rate limited)
+      tags: [auth]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+      responses:
+        '200': { description: WebAuthn assertion options + session id }
+        '404': { description: user not found or no credentials }
+        '429': { description: too many attempts }
+  /api/auth/passkey/login/finish:
+    post:
+      summary: Finish passkey login (public) — returns admin JWT + session cookie
+      tags: [auth]
+      parameters:
+        - name: X-WebAuthn-Session
+          in: header
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: WebAuthn credential (assertion response); session may also arrive via body.session
+      responses:
+        '200':
+          description: token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  username: { type: string }
+                  role: { type: string }
+        '401': { description: verification failed }
+        '400': { description: missing/unknown session }
+  /api/auth/recovery/verify:
+    post:
+      summary: Verify a recovery code and mint a new session (public, brute-force rate limited; code is single-use)
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+                recovery_code: { type: string, description: alias — code }
+                code: { type: string }
+      responses:
+        '200':
+          description: new admin session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  username: { type: string }
+                  role: { type: string }
+        '400': { description: username and code required }
+        '401': { description: invalid recovery code }
+        '429': { description: too many attempts }
+  /api/auth/passkey/register/begin:
+    post:
+      summary: Begin passkey registration for the caller (admin may pass ?user_id for another account)
+      tags: [auth]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200': { description: WebAuthn credential creation options + session id }
+        '401': { description: unauthorized }
+        '403': { description: forbidden (non-admin targeting another user) }
+  /api/auth/passkey/register/finish:
+    post:
+      summary: Finish passkey registration (attestation; session via X-WebAuthn-Session header/query/body)
+      tags: [auth]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: WebAuthn credential (attestation response)
+      responses:
+        '200': { description: credential stored }
+        '400': { description: missing/unknown session }
+        '401': { description: unauthorized }
+  /api/auth/passkey/credentials:
+    get:
+      summary: List the caller's (or ?user_id=…) registered passkeys
+      tags: [auth]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200': { description: credential list }
+  /api/auth/passkey/recovery/generate:
+    post:
+      summary: Generate/rotate recovery codes for the caller (admin may target ?user_id)
+      tags: [auth]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200': { description: recovery codes shown once }
+        '403': { description: forbidden }
+  /api/auth/passkey/disable:
+    post:
+      summary: Disable passkey login for the caller (admin may target ?user_id)
+      tags: [auth]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200': { description: disabled }
+        '403': { description: forbidden }
+  /api/profile:
+    get:
+      summary: Current dashboard user profile
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: profile }
+    put:
+      summary: Update current user display name
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+      responses:
+        '200': { description: updated profile }
+  /api/profile/password:
+    post:
+      summary: Change own password (revokes other sessions via token_version bump)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                old_password: { type: string }
+                new_password: { type: string }
+                password: { type: string, description: legacy alias for old_password }
+      responses:
+        '200': { description: password changed }
+        '400': { description: old/new password required }
+        '401': { description: old password incorrect }
+  /api/profile/activity:
+    get:
+      summary: Recent request activity for the caller
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: activity rows }
+  /api/profile/logins:
+    get:
+      summary: Recent login history for the caller
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: login rows }
+  /api/admin/users:
+    get:
+      summary: List dashboard users
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: users }
+    post:
+      summary: Create dashboard user (admin only, audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, role]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                role: { type: string, enum: [admin, support, member, readonly] }
+                display_name: { type: string }
+      responses:
+        '201': { description: created }
+        '400': { description: invalid input or role }
+        '403': { description: forbidden (admin only) }
+  /api/admin/users/me:
+    get:
+      summary: Current authenticated dashboard user (id/me resolves before {id})
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: me }
+  /api/admin/users/{id}:
+    put:
+      summary: Update a dashboard user (role/display_name/password/disabled; admin only)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: { type: string, enum: [admin, support, member, readonly] }
+                display_name: { type: string }
+                password: { type: string }
+                disabled: { type: boolean }
+      responses:
+        '200': { description: updated }
+        '400': { description: invalid role }
+        '403': { description: forbidden }
+    delete:
+      summary: Delete a dashboard user (admin only)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: deleted }
+  /api/admin/users/{id}/reset-password:
+    post:
+      summary: Reset a dashboard user's password (admin only; revokes their sessions)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        '200': { description: ok }
+        '400': { description: password required }
+        '403': { description: forbidden }
+  /api/models/sync:
+    post:
+      summary: Re-sync models catalog from models.dev (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: sync result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  synced: { type: integer, example: 6120 }
+  /api/models/status:
+    get:
+      summary: Catalog sync status (model/alias counts, last sync time)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: status }
+  /api/provider-models:
+    get:
+      summary: List discovered/manual provider models
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: provider models }
+    post:
+      summary: Manually add a provider model (audited, admin/member)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider_id, model_id]
+              properties:
+                provider_id: { type: string, maxLength: 64 }
+                model_id: { type: string, maxLength: 256 }
+                display_name: { type: string }
+                context_window: { type: integer }
+                max_output: { type: integer }
+                input_cost: { type: number }
+                output_cost: { type: number }
+                reasoning: { type: boolean }
+                tool_call: { type: boolean }
+                attachment: { type: boolean }
+      responses:
+        '201': { description: created }
+        '400': { description: provider_id and model_id required }
+  /api/provider-models/{id}:
+    put:
+      summary: Update a manual provider model (admin only, audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: ProviderModel fields to persist
+      responses:
+        '200': { description: ok }
+        '400': { description: invalid json }
+        '500': { description: update failed }
+    delete:
+      summary: Delete a provider model (admin only, audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: deleted }
+  /api/provider-models/{id}/enrich:
+    post:
+      summary: Enrich a provider model from the models.dev catalog (admin only)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: enriched }
+        '500': { description: enrichment failed }
+  /api/providers/{id}/discover:
+    post:
+      summary: Run model discovery against one provider's /models endpoint (admin only, audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: discovered model ids
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  discovered: { type: array, items: { type: string } }
+        '404': { description: provider not found }
+  /api/discover-all:
+    post:
+      summary: Run discovery across all providers (admin only, audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: discovery report }
+  /api/stats:
+    get:
+      summary: Aggregate usage stats; optional range for time-series breakdowns
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: range
+          in: query
+          required: false
+          schema: { type: string, example: 7d }
+      responses:
+        '200': { description: stats }
+  /api/logs:
+    get:
+      summary: Recent request logs (latest 100)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: logs }
+  /api/logs/{id}:
+    get:
+      summary: Single request log incl. stored bodies (org-scoped)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: log detail }
+        '404': { description: not found }
+  /api/billing/export:
+    get:
+      summary: Billing export as CSV (attachment) over a lookback window; emits a billing.export webhook
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: range
+          in: query
+          required: false
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: CSV rows
+          content:
+            text/csv:
+              schema: { type: string }
+  /api/lb/rules:
+    get:
+      summary: List load-balancer routing rules (admin)
+      description: |
+        Each rule maps a model name to an ORDERED provider group. Rotation
+        happens across requests (round-robin by position). There is no
+        automatic failover: members never chain within one request. Qualified
+        model IDs ("provider/model") and X-Provider headers bypass rules.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Rules with ordered members (joined provider metadata)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/LBRule' }
+  /api/lb/rules/{model}:
+    put:
+      summary: Create or replace the provider group for a model (admin)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: { type: string, maxLength: 256, example: gpt-4o-mini }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [providers]
+              properties:
+                providers:
+                  type: array
+                  maxItems: 50
+                  minItems: 1
+                  items: { type: string }
+                  description: Provider IDs in round-robin order.
+      responses:
+        '201': { $ref: '#/components/responses/LBRuleSaved' }
+        '400': { description: Unknown/duplicate provider or invalid body }
+        '403': { description: Org-scoped caller referencing another org's provider }
+    delete:
+      summary: Delete the routing rule for a model (admin)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Deleted }
+  responses:
+    LBRuleSaved:
+      description: Saved rule with joined member metadata
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/LBRule' }
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    gatewayKey:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: 'Bearer sk-gw-...'
+  schemas:
+    LBRule:
+      type: object
+      required: [model, providers]
+      properties:
+        model:
+          type: string
+          example: gpt-4o-mini
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              provider_id: { type: string }
+              name: { type: string, example: openai }
+              type: { type: string, example: openai }
+              health_status: { type: string, nullable: true, enum: [up, down, unknown, ""] }
+    CreateProvider:
+      type: object
+      required: [name, type, api_key]
+      properties:
+        name: { type: string, example: openai }
+        type: { type: string, enum: [openai, anthropic, azure, openai_compatible], example: openai }
+        base_url: { type: string, example: https://api.openai.com/v1 }
+        api_key: { type: string, example: sk-... }

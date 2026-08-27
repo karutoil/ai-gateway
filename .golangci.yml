@@ -1,0 +1,21 @@
+# golangci-lint configuration — deliberately small and stable.
+# Run: make lint   (prints an install hint and skips if golangci-lint is missing)
+
+run:
+  timeout: 5m
+  # Live/external E2E suites are gated behind -tags=live and touch real
+  # infrastructure — keep them out of lint runs.
+  skip-dirs:
+    - internal/e2e
+    - tests/live
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # go vet suite
+    - staticcheck   # static analysis
+    - gosimple      # simplifiable code
+    - unused        # unused identifiers
+    - misspell      # typos in comments/strings
+    - revive        # basic Go style (default rule set)

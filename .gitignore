@@ -1,0 +1,28 @@
+# Build artifacts
+bin/
+web/dist/
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+
+# Local data & secrets
+data/
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Python scratch
+__pycache__/
+
+# Editor / AI tool state
+.opencode/
+.pi/
+.catalyst-code/
+.swarm/
+
+# Misc scratch
+pi-harness-test/hello-pi.txt
+.DS_Store

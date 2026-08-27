@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/* Design tokens — single source of truth for both themes.             */
+/* Neutrals are a deep slate-green family; teal is the brand accent.   */
+/* ------------------------------------------------------------------ */
+:root {
+  color-scheme: dark;
+  --c-graphite: 16 21 19;    /* app background  #101513 */
+  --c-surface: 26 32 29;     /* card surface    #1A201D */
+  --c-raised: 34 42 38;      /* raised/hover    #222A26 */
+  --c-paper: 231 237 233;    /* primary text    #E7EDE9 */
+  --c-stone: 44 53 48;       /* borders/dividers#2C3530 */
+  --c-muted: 137 152 144;    /* secondary text  #899890 */
+  --c-danger: 239 107 107;
+}
+
+html.light {
+  color-scheme: light;
+  --c-graphite: 246 247 245; /* app background  #F6F7F5 */
+  --c-surface: 255 255 255;  /* cards           #FFFFFF */
+  --c-raised: 240 242 239;
+  --c-paper: 23 33 29;       /* ink text        #17211D */
+  --c-stone: 226 231 227;    /* borders         #E2E7E3 */
+  --c-muted: 96 109 102;     /* #606D66 */
+  --c-danger: 214 69 69;
+}
+
+html { font-size: 15px; }
+
+body {
+  @apply bg-app text-paper font-sans antialiased;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+::selection { background: rgb(44 217 163 / 0.25); }
+
+*:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(44 217 163 / 0.45);
+  border-radius: 8px;
+}
+
+/* Scrollbars — slim, themed, unobtrusive */
+* { scrollbar-width: thin; scrollbar-color: rgb(var(--c-stone)) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-stone)); border-radius: 8px;
+  border: 2px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-track { background: transparent; }
+
+.hide-scrollbar::-webkit-scrollbar { display: none; }
+.hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+.overflow-x-auto { -webkit-overflow-scrolling: touch; }
+
+@media (max-width: 640px) {
+  button, a { min-height: 36px; }
+  input, select, textarea { font-size: 16px; } /* prevent iOS zoom */
+}
+
+/* Legacy ambient grid (login / loading screens) */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgb(44 217 163 / 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(44 217 163 / 0.03) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+html.light .bg-grid {
+  background-image:
+    linear-gradient(to right, rgb(23 33 29 / 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(23 33 29 / 0.025) 1px, transparent 1px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,47 @@
+# AI Gateway — local compose stack.
+#
+# Copy .env.example (or create .env) first: cp .env.example .env
+# The gateway itself also auto-loads ./.env at startup, but compose passes env_file
+# explicitly so container-side values win consistently.
+#
+# Optional Redis (shared cache + distributed rate limiting): uncomment the redis
+# service below and set REDIS_URL in .env or uncomment the override here:
+#   REDIS_URL: redis://redis:6379
+
+services:
+  gateway:
+    build:
+      context: .
+    image: ai-gateway:local
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env.example
+        required: false
+      - path: .env
+        required: false
+    environment:
+      PORT: 8080
+      DATABASE_URL: /data/gateway.db
+      # Optional shared cache / rate limiter — uncomment with the redis service:
+      # REDIS_URL: redis://redis:6379
+    volumes:
+      - ./data:/data
+    # No built-in healthcheck: the image ships without curl/wget and the
+    # binary exposes no self-probe flag. Probe GET /health or /ready from
+    # your orchestrator/load balancer instead.
+    restart: unless-stopped
+
+  # Optional: Redis for multi-replica cache/rate-limit backends.
+  # Enable by removing this comment block AND setting REDIS_URL above.
+  #
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   restart: unless-stopped
+
+volumes:
+  redis-data:

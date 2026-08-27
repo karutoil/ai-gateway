@@ -1,0 +1,154 @@
+package webhook
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog/log"
+)
+
+// Dispatcher is the Phase 2.5 webhook scaffold. Phase 3 will fan out to multiple URLs.
+type Dispatcher interface {
+	Emit(event string, payload any)
+}
+
+// EmptyDispatcher discards events when WEBHOOK_URL not set
+type EmptyDispatcher struct{}
+
+func (n *EmptyDispatcher) Emit(_ string, _ any) {}
+
+var _ Dispatcher = (*EmptyDispatcher)(nil)
+
+// WebhookTimeout bounds each delivery attempt.
+const WebhookTimeout = 5 * time.Second
+
+// HTTPDispatcher POSTs JSON to WEBHOOK_URL asynchronously: Emit enqueues onto a
+// bounded channel consumed by one background worker, so a slow or wedged sink
+// can never add latency to request admission (/v1 quota 429s) or admin
+// mutations (audit trail). Deliveries get a bounded retry with backoff;
+// overflow drops oldest-with-log rather than blocking producers.
+type HTTPDispatcher struct {
+	URL    string
+	Client *http.Client
+
+	queue   chan queuedEvent
+	stop    chan struct{}
+	started sync.Once
+}
+
+type queuedEvent struct {
+	event string
+	body  []byte
+}
+
+// QueueDepth bounds the number of pending deliveries.
+const QueueDepth = 256
+
+var _ Dispatcher = (*HTTPDispatcher)(nil)
+
+// NewFromEnv returns HTTPDispatcher when WEBHOOK_URL is set, otherwise EmptyDispatcher.
+func NewFromEnv() Dispatcher {
+	url := os.Getenv("WEBHOOK_URL")
+	if url == "" {
+		return &EmptyDispatcher{}
+	}
+	return New(url)
+}
+
+// New returns dispatcher based on explicit URL (empty => Empty).
+func New(url string) Dispatcher {
+	if url == "" {
+		return &EmptyDispatcher{}
+	}
+	return &HTTPDispatcher{
+		URL:    url,
+		Client: &http.Client{Timeout: WebhookTimeout},
+		queue:  make(chan queuedEvent, QueueDepth),
+		stop:   make(chan struct{}),
+	}
+}
+
+func marshalEvent(event string, payload any) []byte {
+	body, err := json.Marshal(map[string]any{
+		"event":   event,
+		"payload": payload,
+		"ts":      time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		log.Error().Err(err).Str("event", event).Msg("webhook marshal failed")
+		return nil
+	}
+	return body
+}
+
+// Emit enqueues for asynchronous delivery; it never blocks on the sink.
+func (h *HTTPDispatcher) Emit(event string, payload any) {
+	h.started.Do(func() { go h.worker() })
+	body := marshalEvent(event, payload)
+	if body == nil {
+		return
+	}
+	select {
+	case h.queue <- queuedEvent{event: event, body: body}:
+	default:
+		// Drop the OLDEST entry to admit the newest (audit events are append-most).
+		select {
+		case <-h.queue:
+			log.Warn().Str("event", event).Msg("webhook queue full, dropped oldest")
+		default:
+		}
+		select {
+		case h.queue <- queuedEvent{event: event, body: body}:
+		default:
+			log.Warn().Str("event", event).Msg("webhook queue still full, dropping")
+		}
+	}
+}
+
+// worker drains the queue. Two attempts with backoff keep delivery best-effort
+// without ever stalling callers.
+func (h *HTTPDispatcher) worker() {
+	for {
+		select {
+		case ev := <-h.queue:
+			if !h.deliver(ev.event, ev.body) {
+				time.Sleep(500 * time.Millisecond)
+				h.deliver(ev.event, ev.body)
+			}
+		case <-h.stop:
+			return
+		}
+	}
+}
+
+func (h *HTTPDispatcher) deliver(event string, body []byte) bool {
+	req, err := http.NewRequest(http.MethodPost, h.URL, bytes.NewReader(body))
+	if err != nil {
+		log.Error().Err(err).Str("event", event).Msg("webhook request build failed")
+		return true // unbuildable requests will never succeed
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Event", event)
+	resp, err := h.Client.Do(req)
+	if err != nil {
+		log.Error().Err(err).Str("event", event).Str("url", h.URL).Msg("webhook emit failed")
+		return false
+	}
+	defer resp.Body.Close()
+	log.Info().Str("event", event).Int("status", resp.StatusCode).Str("url", h.URL).Msg("webhook emitted")
+	return true
+}
+
+// Global dispatcher used by audit recorder; swapped in tests.
+var Global Dispatcher = &EmptyDispatcher{}
+
+func init() {
+	// Initialize Global from env at startup; audit recorder will call Global.Emit.
+	if url := os.Getenv("WEBHOOK_URL"); url != "" {
+		Global = New(url)
+	}
+}

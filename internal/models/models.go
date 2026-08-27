@@ -1,0 +1,143 @@
+package models
+
+import "time"
+
+type ProviderType string
+
+const (
+	ProviderOpenAI           ProviderType = "openai"
+	ProviderAnthropic        ProviderType = "anthropic"
+	ProviderAzure            ProviderType = "azure"
+	ProviderOpenAICompatible ProviderType = "openai_compatible"
+)
+
+type Provider struct {
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Type         ProviderType `json:"type"`
+	BaseURL      string       `json:"base_url"`
+	APIKeyEnc    []byte       `json:"-"`                 // encrypted
+	APIKey       string       `json:"api_key,omitempty"` // only on create, masked on read
+	CreatedAt    time.Time    `json:"created_at"`
+	LastHealth   *string      `json:"last_health,omitempty"`
+	HealthStatus *string      `json:"health_status,omitempty"`
+	OrgID        *string      `json:"org_id,omitempty"` // nullable, Phase 2.5 scaffold — global when NULL
+}
+
+type GatewayKey struct {
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Prefix           string     `json:"prefix"`
+	Hash             string     `json:"-"`
+	Key              string     `json:"key,omitempty"` // only on creation
+	LastUsedAt       *time.Time `json:"last_used_at"`
+	CreatedAt        time.Time  `json:"created_at"`
+	RevokedAt        *time.Time `json:"revoked_at"`
+	RateLimitRPM     int        `json:"rate_limit_rpm"`
+	RateLimitRPH     int        `json:"rate_limit_rph"`
+	RateLimitRPD     int        `json:"rate_limit_rpd"`
+	RateLimitTPM     int        `json:"rate_limit_tpm"`
+	AllowedModels    []string   `json:"allowed_models,omitempty"`
+	AllowedModelsRaw string     `json:"-"`                // raw JSON string from DB, not exposed
+	OrgID            *string    `json:"org_id,omitempty"` // nullable, Phase 2.5 scaffold — global when NULL
+}
+
+// Organization is Phase 2.5 pre-enterprise scaffold — nullable org_id on providers/keys.
+// Existing rows have org_id=NULL meaning "global". Phase 3 will enforce isolation.
+type Organization struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Membership links a user to an organization with a role (admin|member|readonly).
+// Roles: admin, member, readonly — enforced by RequireRole middleware
+type Membership struct {
+	ID        string    `json:"id"`
+	OrgID     string    `json:"org_id"`
+	UserID    string    `json:"user_id"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type RequestLog struct {
+	ID               string    `json:"id"`
+	KeyPrefix        string    `json:"key_prefix"`
+	ProviderID       string    `json:"provider_id"`
+	Model            string    `json:"model"`
+	Endpoint         string    `json:"endpoint"`
+	Status           int       `json:"status"`
+	LatencyMs        int64     `json:"latency_ms"`
+	TTFTMs           int64     `json:"ttft_ms"`
+	CreatedAt        time.Time `json:"created_at"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+	CostUSD          float64   `json:"cost_usd"`
+	IsStream         bool      `json:"is_stream"`
+	Error            string    `json:"error,omitempty"`
+	RequestBody      string    `json:"request_body,omitempty"`
+	ResponseBody     string    `json:"response_body,omitempty"`
+}
+
+// CatalogModel is enriched from models.dev
+type CatalogModel struct {
+	ID                    string    `json:"id"` // e.g. openai/gpt-5.5
+	Provider              string    `json:"provider"`
+	Name                  string    `json:"name"`
+	Description           string    `json:"description"`
+	Family                string    `json:"family"`
+	ContextWindow         int       `json:"context_window"`
+	MaxOutput             int       `json:"max_output"`
+	InputCost             float64   `json:"input_cost"`  // per 1M
+	OutputCost            float64   `json:"output_cost"` // per 1M
+	CacheReadCost         float64   `json:"cache_read_cost"`
+	CacheWriteCost        float64   `json:"cache_write_cost"`
+	Reasoning             bool      `json:"reasoning"`
+	ToolCall              bool      `json:"tool_call"`
+	StructuredOutput      bool      `json:"structured_output"`
+	Attachment            bool      `json:"attachment"`
+	Modalities            string    `json:"modalities"` // json string
+	OpenWeights           bool      `json:"open_weights"`
+	KnowledgeCutoff       string    `json:"knowledge_cutoff"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	ReasoningType         string    `json:"reasoning_type"`          // effort, toggle, none
+	ReasoningLevels       string    `json:"reasoning_levels"`        // JSON array e.g. ["low","medium","high"]
+	ReasoningOutputLimits string    `json:"reasoning_output_limits"` // JSON map e.g. {"low":10000,"high":50000}
+}
+
+type ModelAlias struct {
+	Alias     string    `json:"alias"`
+	Target    string    `json:"target"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type ProviderModel struct {
+	ID                    string    `json:"id"`
+	ProviderID            string    `json:"provider_id"`
+	ProviderName          string    `json:"provider_name,omitempty"`
+	ProviderType          string    `json:"provider_type,omitempty"`
+	ModelID               string    `json:"model_id"`
+	DisplayName           string    `json:"display_name"`
+	OwnedBy               string    `json:"owned_by"`
+	ContextWindow         int       `json:"context_window"`
+	MaxOutput             int       `json:"max_output"`
+	InputCost             float64   `json:"input_cost"`
+	OutputCost            float64   `json:"output_cost"`
+	CacheReadCost         float64   `json:"cache_read_cost"`
+	CacheWriteCost        float64   `json:"cache_write_cost"`
+	Reasoning             bool      `json:"reasoning"`
+	ToolCall              bool      `json:"tool_call"`
+	StructuredOutput      bool      `json:"structured_output"`
+	Attachment            bool      `json:"attachment"`
+	Modalities            string    `json:"modalities"`
+	Source                string    `json:"source"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	ReasoningType         string    `json:"reasoning_type"`
+	ReasoningLevels       string    `json:"reasoning_levels"`
+	ReasoningOutputLimits string    `json:"reasoning_output_limits"`
+	AvgTTFTMs             float64   `json:"avg_ttft_ms,omitempty"`
+	AvgTPS                float64   `json:"avg_tps,omitempty"`
+	RequestCount          int       `json:"request_count,omitempty"`
+}
