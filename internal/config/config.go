@@ -16,7 +16,7 @@ import (
 // ENV validation table:
 // | ENV var              | Required | Default             | Validation / Notes                                                                 |
 // | PORT                 | no       | 8080                | numeric 1-65535                                                                    |
-// | DATABASE_URL         | no       | ./data/gateway.db   | file path or :memory: or file: URI; sqlite only in 1.6 (postgres in Phase 3)      |
+// | DATABASE_URL         | no       | ./data/gateway.db   | file path or :memory: or file: URI; postgres:// DSN switches to the (beta) Postgres dialect |
 // | ADMIN_PASSWORD       | no       | admin123 (dev)      | if ENV==production and ==admin123 → ERROR log + health config_ok:false            |
 // | MASTER_KEY           | no*      | derived/persistent  | *required in prod; must be 64 hex chars (32 bytes). hex.Decode + len==32 check    |
 // | JWT_SECRET           | no*      | derived/persistent  | *required in prod; ≥32 chars (hex 64). Derived from MASTER_KEY/admin password     |
@@ -26,7 +26,7 @@ import (
 // | REDIS_URL            | no       | ""                  | redis:// URL for cache + rate limiting; when set uses Redis, fallback to memory if unavailable |
 // | PUBLIC_URL           | no       | ""                  | https://gateway.example.com — public URL for Cloudflare Tunnel / reverse proxy. Used for CORS + logs |
 // | CORS_ALLOWED_ORIGINS | no       | "" (= *)            | comma-separated origins, e.g. https://app.example.com,https://ai.example.com. Overrides PUBLIC_URL. Supports "*" |
-// | TRUSTED_PROXIES      | no       | ""                  | comma-separated IPs/CIDRs trusted for X-Forwarded-* / CF-Connecting-IP (empty = trust all for tunnel) |
+// | TRUSTED_PROXIES      | no       | ""                  | comma-separated IPs/CIDRs trusted for X-Forwarded-* / CF-Connecting-IP (empty = loopback only; "*" trusts all) |
 
 type Config struct {
 	Port               string

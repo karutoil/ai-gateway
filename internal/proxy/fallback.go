@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 
 	"github.com/rs/zerolog/log"
@@ -103,7 +104,28 @@ func (b *bufWriter) flushTo(w http.ResponseWriter) {
 //   - Cross-provider fallback is DISABLED by design: the returned slice always
 //     holds at most one provider. Same-provider retries inside
 //     proxyWithMetrics remain active per the retry policy.
-func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*models.Provider) bool) []*models.Provider {
+//
+// requestKeyOrg extracts the authenticated gateway key's org scope ("" for
+// global keys / dashboard sessions without an org).
+func (h *Handler) requestKeyOrg(r *http.Request) string {
+	if k, ok := middleware.GatewayKeyFromContext(r.Context()); ok && k != nil && k.OrgID != nil {
+		return *k.OrgID
+	}
+	return ""
+}
+
+// orgAllows reports whether a key org may use a provider. Policy: global
+// (unscoped) providers serve everyone; org-scoped providers serve only that
+// org. Previously the proxy path ignored the key's org entirely, so any key
+// could route through (and spend) another tenant's provider.
+func orgAllows(keyOrg string, p *models.Provider) bool {
+	if keyOrg == "" || p == nil || p.OrgID == nil || *p.OrgID == "" {
+		return true
+	}
+	return *p.OrgID == keyOrg
+}
+
+func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) []*models.Provider {
 	out := make([]*models.Provider, 0, 1)
 	consider := func(p *models.Provider) bool {
 		if p == nil || p.ID == "" || (pred != nil && !pred(p)) {
@@ -115,11 +137,11 @@ func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*mo
 
 	// 1. Explicit provider hint = hard pin.
 	if hint != "" {
-		if p, err := h.ProviderStore.GetByName(hint); err == nil {
+		if p, err := h.ProviderStore.GetByName(hint); err == nil && orgAllows(keyOrg, p) {
 			consider(p)
 			return out
 		}
-		if p, err := h.ProviderStore.GetByID(hint); err == nil {
+		if p, err := h.ProviderStore.GetByID(hint); err == nil && orgAllows(keyOrg, p) {
 			consider(p)
 			return out
 		}
@@ -131,10 +153,10 @@ func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*mo
 	if idx := strings.Index(model, "/"); idx > 0 {
 		prefix := strings.ToLower(strings.TrimSpace(model[:idx]))
 		if prefix != "" {
-			if p, err := h.ProviderStore.GetByName(prefix); err == nil && consider(p) {
+			if p, err := h.ProviderStore.GetByName(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
 				return out
 			}
-			if p, err := h.ProviderStore.GetByType(prefix); err == nil && consider(p) {
+			if p, err := h.ProviderStore.GetByType(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
 				return out
 			}
 		}
@@ -152,9 +174,20 @@ func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*mo
 			}
 			if rule := h.LB.RuleForModel(key); rule != nil {
 				if rotated := h.LB.RotateProviders(rule); len(rotated) > 0 {
-					picked := rotated[0]
+					// Org-scoped keys may only route to providers their org
+					// owns (or global ones).
+					eligible := make([]*models.Provider, 0, len(rotated))
+					for _, cand := range rotated {
+						if orgAllows(keyOrg, cand) {
+							eligible = append(eligible, cand)
+						}
+					}
+					if len(eligible) == 0 {
+						continue
+					}
+					picked := eligible[0]
 					if h.Breaker != nil {
-						for _, cand := range rotated {
+						for _, cand := range eligible {
 							if h.Breaker.State(cand.ID) != "open" {
 								picked = cand
 								break
@@ -169,9 +202,17 @@ func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*mo
 	}
 
 	// 4. Legacy single pick: health-aware round-robin over discovered owners,
-	// heuristic ownership by name/type, else default provider.
+	// heuristic ownership by name/type, else default provider. Org-scoped keys
+	// resolve through the org-aware resolver (global providers still shared).
 	if h.ProviderStore != nil {
-		if p, err := h.ProviderStore.Resolve(model, ""); err == nil {
+		var p *models.Provider
+		var err error
+		if keyOrg != "" {
+			p, err = h.ProviderStore.ResolveWithOrg(model, "", keyOrg)
+		} else {
+			p, err = h.ProviderStore.Resolve(model, "")
+		}
+		if err == nil {
 			consider(p)
 		}
 	}
@@ -205,6 +246,12 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		lastProvider   *models.Provider
 		lastFailStatus int
 		attempted      bool
+		// Diagnostics for the terminal "all attempts failed" response: which
+		// provider was tried last and why it failed (bounded upstream error
+		// body or transport error text).
+		lastProviderID   string
+		lastProviderName string
+		lastDetail       string
 	)
 
 	for idx, p := range candidates {
@@ -225,10 +272,15 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 
 		if isStream {
 			outcome := h.proxyWithMetricsOpts(w, r, target, apiKey, outBody, true, model, p.ID, keyPrefix, endpoint, start, isAnth, opts)
+			lastProviderID, lastProviderName = p.ID, p.Name
+			lastDetail = outcome.errSnippet
+			if outcome.errSnippet == "" {
+				lastDetail = outcome.errText
+			}
 			if outcome.committed || !outcome.retriable {
 				return // headers already flowed (or hard client-side stop)
 			}
-			log.Info().Str("candidate", p.Name).Str("model", model).Int("status", outcome.status).Msg("stream candidate failed pre-commit, failing over")
+			log.Info().Str("candidate", p.Name).Str("model", model).Int("status", outcome.status).Str("detail", truncateDetail(lastDetail)).Msg("stream candidate failed pre-commit, failing over")
 			lastFailStatus = outcome.status
 			continue
 		}
@@ -237,6 +289,11 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		outcome := h.proxyWithMetricsOpts(bw, r, target, apiKey, outBody, false, model, p.ID, keyPrefix, endpoint, start, isAnth, opts)
 		if !outcome.committed && bw.code == 0 {
 			// Terminal pre-commit failure: nothing usable was produced.
+			lastProviderID, lastProviderName = p.ID, p.Name
+			lastDetail = outcome.errSnippet
+			if lastDetail == "" {
+				lastDetail = outcome.errText
+			}
 			lastFailStatus = outcome.status
 			if shouldFailoverFrom(outcome.status) {
 				continue
@@ -279,7 +336,20 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	if lastFailStatus >= 400 {
 		status = outboundStatus(lastFailStatus)
 	}
+	// The client only ever saw this relayed status with zero context, and no
+	// request_logs row was written — failures were invisible in the dashboard.
+	// Log the upstream's own answer and persist the failed request.
+	log.Error().Str("provider", lastProviderName).Str("model", model).Str("endpoint", endpoint).Int("upstream_status", lastFailStatus).Str("detail", truncateDetail(lastDetail)).Msg("all provider attempts failed")
+	h.logRequestExtended(keyPrefix, lastProviderID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 	httperr.Proxy(w, status, "all provider attempts failed")
+}
+
+// truncateDetail bounds upstream error text for structured logs.
+func truncateDetail(s string) string {
+	if len(s) > 512 {
+		return s[:512] + "…"
+	}
+	return s
 }
 
 // outboundStatus normalizes an upstream status for client-facing responses.

@@ -66,6 +66,10 @@ func (h *AdminHandler) auditLogin(username string) {
 // make target). The install.sh updater also reads this through `gateway version`.
 var GatewayVersion = "dev"
 
+// GatewayCommit is injected at build time with the release's git SHA
+// (-ldflags "-X ai-gateway/internal/handler.GatewayCommit=<sha>").
+var GatewayCommit = "unknown"
+
 func (h *AdminHandler) Routes(r chi.Router) {
 	if h.AuthLimiter != nil {
 		r.With(h.AuthLimiter.Middleware(middleware.AccountFromLoginBody)).Post("/auth/login", h.Login)
@@ -410,9 +414,11 @@ func (h *AdminHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "name or base_url too long")
 		return
 	}
-	// Tenant-scoped callers may only create providers inside their own org;
-	// only admins may create global (unscoped) providers.
-	if body.OrgID == "" {
+	// Tenant-scoped callers may only create providers inside their own org —
+	// client-supplied org_id values are overridden by the verified claim for
+	// non-admins (a member of org A must not plant providers in org B). Only
+	// admins may create global (unscoped) providers or target another org.
+	if auth.GetRole(r) != "admin" {
 		body.OrgID = auth.GetOrgID(r)
 	}
 	if body.OrgID == "" && auth.GetRole(r) != "admin" {
@@ -619,7 +625,9 @@ func (h *AdminHandler) CreateKey(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "name too long (max 64)")
 		return
 	}
-	if body.OrgID == "" {
+	// Same cross-org guard as CreateProvider: non-admins always get their own
+	// verified claim org; admins may target any org or global.
+	if auth.GetRole(r) != "admin" {
 		body.OrgID = auth.GetOrgID(r)
 	}
 	if body.OrgID == "" && auth.GetRole(r) != "admin" {
@@ -688,7 +696,18 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	}
 	var totalTokens sql.NullInt64
 	var totalCost sql.NullFloat64
-	h.DB.QueryRow(`SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0) FROM request_logs`).Scan(&totalTokens, &totalCost)
+	// Cross-tenant guard: every request_logs aggregate below must honor the
+	// same org scope as the counts above — previously only the counts were
+	// filtered, leaking other orgs' tokens/cost/latency metadata to
+	// org-scoped callers.
+	orgFilter := ""
+	orgArgs := []any{}
+	if orgID != "" {
+		orgFilter = " AND provider_id IN (SELECT id FROM providers WHERE org_id=?)"
+		orgArgs = []any{orgID}
+	}
+	totArgs := append([]any{}, orgArgs...)
+	h.DB.QueryRow(db.Q(`SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0) FROM request_logs WHERE 1=1`+orgFilter), totArgs...).Scan(&totalTokens, &totalCost)
 	var catalogCount int
 	h.DB.QueryRow(`SELECT COUNT(*) FROM models_catalog`).Scan(&catalogCount)
 	var aliasCount int
@@ -754,7 +773,7 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		Requests int64   `json:"requests"`
 	}
 	var dailyRows []daily
-	rows, err := h.DB.Query(db.Q(`SELECT date(created_at) as day, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? GROUP BY date(created_at) ORDER BY day`), start)
+	rows, err := h.DB.Query(db.Q(`SELECT date(created_at) as day, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ?`+orgFilter+` GROUP BY date(created_at) ORDER BY day`), append([]any{start}, orgArgs...)...)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -780,7 +799,7 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		Requests int64   `json:"requests"`
 	}
 	var topModels []topM
-	rows2, err := h.DB.Query(db.Q(`SELECT model, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? AND model != '' GROUP BY model ORDER BY SUM(total_tokens) DESC LIMIT 5`), start)
+	rows2, err := h.DB.Query(db.Q(`SELECT model, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? AND model != ''`+orgFilter+` GROUP BY model ORDER BY SUM(total_tokens) DESC LIMIT 5`), append([]any{start}, orgArgs...)...)
 	if err == nil {
 		defer rows2.Close()
 		for rows2.Next() {
@@ -801,7 +820,7 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		Requests  int64   `json:"requests"`
 	}
 	var topKeys []topK
-	rows3, err := h.DB.Query(db.Q(`SELECT key_prefix, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? AND key_prefix != '' GROUP BY key_prefix ORDER BY COUNT(*) DESC LIMIT 5`), start)
+	rows3, err := h.DB.Query(db.Q(`SELECT key_prefix, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? AND key_prefix != ''`+orgFilter+` GROUP BY key_prefix ORDER BY COUNT(*) DESC LIMIT 5`), append([]any{start}, orgArgs...)...)
 	if err == nil {
 		defer rows3.Close()
 		for rows3.Next() {
@@ -816,7 +835,7 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 
 	// latency p50/p95
 	var latencies []int64
-	rows4, err := h.DB.Query(db.Q(`SELECT latency_ms FROM request_logs WHERE created_at >= ? AND latency_ms IS NOT NULL ORDER BY latency_ms`), start)
+	rows4, err := h.DB.Query(db.Q(`SELECT latency_ms FROM request_logs WHERE created_at >= ? AND latency_ms IS NOT NULL`+orgFilter+` ORDER BY latency_ms`), append([]any{start}, orgArgs...)...)
 	if err == nil {
 		defer rows4.Close()
 		for rows4.Next() {
@@ -845,23 +864,23 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	var rangeTokens sql.NullInt64
 	var rangeCost sql.NullFloat64
 	var rangeCount int
-	h.DB.QueryRow(db.Q(`SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ?`), start).Scan(&rangeTokens, &rangeCost, &rangeCount)
+	h.DB.QueryRow(db.Q(`SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ?`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&rangeTokens, &rangeCost, &rangeCount)
 
 	// success vs failure for range
 	var successful, failed int
-	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE created_at >= ? AND status < 400`), start).Scan(&successful)
-	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE created_at >= ? AND status >= 400`), start).Scan(&failed)
+	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE created_at >= ? AND status < 400`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&successful)
+	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE created_at >= ? AND status >= 400`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&failed)
 
 	// TTFT and TPS aggregates for range
 	var avgTTFT sql.NullFloat64
 	var avgTPS sql.NullFloat64
-	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(ttft_ms),0) FROM request_logs WHERE created_at >= ? AND ttft_ms > 0`), start).Scan(&avgTTFT)
-	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(CASE WHEN latency_ms>0 THEN total_tokens*1000.0/latency_ms ELSE 0 END),0) FROM request_logs WHERE created_at >= ? AND total_tokens>0`), start).Scan(&avgTPS)
+	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(ttft_ms),0) FROM request_logs WHERE created_at >= ? AND ttft_ms > 0`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&avgTTFT)
+	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(CASE WHEN latency_ms>0 THEN total_tokens*1000.0/latency_ms ELSE 0 END),0) FROM request_logs WHERE created_at >= ? AND total_tokens>0`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&avgTPS)
 
 	// overall success/failure
 	var totalSuccessful, totalFailed int
-	h.DB.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE status < 400`).Scan(&totalSuccessful)
-	h.DB.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE status >= 400`).Scan(&totalFailed)
+	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE status < 400`+orgFilter), orgArgs...).Scan(&totalSuccessful)
+	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE status >= 400`+orgFilter), orgArgs...).Scan(&totalFailed)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{

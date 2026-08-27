@@ -119,6 +119,24 @@ func (h *UsersHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
+	// Last-admin guard: demoting or disabling the sole active admin would
+	// lock every operator out of user management (DeleteUser already guards
+	// this — UpdateUser previously did not).
+	if (body.Role != nil && *body.Role != "admin") || (body.Disabled != nil && *body.Disabled) {
+		if target, err := h.Store.GetByID(id); err == nil && target.Role == "admin" && !target.Disabled {
+			users, _ := h.Store.List()
+			adminCount := 0
+			for _, u := range users {
+				if u.Role == "admin" && !u.Disabled {
+					adminCount++
+				}
+			}
+			if adminCount <= 1 {
+				http.Error(w, `{"error":"cannot demote or disable the last admin"}`, http.StatusBadRequest)
+				return
+			}
+		}
+	}
 	if body.Role != nil {
 		if !user.IsValidRole(*body.Role) {
 			http.Error(w, `{"error":"invalid role"}`, http.StatusBadRequest)

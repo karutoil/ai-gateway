@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -297,6 +298,29 @@ func verifyHS256Fallback(tokenStr, expectedIssuer string) (jwt.MapClaims, error)
 	return claims, nil
 }
 
+// oidcProviderCache memoizes oidc.Provider per issuer. VerifyOIDCToken is
+// called from the request path; the previous uncached NewProvider fetch per
+// verification added discovery latency to every external-token request and
+// turned the IdP into a DoS amplifier.
+var (
+	oidcProvidersMu sync.Mutex
+	oidcProviders   = map[string]*oidc.Provider{}
+)
+
+func cachedOIDCProvider(ctx context.Context, issuer string) (*oidc.Provider, error) {
+	oidcProvidersMu.Lock()
+	defer oidcProvidersMu.Unlock()
+	if p, ok := oidcProviders[issuer]; ok {
+		return p, nil
+	}
+	p, err := oidc.NewProvider(ctx, issuer)
+	if err != nil {
+		return nil, err
+	}
+	oidcProviders[issuer] = p
+	return p, nil
+}
+
 func VerifyOIDCToken(tokenStr, expectedIssuer string) (jwt.MapClaims, error) {
 	// HMAC fallback for HS256 tokens used in tests
 	if isHS256(tokenStr) {
@@ -305,7 +329,7 @@ func VerifyOIDCToken(tokenStr, expectedIssuer string) (jwt.MapClaims, error) {
 	// Real OIDC JWKS verification
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	provider, err := oidc.NewProvider(ctx, expectedIssuer)
+	provider, err := cachedOIDCProvider(ctx, expectedIssuer)
 	if err != nil {
 		return nil, err
 	}

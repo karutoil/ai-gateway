@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"ai-gateway/internal/resilience"
 	"ai-gateway/internal/translate"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
@@ -415,6 +417,26 @@ var upstreamForwardHeaders = map[string]bool{
 	"x-request-id":    true,
 }
 
+// azureAPIVersion is the default Azure OpenAI API version used for
+// deployment-style URLs.
+const azureAPIVersion = "2024-06-01"
+
+// upstreamTarget builds the upstream URL for an OpenAI-style action
+// ("/chat/completions", "/completions", "/embeddings", "/models").
+// Azure providers need deployment-shaped paths plus an api-version query;
+// the request builder detects that shape and switches the auth header from
+// "Authorization: Bearer" to "api-key" accordingly.
+func upstreamTarget(baseURL, action, model string, isAzure bool) string {
+	base := strings.TrimRight(baseURL, "/")
+	if !isAzure {
+		return base + action
+	}
+	if strings.Contains(base, "/openai/deployments/") {
+		return base + action + "?api-version=" + azureAPIVersion
+	}
+	return base + "/openai/deployments/" + url.PathEscape(model) + action + "?api-version=" + azureAPIVersion
+}
+
 func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, targetURL, apiKey string, body []byte, isStream, isAnthropicUpstream bool) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -436,6 +458,9 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, targe
 	if isAnthropicUpstream {
 		req.Header.Set("x-api-key", apiKey)
 		req.Header.Set("anthropic-version", "2023-06-01")
+	} else if strings.Contains(targetURL, "/openai/deployments/") {
+		// Azure: api-key header, no Bearer.
+		req.Header.Set("api-key", apiKey)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -531,8 +556,8 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		return attemptOutcome{committed: true, status: http.StatusServiceUnavailable}
 	}
 
-		ctx := r.Context()
-		var cancelFn context.CancelFunc
+	ctx := r.Context()
+	var cancelFn context.CancelFunc
 	if h.Timeouts.RequestTotal > 0 {
 		ctx, cancelFn = context.WithTimeout(ctx, h.Timeouts.RequestTotal)
 		defer cancelFn()
@@ -585,6 +610,15 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				breaker.Record(providerID, 0)
 			}
 			lastErr, lastStatus, lastHdr, lastBody = err, status, retryHdr, retryBody
+			// Keep a bounded sample of the upstream's error output so the
+			// terminal "attempts failed" path can log WHY the provider 5xx'd
+			// (quota text, model errors, HTML error pages — truncated).
+			if len(retryBody) > 0 {
+				lastErrSnippet = retryBody
+				if len(lastErrSnippet) > 2048 {
+					lastErrSnippet = lastErrSnippet[:2048]
+				}
+			}
 			if retry.ShouldRetry(attempt, retryableCode(status)) {
 				sleepCtx(ctx, retryAfterDelay(retryHdr, retry.Backoff(attempt)))
 				continue
@@ -592,11 +626,11 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if err != nil {
 				// Distinguish client-cancelled from genuinely dead upstream.
 				if ctx.Err() != nil {
-					return attemptOutcome{committed: false, status: status, retriable: false}
+					return attemptOutcome{committed: false, status: status, retriable: false, errText: err.Error()}
 				}
-				return attemptOutcome{committed: false, status: 0, retriable: true}
+				return attemptOutcome{committed: false, status: 0, retriable: true, errText: err.Error()}
 			}
-			return attemptOutcome{committed: false, status: status, retriable: true}
+			return attemptOutcome{committed: false, status: status, retriable: true, errSnippet: string(lastErrSnippet)}
 		}
 
 		lastStatus = resp.StatusCode
@@ -1556,7 +1590,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, func(p *models.Provider) bool {
+	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type != models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
@@ -1590,7 +1624,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				out = b2
 			}
 		}
-		target := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+		target := upstreamTarget(p.BaseURL, "/chat/completions", model, p.Type == models.ProviderAzure)
 		return target, apiKey, out, false, nil
 	})
 }
@@ -1611,7 +1645,7 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, nil)
+	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
 		http.Error(w, `{"error":{"message":"no provider configured"}}`, http.StatusServiceUnavailable)
 		return
@@ -1632,7 +1666,7 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		httperr.Write(w, http.StatusBadGateway, "provider credential unavailable", httperr.TypeProxy)
 		return
 	}
-	target := strings.TrimRight(p.BaseURL, "/") + "/completions"
+	target := upstreamTarget(p.BaseURL, "/completions", model, p.Type == models.ProviderAzure)
 	isAnthropic := p.Type == models.ProviderAnthropic || strings.Contains(strings.ToLower(p.BaseURL), "anthropic") || strings.Contains(strings.ToLower(p.Name), "claude") || strings.Contains(strings.ToLower(model), "claude") || strings.Contains(strings.ToLower(model), "muse-spark")
 	if isAnthropic {
 		var comp map[string]any
@@ -1736,7 +1770,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, func(p *models.Provider) bool {
+	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type != models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
@@ -1754,9 +1788,51 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		if upstream != translate.ExtractModel(body) {
 			out = replaceModelInBody(body, upstream)
 		}
-		target := strings.TrimRight(p.BaseURL, "/") + "/embeddings"
+		target := upstreamTarget(p.BaseURL, "/embeddings", model, p.Type == models.ProviderAzure)
 		return target, apiKey, out, false, nil
 	})
+}
+
+// GetModel serves GET /v1/models/{id} — OpenAI SDK "retrieve model" parity.
+// The route previously did not exist and fell through to the SPA 404.
+func (h *Handler) GetModel(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		httperr.Invalid(w, "model id required")
+		return
+	}
+	// Enforce per-key allowlists the same way the list endpoint does.
+	if k, ok := middleware.GatewayKeyFromContext(r.Context()); ok && k != nil && len(k.AllowedModels) > 0 {
+		if !apikey.IsModelAllowed(k.AllowedModels, id) {
+			httperr.NotFound(w, "model not found")
+			return
+		}
+	}
+	if h.DB != nil {
+		var modelID, displayName, ownedBy sql.NullString
+		err := h.DB.QueryRow(db.Q(`SELECT pm.model_id, COALESCE(pm.display_name,''), COALESCE(pm.owned_by,'system') FROM provider_models pm WHERE pm.model_id=? OR pm.model_id LIKE '%/'||? LIMIT 1`), id, id).Scan(&modelID, &displayName, &ownedBy)
+		if err == nil && modelID.Valid {
+			owner := "system"
+			if ownedBy.Valid && ownedBy.String != "" {
+				owner = ownedBy.String
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"object": "model", "id": id, "owned_by": owner})
+			return
+		}
+	}
+	if h.CatalogStore != nil {
+		if m, err := h.CatalogStore.Get(id); err == nil {
+			owned := m.Provider
+			if owned == "" {
+				owned = "system"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"object": "model", "id": id, "owned_by": owned})
+			return
+		}
+	}
+	httperr.NotFound(w, "model not found")
 }
 
 // Models handles GET /v1/models - now returns provider_models (discovered per provider) enriched, not full catalog
@@ -2036,7 +2112,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, func(p *models.Provider) bool {
+	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type == models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
@@ -2088,7 +2164,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, nil)
+	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
 		http.Error(w, `{"error":{"message":"no provider configured"}}`, http.StatusServiceUnavailable)
 		return
@@ -2171,7 +2247,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	// path previously fell through, sending a chat-shaped body to
 	// <anthropic-base>/chat/completions with Bearer auth — a guaranteed 404/401
 	// against real Anthropic APIs.
-	target := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+	target := upstreamTarget(p.BaseURL, "/chat/completions", model, p.Type == models.ProviderAzure)
 	upstreamBody := translated
 	isAnthropicUpstream := false
 	if p.Type == models.ProviderAnthropic {

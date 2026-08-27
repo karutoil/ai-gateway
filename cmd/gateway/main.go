@@ -54,11 +54,7 @@ func main() {
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
 		if arg == "version" || arg == "--version" || arg == "-v" {
-			commit := "unknown"
-			if c := os.Getenv("GATEWAY_COMMIT"); c != "" {
-				commit = c
-			}
-			fmt.Printf("ai-gateway %s (commit %s)\n", handler.GatewayVersion, commit)
+			fmt.Printf("ai-gateway %s (commit %s)\n", handler.GatewayVersion, handler.GatewayCommit)
 			return
 		}
 	}
@@ -156,22 +152,34 @@ func main() {
 	proxyHandler.Metrics = otel.NewMetrics()
 
 	go func() {
+		// Sync now when empty, then re-sync daily: pricing/model metadata
+		// drift over time and the "boot-sync only when empty" behavior left
+		// deployments with a frozen snapshot forever. Failure surfaces in
+		// logs and /health config is unaffected.
+		syncCatalog := func(reason string) {
+			n, err := catalogStore.FetchAndSync()
+			if err != nil {
+				log.Error().Err(err).Str("trigger", reason).Msg("catalog sync failed")
+			} else {
+				log.Info().Int("models", n).Str("trigger", reason).Msg("catalog synced")
+			}
+		}
 		count, _ := catalogStore.Count()
 		if count == 0 {
 			log.Info().Msg("catalog empty, syncing from models.dev...")
-			n, err := catalogStore.FetchAndSync()
-			if err != nil {
-				log.Error().Err(err).Msg("initial catalog sync failed")
-			} else {
-				log.Info().Int("models", n).Msg("catalog synced")
-			}
+			syncCatalog("boot")
+		}
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			syncCatalog("daily")
 		}
 	}()
 
 	provider.StartHealthChecker(database, providerStore, 5*time.Minute)
 
 	// singletons
-	_ = webhook.Global // init from WEBHOOK_URL via internal/webhook/init()
+	_ = webhook.Global // rebuilt post-env-load via webhook.ReinitFromEnv() above
 	// Nightly retention purge for request_logs when LOG_RETENTION_DAYS is set.
 	if cfg.LogRetentionDays > 0 {
 		go runLogRetention(database, cfg.LogRetentionDays)
@@ -369,6 +377,7 @@ func main() {
 		r.Post("/v1/embeddings", proxyHandler.Embeddings)
 		r.Post("/embeddings", proxyHandler.Embeddings)
 		r.Get("/v1/models", proxyHandler.Models)
+	r.Get("/v1/models/{id}", proxyHandler.GetModel)
 		r.Get("/models", proxyHandler.Models)
 		// Anthropic compat — handle both /v1/messages and /messages for SDK baseURL flexibility
 		r.Post("/v1/messages", proxyHandler.AnthropicMessages)
