@@ -96,6 +96,18 @@ func getBool(name string) bool {
 	return false
 }
 
+// streamUsageInjectDefault: STREAM_USAGE_INJECT defaults to true (usage
+// injection on streams the client did not ask for include_usage) because
+// silent zero-usage streams break budgets, quotas and cost analytics.
+// Operators can opt out with STREAM_USAGE_INJECT=0/false/off.
+func streamUsageInjectDefault() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("STREAM_USAGE_INJECT"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
 // IsWeakProductionPassword reports whether the config uses the insecure default
 // ADMIN_PASSWORD while ENV==production. Health handlers should expose config_ok accordingly.
 func (c *Config) IsWeakProductionPassword() bool {
@@ -339,7 +351,11 @@ func Load() (*Config, error) {
 		BodyLogMaxBytes:  getInt("BODY_LOG_MAX_BYTES", 8192),
 		LogRetentionDays: getInt("LOG_RETENTION_DAYS", 0),
 
-		StreamUsageInject: getBool("STREAM_USAGE_INJECT"),
+			// Billing-correct default: STREAM_USAGE_INJECT defaults to TRUE so streamed
+	// requests are actually metered (OpenAI streams carry no usage unless the
+	// client asked for include_usage). Set STREAM_USAGE_INJECT=0 to restore
+	// byte-pure pass-through at the cost of zero usage on such streams.
+	StreamUsageInject: streamUsageInjectDefault(),
 
 		MetricsRequireAuth: getBool("METRICS_PROTECT"),
 	}

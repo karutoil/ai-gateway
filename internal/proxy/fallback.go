@@ -141,7 +141,9 @@ func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*mo
 	}
 
 	// 3. Curated LB rule (checked on post-alias model name first, then the
-	// raw/alias spelling). One healthy member per request, rotating start.
+	// raw/alias spelling). One member per request, rotating start. If the
+	// rotated pick's breaker is OPEN, prefer the next member with a closed
+	// circuit instead of 503-ing while healthy group members exist.
 	if h.LB != nil {
 		for _, key := range []string{model, rawModel} {
 			key = strings.ToLower(strings.TrimSpace(key))
@@ -150,7 +152,16 @@ func (h *Handler) candidateProviders(rawModel, model, hint string, pred func(*mo
 			}
 			if rule := h.LB.RuleForModel(key); rule != nil {
 				if rotated := h.LB.RotateProviders(rule); len(rotated) > 0 {
-					consider(rotated[0])
+					picked := rotated[0]
+					if h.Breaker != nil {
+						for _, cand := range rotated {
+							if h.Breaker.State(cand.ID) != "open" {
+								picked = cand
+								break
+							}
+						}
+					}
+					consider(picked)
 					return out
 				}
 			}

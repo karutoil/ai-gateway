@@ -17,6 +17,7 @@ import (
 	"ai-gateway/internal/apikey"
 	"ai-gateway/internal/cache"
 	"ai-gateway/internal/catalog"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
@@ -86,7 +87,7 @@ func (h *Handler) resolveAlias(model string) string {
 	// direct alias
 	if h.DB != nil {
 		var target string
-		err := h.DB.QueryRow(`SELECT target FROM model_aliases WHERE alias=?`, model).Scan(&target)
+		err := h.DB.QueryRow(db.Q(`SELECT target FROM model_aliases WHERE alias=?`), model).Scan(&target)
 		if err == nil && target != "" {
 			return target
 		}
@@ -94,7 +95,7 @@ func (h *Handler) resolveAlias(model string) string {
 		if strings.HasPrefix(model, "opencode/") {
 			trimmed := strings.TrimPrefix(model, "opencode/")
 			// try alias of trimmed
-			err = h.DB.QueryRow(`SELECT target FROM model_aliases WHERE alias=?`, trimmed).Scan(&target)
+			err = h.DB.QueryRow(db.Q(`SELECT target FROM model_aliases WHERE alias=?`), trimmed).Scan(&target)
 			if err == nil && target != "" {
 				return target
 			}
@@ -231,6 +232,18 @@ func extractUsage(body []byte) (prompt, completion int) {
 		} else if v, ok := usage["promptTokens"]; ok {
 			prompt = toInt(v)
 		}
+		// Anthropic prompt caching: cache_read_input_tokens and
+		// cache_creation_input_tokens are billed separately from
+		// input_tokens. They were previously dropped entirely, systematically
+		// under-billing cached-prompt traffic. Count them into the prompt
+		// side (priced at the input rate — a close approximation and strictly
+		// better than $0).
+		if v, ok := usage["cache_read_input_tokens"]; ok {
+			prompt += toInt(v)
+		}
+		if v, ok := usage["cache_creation_input_tokens"]; ok {
+			prompt += toInt(v)
+		}
 		if v, ok := usage["completion_tokens"]; ok {
 			completion = toInt(v)
 		} else if v, ok := usage["output_tokens"]; ok {
@@ -244,6 +257,12 @@ func extractUsage(body []byte) (prompt, completion int) {
 		if um, ok := v.(map[string]interface{}); ok {
 			if iv, ok := um["input_tokens"]; ok {
 				prompt = toInt(iv)
+			}
+			if cv, ok := um["cache_read_input_tokens"]; ok {
+				prompt += toInt(cv)
+			}
+			if cv, ok := um["cache_creation_input_tokens"]; ok {
+				prompt += toInt(cv)
 			}
 			if ov, ok := um["output_tokens"]; ok {
 				completion = toInt(ov)
@@ -267,6 +286,12 @@ func toInt(v interface{}) int {
 	}
 	return 0
 }
+
+// maxProxyRequestBodyBytes bounds how much of a client request body the
+// gateway will buffer. Upstream LLM payloads can legitimately reach tens of
+// MB (large multimodal contexts), but an unbounded read let a single
+// authenticated request exhaust gateway memory (DoS for every tenant).
+const maxProxyRequestBodyBytes = 64 << 20 // 64 MiB
 
 func cacheKeyFor(endpoint, model string, body []byte, scope string) string {
 	sum := sha256.Sum256(append([]byte(endpoint+"\n"+scope+"\n"+model+"\n"), body...))
@@ -332,14 +357,19 @@ var hopByHopHeaders = map[string]bool{
 }
 
 func copyHeader(dst, src http.Header) {
-	// Headers named in a Connection: header are hop-by-hop too.
+	// Headers named in a Connection: header are hop-by-hop too. Build a
+	// per-call set: the previous version WROTE these tokens into the shared
+	// hopByHopHeaders map, which is a data race under concurrent responses
+	// (Go fatal: concurrent map writes) and permanently blacklisted headers
+	// for the process lifetime.
+	connTokens := map[string]bool{}
 	for _, tok := range strings.Split(src.Get("Connection"), ",") {
 		if t := strings.ToLower(strings.TrimSpace(tok)); t != "" {
-			hopByHopHeaders[t] = true
+			connTokens[t] = true
 		}
 	}
 	for k, vv := range src {
-		if hopByHopHeaders[strings.ToLower(k)] {
+		if hopByHopHeaders[strings.ToLower(k)] || connTokens[strings.ToLower(k)] {
 			continue
 		}
 		for _, v := range vv {
@@ -531,8 +561,12 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			// Upstream unusable and NOTHING has been committed yet — both
 			// streams and buffered requests can recover here.
 			status := 0
+			var retryHdr http.Header
 			if err == nil {
 				status = resp.StatusCode
+				// Capture Retry-After before the body is discarded so the
+				// backoff honors the provider's requested delay.
+				retryHdr = resp.Header.Clone()
 				io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 				resp.Body.Close()
 				breaker.Record(providerID, status)
@@ -541,7 +575,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			}
 			lastErr, lastStatus, lastHdr, lastBody = err, status, nil, nil
 			if retry.ShouldRetry(attempt, retryableCode(status)) {
-				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
+				sleepCtx(ctx, retryAfterDelay(retryHdr, retry.Backoff(attempt)))
 				continue
 			}
 			if err != nil {
@@ -560,9 +594,12 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 
 		if isStream {
 			out := h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader)
-			if out.midStreamFailure {
+			if out.midStreamFailure && !out.clientGone {
+				// A genuine upstream death mid-stream feeds the breaker a
+				// synthetic 599. Client disconnects are NOT the provider's
+				// fault — penalizing them let client churn open circuits.
 				breaker.Record(providerID, midStreamFailStatus)
-			} else {
+			} else if !out.midStreamFailure {
 				breaker.Record(providerID, lastStatus)
 			}
 			return attemptOutcome{committed: true, status: lastStatus}
@@ -620,6 +657,15 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 
 		needsResponsesShape := opts.translatedResponses && endpoint == "responses" && lastStatus == 200
 		if needsResponsesShape {
+			// Anthropic upstream: normalize the message response into chat
+			// shape first, otherwise chatToResponsesJSON has nothing to work
+			// with (the old path sent chat-shaped requests to Anthropic and
+			// never handled the reply at all).
+			if isAnthropicUpstream {
+				if chatShape := anthropicToOpenAIChatResponse(outBody, model); chatShape != nil {
+					outBody = chatShape
+				}
+			}
 			if converted := chatToResponsesJSON(outBody, model); converted != nil {
 				if pt2, ct2 := extractUsage(converted); pt2 != 0 || ct2 != 0 {
 					pt, ct = pt2, ct2
@@ -1009,6 +1055,18 @@ func harvestAnthropicTokens(data []byte) (prompt, completion int) {
 			if v, ok := u["input_tokens"]; ok && toInt(v) > prompt {
 				prompt = toInt(v)
 			}
+			// Anthropic prompt-cache tokens: message_start /
+			// message_delta carry them alongside input_tokens.
+			cacheSum := 0
+			if v, ok := u["cache_read_input_tokens"]; ok {
+				cacheSum += toInt(v)
+			}
+			if v, ok := u["cache_creation_input_tokens"]; ok {
+				cacheSum += toInt(v)
+			}
+			if cacheSum > 0 {
+				prompt += cacheSum
+			}
 			if v, ok := u["output_tokens"]; ok && toInt(v) > completion {
 				completion = toInt(v)
 			}
@@ -1140,7 +1198,7 @@ func (h *Handler) logRequestExtendedBodies(keyPrefix, providerID, model, endpoin
 			respBodyStr = ScrubSecrets(string(b))
 		}
 	}
-	h.DB.Exec(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		id, keyPrefix, providerID, model, endpoint, status, latencyMs, time.Now().UTC(), promptTokens, completionTokens, total, costUSD, isStream, nullIfEmpty(reqBodyStr), nullIfEmpty(respBodyStr))
 }
 
@@ -1349,10 +1407,34 @@ func (h *Handler) costForModel(modelID string, prompt, completion int) float64 {
 	if err != nil {
 		m, err = h.CatalogStore.GetByShortID(modelID)
 		if err != nil {
+			// Unknown model (not in the models.dev snapshot — new releases,
+			// private or aliased upstream names). Returning $0 makes real
+			// upstream spend invisible to cost budgets. Fall back to
+			// operator-configured default pricing when present:
+			//   price_fallback_input_usd_per_1m / price_fallback_output_usd_per_1m
+			// (settable via the dashboard Settings page).
+			in := h.settingFloat("price_fallback_input_usd_per_1m")
+			out := h.settingFloat("price_fallback_output_usd_per_1m")
+			if in > 0 || out > 0 {
+				return float64(prompt)/1_000_000*in + float64(completion)/1_000_000*out
+			}
 			return 0
 		}
 	}
 	return catalog.CostFor(m, prompt, completion)
+}
+
+// settingFloat reads a numeric system_config key ("" / unparseable → 0).
+func (h *Handler) settingFloat(key string) float64 {
+	if h.DB == nil {
+		return 0
+	}
+	var v sql.NullString
+	if err := h.DB.QueryRow(db.Q(`SELECT value FROM system_config WHERE key=?`), key).Scan(&v); err != nil || !v.Valid {
+		return 0
+	}
+	f, _ := strconv.ParseFloat(strings.TrimSpace(v.String), 64)
+	return f
 }
 
 func (h *Handler) getReasoningConfig(providerID, modelID string) (reasoning bool, rType string, levels []string, limits map[string]int) {
@@ -1362,7 +1444,7 @@ func (h *Handler) getReasoningConfig(providerID, modelID string) (reasoning bool
 	}
 	var r bool
 	var rt, rl, rol sql.NullString
-	err := h.DB.QueryRow(`SELECT reasoning, reasoning_type, reasoning_levels, reasoning_output_limits FROM provider_models WHERE provider_id=? AND model_id=?`, providerID, modelID).Scan(&r, &rt, &rl, &rol)
+	err := h.DB.QueryRow(db.Q(`SELECT reasoning, reasoning_type, reasoning_levels, reasoning_output_limits FROM provider_models WHERE provider_id=? AND model_id=?`), providerID, modelID).Scan(&r, &rt, &rl, &rol)
 	if err != nil {
 		// fallback to catalog
 		if h.CatalogStore != nil {
@@ -1440,7 +1522,7 @@ func (h *Handler) validateReasoning(providerID, modelID string, body []byte) err
 }
 
 func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyRequestBodyBytes))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -1495,7 +1577,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // Completions handles POST /v1/completions
 func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyRequestBodyBytes))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -1523,7 +1605,13 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"model '`+model+`' is an anthropic model; use POST /v1/messages instead of /v1/completions","type":"invalid_request_error"}}`, http.StatusBadRequest)
 		return
 	}
-	apiKey, _ := h.ProviderStore.DecryptKey(p)
+	apiKey, derr := h.ProviderStore.DecryptKey(p)
+	if derr != nil {
+		// Fail fast (502) instead of sending "Bearer " + "" upstream to get a
+		// confusing 401 from the provider.
+		httperr.Write(w, http.StatusBadGateway, "provider credential unavailable", httperr.TypeProxy)
+		return
+	}
 	target := strings.TrimRight(p.BaseURL, "/") + "/completions"
 	isAnthropic := p.Type == models.ProviderAnthropic || strings.Contains(strings.ToLower(p.BaseURL), "anthropic") || strings.Contains(strings.ToLower(p.Name), "claude") || strings.Contains(strings.ToLower(model), "claude") || strings.Contains(strings.ToLower(model), "muse-spark")
 	if isAnthropic {
@@ -1608,18 +1696,14 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			body = translated
 			target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
-			if strings.Contains(p.BaseURL, "ckff.dev") {
-				target = "https://ckff.dev/v1/messages"
-			}
 		}
-	} else if strings.HasSuffix(p.BaseURL, "/v1") {
 	}
 	start := time.Now()
 	h.proxyWithMetrics(w, r, target, apiKey, body, isStream, model, p.ID, r.Header.Get("X-Gateway-Key-Prefix"), "completions", start, isAnthropic)
 }
 
 func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyRequestBodyBytes))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -1685,7 +1769,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.ProviderStore.List()
 	// Try provider_models first - this is the dynamic per-provider list user wants
 	if h.DB != nil {
-		rows, err := h.DB.Query(`SELECT pm.model_id, pm.display_name, pm.owned_by, pm.context_window, pm.max_output, pm.input_cost, pm.output_cost, pm.reasoning, pm.tool_call, pm.attachment, p.name, pm.reasoning_type, pm.reasoning_levels, pm.reasoning_output_limits FROM provider_models pm JOIN providers p ON p.id = pm.provider_id ORDER BY p.name, pm.model_id LIMIT 500`)
+		rows, err := h.DB.Query(db.Q(`SELECT pm.model_id, pm.display_name, pm.owned_by, pm.context_window, pm.max_output, pm.input_cost, pm.output_cost, pm.reasoning, pm.tool_call, pm.attachment, p.name, pm.reasoning_type, pm.reasoning_levels, pm.reasoning_output_limits FROM provider_models pm JOIN providers p ON p.id = pm.provider_id ORDER BY p.name, pm.model_id LIMIT 500`))
 		if err == nil {
 			defer rows.Close()
 			var pmModels []map[string]interface{}
@@ -1746,7 +1830,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 					seen[m["id"].(string)] = true
 				}
 				if h.DB != nil {
-					rows2, _ := h.DB.Query(`SELECT alias, target FROM model_aliases`)
+					rows2, _ := h.DB.Query(db.Q(`SELECT alias, target FROM model_aliases`))
 					if rows2 != nil {
 						defer rows2.Close()
 						for rows2.Next() {
@@ -1808,7 +1892,10 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 		all = append(all, cm)
 	}
 	for _, prov := range providers {
-		apiKey, _ := h.ProviderStore.DecryptKey(&prov)
+		apiKey, derr := h.ProviderStore.DecryptKey(&prov)
+		if derr != nil {
+			continue // skip providers whose credentials cannot be decrypted
+		}
 		target := strings.TrimRight(prov.BaseURL, "/") + "/models"
 		if prov.Type == models.ProviderAnthropic {
 			continue
@@ -1857,7 +1944,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if h.DB != nil {
-		rows, _ := h.DB.Query(`SELECT alias, target FROM model_aliases`)
+		rows, _ := h.DB.Query(db.Q(`SELECT alias, target FROM model_aliases`))
 		if rows != nil {
 			defer rows.Close()
 			for rows.Next() {
@@ -1915,7 +2002,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyRequestBodyBytes))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -1967,7 +2054,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 // Responses handles POST /v1/responses (OpenAI Responses API)
 func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyRequestBodyBytes))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -1991,7 +2078,11 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s","type":"invalid_request_error"}}`, err.Error()), http.StatusBadRequest)
 		return
 	}
-	apiKey, _ := h.ProviderStore.DecryptKey(p)
+	apiKey, derr := h.ProviderStore.DecryptKey(p)
+	if derr != nil {
+		httperr.Write(w, http.StatusBadGateway, "provider credential unavailable", httperr.TypeProxy)
+		return
+	}
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	// For anthropic providers, /v1/responses does not exist — skip native and translate directly
@@ -2037,6 +2128,13 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					pt, ct2 := extractUsage(bodyBytes)
 					cost := h.costForModel(model, pt, ct2)
 					h.logRequestExtended(keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), pt, ct2, cost, false)
+					// Billing + breaker parity: the native non-stream path
+					// previously logged spend but never fed the budget ledger
+					// or the circuit breaker, silently bypassing quotas.
+					h.recordUsage(keyPrefix, r, pt+ct2, cost)
+					if h.Breaker != nil {
+						h.Breaker.Record(p.ID, resp.StatusCode)
+					}
 					return
 				}
 			}
@@ -2049,27 +2147,39 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"failed to translate responses to chat"}}`, http.StatusBadRequest)
 		return
 	}
+	// Shared Anthropic branch for BOTH stream and non-stream: the non-stream
+	// path previously fell through, sending a chat-shaped body to
+	// <anthropic-base>/chat/completions with Bearer auth — a guaranteed 404/401
+	// against real Anthropic APIs.
+	target := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+	upstreamBody := translated
+	isAnthropicUpstream := false
+	if p.Type == models.ProviderAnthropic {
+		translated2, _, convErr := translate.OpenAIToAnthropic(translated)
+		if convErr != nil || len(translated2) == 0 {
+			http.Error(w, `{"error":{"message":"failed to translate responses to anthropic"}}`, http.StatusBadRequest)
+			return
+		}
+		upstreamBody = translated2
+		target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+		isAnthropicUpstream = true
+	}
 	if isStream {
 		// Translated-path streaming: force stream:true on the outbound chat
 		// (or anthropic messages) call and re-emit inbound deltas as the
 		// OpenAI Responses SSE protocol. LB guarantees a single candidate.
-		targetChat := strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
-		upstreamBody := translated
-		isAnthropicUpstream := false
-		if p.Type == models.ProviderAnthropic {
-			translated2, _, convErr := translate.OpenAIToAnthropic(translated)
-			if convErr != nil || len(translated2) == 0 {
-				http.Error(w, `{"error":{"message":"failed to translate responses to anthropic"}}`, http.StatusBadRequest)
-				return
+		// Chat upstreams need stream_options.include_usage or the streamed
+		// tokens are invisible to budgets; Anthropic always emits usage
+		// frames in message_start/message_delta.
+		if !isAnthropicUpstream {
+			if b2, changed := injectStreamUsage(upstreamBody); changed {
+				upstreamBody = b2
 			}
-			upstreamBody = translated2
-			targetChat = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
-			isAnthropicUpstream = true
 		}
-		h.streamTranslatedResponses(w, r, targetChat, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream)
+		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream)
 		return
 	}
-	h.proxyWithMetricsOpts(w, r, strings.TrimRight(p.BaseURL, "/")+"/chat/completions", apiKey, translated, false, model, p.ID, keyPrefix, "responses", start, false, proxyOpts{translatedResponses: true})
+	h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true})
 }
 
 func replaceModelInBody(body []byte, newModel string) []byte {

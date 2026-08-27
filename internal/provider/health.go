@@ -143,7 +143,12 @@ func checkAll(db *sql.DB, store *Store) {
 						continue
 					}
 					resp.Body.Close()
-					// Consider 200, 401, 403 as "up" (reachable), 5xx as down, 404 as config error
+					// Consider 200, 401, 403 as "up" (reachable), 5xx as down.
+					// A 404 on the /models probe is NOT proof of an unhealthy
+					// provider: many OpenAI-compatible relays don't implement
+					// it while chat works fine. Treating 404 as "down" made
+					// the LB skip working providers (potentially emptying a
+					// whole routing group), so it's "unknown" now.
 					if resp.StatusCode == 200 {
 						status = "up"
 						msg = "OK"
@@ -157,9 +162,11 @@ func checkAll(db *sql.DB, store *Store) {
 					} else if resp.StatusCode >= 500 {
 						status = "down"
 						msg = http.StatusText(resp.StatusCode)
-					} else if resp.StatusCode == 404 {
-						status = "down"
-						msg = "404 models not found (check base_url)"
+					} else if resp.StatusCode == 404 || resp.StatusCode == 405 {
+						status = "unknown"
+						msg = "probe endpoint not implemented (404); provider kept"
+						success = true
+						break
 					} else {
 						status = "up"
 						msg = http.StatusText(resp.StatusCode)

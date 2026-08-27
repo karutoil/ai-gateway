@@ -458,7 +458,15 @@ func Middleware(l Limiter) func(http.Handler) http.Handler {
 				}
 			}
 			if prefix != "" {
-				err := l.Check(prefix, 0)
+				// Pre-flight token estimate from the declared body size (~4
+				// bytes per token). Real usage is still recorded post-response;
+				// this estimate only stops a single very large request from
+				// blowing past a nearly-exhausted daily token budget unchecked.
+				estimate := 0
+				if r.ContentLength > 0 {
+					estimate = int(r.ContentLength / 4)
+				}
+				err := l.Check(prefix, estimate)
 				switch {
 				case IsOverQuota(err):
 					var quota *QuotaError
