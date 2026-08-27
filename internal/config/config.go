@@ -351,11 +351,11 @@ func Load() (*Config, error) {
 		BodyLogMaxBytes:  getInt("BODY_LOG_MAX_BYTES", 8192),
 		LogRetentionDays: getInt("LOG_RETENTION_DAYS", 0),
 
-			// Billing-correct default: STREAM_USAGE_INJECT defaults to TRUE so streamed
-	// requests are actually metered (OpenAI streams carry no usage unless the
-	// client asked for include_usage). Set STREAM_USAGE_INJECT=0 to restore
-	// byte-pure pass-through at the cost of zero usage on such streams.
-	StreamUsageInject: streamUsageInjectDefault(),
+		// Billing-correct default: STREAM_USAGE_INJECT defaults to TRUE so streamed
+		// requests are actually metered (OpenAI streams carry no usage unless the
+		// client asked for include_usage). Set STREAM_USAGE_INJECT=0 to restore
+		// byte-pure pass-through at the cost of zero usage on such streams.
+		StreamUsageInject: streamUsageInjectDefault(),
 
 		MetricsRequireAuth: getBool("METRICS_PROTECT"),
 	}

@@ -377,7 +377,7 @@ func main() {
 		r.Post("/v1/embeddings", proxyHandler.Embeddings)
 		r.Post("/embeddings", proxyHandler.Embeddings)
 		r.Get("/v1/models", proxyHandler.Models)
-	r.Get("/v1/models/{id}", proxyHandler.GetModel)
+		r.Get("/v1/models/{id}", proxyHandler.GetModel)
 		r.Get("/models", proxyHandler.Models)
 		// Anthropic compat — handle both /v1/messages and /messages for SDK baseURL flexibility
 		r.Post("/v1/messages", proxyHandler.AnthropicMessages)
