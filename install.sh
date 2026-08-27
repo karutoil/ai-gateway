@@ -29,6 +29,13 @@ REPO="${GATEWAY_REPO:-karutoil/ai-gateway}"
 PINNED_VERSION="${GATEWAY_VERSION:-}"
 NONINTERACTIVE="${GATEWAY_YES:-0}"
 
+# Global cleanup handle for temp dirs. EXIT traps fire after the registering
+# function returned, so a `local` variable would already be out of scope —
+# always point this at the live temp dir and let cleanup() do the rm.
+CLEANUP_DIR=""
+cleanup() { [ -n "$CLEANUP_DIR" ] && rm -rf "$CLEANUP_DIR"; return 0; }
+trap cleanup EXIT
+
 # ---------------------------------------------------------------------------
 # Pretty output
 # ---------------------------------------------------------------------------
@@ -176,10 +183,18 @@ download_release() {
   HTTP_HEADERS=""
   http_fetch "$url" "${tmp}/${asset}" || die "download failed: ${url}"
   HTTP_HEADERS=""
+  # `set -e -o pipefail`: a grep miss here must not kill the installer, so the
+  # assignment is guarded and validated below.
   if http_fetch "https://github.com/${REPO}/releases/download/${version}/checksums.txt" "${tmp}/checksums.txt" 2>/dev/null; then
-    want="$(grep " ${asset}\$" "${tmp}/checksums.txt" | awk '{print $1}')"
+    want="$(grep " ${asset}\$" "${tmp}/checksums.txt" 2>/dev/null | awk '{print $1}')" || true
+    if [ -z "$want" ] && http_fetch "https://github.com/${REPO}/releases/download/${version}/${asset}.sha256" "${tmp}/${asset}.sha256" 2>/dev/null; then
+      want="$(awk '{print $1}' "${tmp}/${asset}.sha256" 2>/dev/null)" || true
+    fi
     got="$(sha256_of "${tmp}/${asset}")"
-    if [ -n "$want" ] && [ "$want" != "$got" ]; then
+    if [ -z "$want" ]; then
+      die "checksums.txt does not list ${asset} — refusing to install an unverified binary"
+    fi
+    if [ "$want" != "$got" ]; then
       die "checksum mismatch for ${asset} (want ${want}, got ${got})"
     fi
     info "Checksum verified (${got:0:16}...)"
@@ -450,8 +465,8 @@ cmd_install() {
   info "Installing version ${C_B}${version}${C_0}"
 
   local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp:-}"' EXIT
+  CLEANUP_DIR="$(mktemp -d)"
+  tmp="$CLEANUP_DIR"
   download_release "$tmp" "$version"
 
   mkdir -p "$dir"
@@ -525,8 +540,8 @@ cmd_update() {
   fi
 
   local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp:-}"' EXIT
+  CLEANUP_DIR="$(mktemp -d)"
+  tmp="$CLEANUP_DIR"
   download_release "$tmp" "$version"
 
   local was_active=0 was_running=0
