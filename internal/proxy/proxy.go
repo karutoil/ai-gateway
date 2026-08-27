@@ -1617,6 +1617,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if upstream != translate.ExtractModel(body) {
 			out = replaceModelInBody(body, upstream)
 		}
+		// Strict OpenAI-compatible upstreams reject legal-but-sloppy shapes
+		// (tool msgs without tool_call_id, role:"developer", assistant
+		// content:null) with 400 "Invalid input". Normalize before sending;
+		// no-op on bodies it does not understand.
+		out = sanitizeOpenAICompatBody(out)
 		// Billing accuracy: ask the upstream for a final usage frame when the
 		// client didn't (OpenAI-compat endpoints only; guarded per-dialect).
 		if isStream && h.StreamUsageInject {
@@ -1628,6 +1633,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return target, apiKey, out, false, nil
 	})
 }
+
+// Completions handles POST /v1/completions
 
 // Completions handles POST /v1/completions
 func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
