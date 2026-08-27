@@ -87,6 +87,7 @@ export default function Users(){
 
   const create = async()=>{
     if(!newUser.username || !newUser.password){ setCreateError('Username and password are required.'); return}
+    if(newUser.password.length < 8){ setCreateError('Password must be at least 8 characters.'); return}
     setCreateError('')
     try{
       await api.users.create(newUser)
@@ -124,6 +125,7 @@ export default function Users(){
 
   const resetPwSubmit = async()=>{
     if(!resetTarget || !resetPwValue){ return }
+    if(resetPwValue.length < 8){ toast.error('Password must be at least 8 characters'); return }
     try{
       await api.users.resetPassword(resetTarget.id, resetPwValue)
       toast.success(`Password reset for ${resetTarget.username}`)
@@ -236,7 +238,7 @@ export default function Users(){
             <Field label="Username">
               <Input value={newUser.username} onChange={e=>setNewUser({...newUser, username:e.target.value})} placeholder="jane.doe" spellCheck={false} autoComplete="off" />
             </Field>
-            <Field label="Password" hint="Share securely — the user should change it after first login.">
+            <Field label="Password" hint="Minimum 8 characters. Share securely — the user should change it after first login.">
               <Input type="password" value={newUser.password} onChange={e=>setNewUser({...newUser, password:e.target.value})} placeholder="••••••••" autoComplete="new-password" />
             </Field>
             <Field label="Role">
@@ -299,24 +301,30 @@ export default function Users(){
                           ? <span className="text-xs text-muted tabular-nums">{u.passkey_count} enrolled</span>
                           : <span className="text-xs text-muted/60">none</span>}
                       </span>
-                      {showPasskeyFor===u.id ? (
-                        <div className="flex items-center gap-1">
-                          <Button size="sm" variant="primary" onClick={()=>handleRegisterPasskey(u.id)} disabled={passkeyBusy}>Enroll</Button>
-                          {u.passkey_enabled && (
-                            <Button size="sm" variant="ghost" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
-                              onClick={()=>setPasskeyDisableTarget(u.id)}>
-                              Disable
-                            </Button>
-                          )}
-                          <button onClick={()=>setShowPasskeyFor(null)} aria-label="Close"
-                            className="w-6 h-6 rounded-md flex items-center justify-center text-muted hover:text-paper hover:bg-stone/50">
-                            <Icon name="x" size={12} />
-                          </button>
-                        </div>
+                      {u.id === me?.id ? (
+                        showPasskeyFor===u.id ? (
+                          <div className="flex items-center gap-1">
+                            <Button size="sm" variant="primary" onClick={()=>handleRegisterPasskey(u.id)} disabled={passkeyBusy}>Enroll</Button>
+                            {u.passkey_enabled && (
+                              <Button size="sm" variant="ghost" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                                onClick={()=>setPasskeyDisableTarget(u.id)}>
+                                Disable
+                              </Button>
+                            )}
+                            <button onClick={()=>setShowPasskeyFor(null)} aria-label="Close"
+                              className="w-6 h-6 rounded-md flex items-center justify-center text-muted hover:text-paper hover:bg-stone/50">
+                              <Icon name="x" size={12} />
+                            </button>
+                          </div>
+                        ) : (
+                          <Button size="sm" variant="ghost" onClick={()=>setShowPasskeyFor(u.id)}>
+                            {u.passkey_enabled ? 'Manage' : 'Enable'}
+                          </Button>
+                        )
                       ) : (
-                        <Button size="sm" variant="ghost" onClick={()=>setShowPasskeyFor(u.id)}>
-                          {u.passkey_enabled ? 'Manage' : 'Enable'}
-                        </Button>
+                        <span className="text-[11px] text-muted leading-snug">
+                          Users enroll their own passkey from their Profile page.
+                        </span>
                       )}
                     </div>
                   </Td>
@@ -413,18 +421,18 @@ export default function Users(){
       <Modal open={resetTarget !== null}
         onClose={()=>{ setResetTarget(null); setResetPwValue('') }}
         title={`Reset password — ${resetTarget?.username ?? ''}`} width="max-w-sm">
-        <Field label="New password" hint="At least 8 characters recommended. Share securely — the user should change it after logging in.">
+        <Field label="New password" hint="At least 8 characters required. Share securely — the user should change it after logging in.">
           <Input type="password" value={resetPwValue} onChange={e=>setResetPwValue(e.target.value)} autoFocus autoComplete="new-password" placeholder="••••••••"
-            onKeyDown={e=>{ if(e.key==='Enter' && resetPwValue) resetPwSubmit() }} />
+            onKeyDown={e=>{ if(e.key==='Enter' && resetPwValue.length >= 8) resetPwSubmit() }} />
         </Field>
         {resetPwValue.length > 0 && (
           <p className={`text-xs mt-2 ${resetPwValue.length >= 8 ? 'text-teal' : 'text-amber'}`}>
-            {resetPwValue.length >= 8 ? 'Strong enough — 8+ characters.' : 'Weak — mix letters, numbers and symbols for more strength.'}
+            {resetPwValue.length >= 8 ? 'Strong enough — 8+ characters.' : 'Too short — 8 characters minimum.'}
           </p>
         )}
         <div className="flex justify-end gap-2 mt-5">
           <Button variant="ghost" onClick={()=>{ setResetTarget(null); setResetPwValue('') }}>Cancel</Button>
-          <Button variant="primary" disabled={!resetPwValue} onClick={resetPwSubmit}>Reset password</Button>
+          <Button variant="primary" disabled={!resetPwValue || resetPwValue.length < 8} onClick={resetPwSubmit}>Reset password</Button>
         </div>
       </Modal>
 

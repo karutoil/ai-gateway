@@ -1,0 +1,213 @@
+# Release pipeline — runs on every push to main.
+#
+# Versioning is derived from commits (scripts/version.sh, conventional commits):
+#   feat:            -> minor bump
+#   fix:/perf:/other -> patch bump
+#   BREAKING CHANGE / !: -> major bump
+# The workflow tags v<next>, builds self-contained binaries (web UI embedded,
+# SQLite statically linked — the binary runs without Go or any dependencies),
+# and publishes a GitHub Release with commit-based notes.
+#
+# Binaries produced:
+#   linux amd64 / arm64  — fully static (musl via zig cc)
+#   macOS amd64 / arm64  — native build (needs macOS system libs only)
+name: Release
+
+'on':
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '20'
+  ZIG_VERSION: '0.13.0'
+
+jobs:
+  # 1. Derive the next version from commits since the last tag.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      new: ${{ steps.ver.outputs.new }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: ver
+        run: |
+          VERSION="$(bash scripts/version.sh next)"
+          CURRENT="$(bash scripts/version.sh current)"
+          NEW="true"
+          if [ "$VERSION" = "$CURRENT" ]; then
+            NEW="false" # no commits since the last tag — nothing to release
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "Release plan: current=$CURRENT next=$VERSION new=$NEW"
+          bash scripts/version.sh explain || true
+
+  # 2. Build the dashboard (vite -> cmd/gateway/web, embedded via go:embed).
+  web:
+    needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webdist
+          path: cmd/gateway/web
+          retention-days: 1
+
+  # 3. Build the self-contained gateway binary per platform.
+  build:
+    needs: [version, web]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cross: zig-x86_64-linux-musl
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cross: zig-aarch64-linux-musl
+          - os: macos-13
+            goos: darwin
+            goarch: amd64
+            cross: native
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cross: native
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      COMMIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install zig (CGO cross-compiler for static musl builds)
+        if: startsWith(matrix.cross, 'zig-')
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/.zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Download embedded web UI
+        uses: actions/download-artifact@v4
+        with:
+          name: webdist
+          path: cmd/gateway/web
+
+      - name: Build gateway (${{ matrix.goos }}/${{ matrix.goarch }})
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X ai-gateway/internal/handler.GatewayVersion=${VERSION} -X ai-gateway/internal/handler.GatewayCommit=${COMMIT_SHA:0:12}"
+          mkdir -p dist
+          if [ "${{ matrix.cross }}" = "zig-x86_64-linux-musl" ]; then
+            export CGO_ENABLED=1 GOOS=linux GOARCH=amd64
+            export CC="zig cc -target x86_64-linux-musl"
+            go build -trimpath -ldflags "${LDFLAGS} -linkmode external -extldflags -static" -o dist/gateway ./cmd/gateway
+          elif [ "${{ matrix.cross }}" = "zig-aarch64-linux-musl" ]; then
+            export CGO_ENABLED=1 GOOS=linux GOARCH=arm64
+            export CC="zig cc -target aarch64-linux-musl"
+            go build -trimpath -ldflags "${LDFLAGS} -linkmode external -extldflags -static" -o dist/gateway ./cmd/gateway
+          else
+            export CGO_ENABLED=1
+            go build -trimpath -ldflags "${LDFLAGS}" -o dist/gateway ./cmd/gateway
+          fi
+
+      - name: Smoke test binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          file dist/gateway | tee /dev/stderr | grep -q 'statically linked'
+          ./dist/gateway version | grep -q "${VERSION}"
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          PKG="ai-gateway_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          mkdir -p "dist/${PKG}"
+          cp dist/gateway "dist/${PKG}/gateway"
+          cp .env.example "dist/${PKG}/.env.example"
+          tar -czf "dist/${PKG}.tar.gz" -C dist "${PKG}"
+          rm -rf "dist/${PKG}" dist/gateway
+          if command -v sha256sum >/dev/null; then
+            sha256sum "dist/${PKG}.tar.gz" > "dist/${PKG}.tar.gz.sha256"
+          else
+            shasum -a 256 "dist/${PKG}.tar.gz" > "dist/${PKG}.tar.gz.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 1
+          if-no-files-found: error
+
+  # 4. Tag and publish the GitHub Release with all artifacts.
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate combined checksums
+        working-directory: dist
+        run: |
+          rm -f *.sha256
+          if command -v sha256sum >/dev/null; then
+            sha256sum *.tar.gz > checksums.txt
+          else
+            shasum -a 256 *.tar.gz > checksums.txt
+          fi
+          cat checksums.txt
+
+      - name: Create release
+        run: |
+          gh release create "$VERSION" \
+            --target "${GITHUB_SHA}" \
+            --title "AI Gateway ${VERSION}" \
+            --generate-notes \
+            dist/*

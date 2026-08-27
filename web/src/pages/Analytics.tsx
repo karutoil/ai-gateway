@@ -1,10 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import {
-  Card, PageHeader, Button, Badge, Icon, SegmentedControl, ErrorNote,
+  Card, PageHeader, Button, Badge, Icon, SegmentedControl,
   TableShell, Th, Td, EmptyState, Skeleton,
   type IconName,
 } from '../components/ui'
-
 type Daily = { day: string; tokens: number; cost: number; requests: number }
 type TopModel = { model: string; tokens: number; cost: number; requests: number }
 type TopKey = { key_prefix: string; tokens: number; cost: number; requests: number }
@@ -18,6 +17,25 @@ async function fetchKeyMap():Promise<Record<string,string>>{
   try{
     const res=await fetch('/api/keys',{credentials:'same-origin'}); if(!res.ok) return {}; const keys=await res.json(); const m:Record<string,string>={}; for(const k of keys) m[k.prefix]=k.name; return m
   }catch{ return {}}
+}
+
+const RANGE_DAYS: Record<'24h'|'7d'|'30d', number> = { '24h': 1, '7d': 7, '30d': 30 }
+
+/**
+ * Zero-fill missing days so the bar charts always span the selected range —
+ * days without traffic render as 0-height bars instead of silently shifting
+ * the axis. Bucket keys are UTC day strings, matching the backend grouping.
+ */
+function zeroFillDaily(daily: Daily[], range: '24h'|'7d'|'30d'): Daily[] {
+  const byDay = new Map(daily.map(d => [d.day, d]))
+  const days = RANGE_DAYS[range]
+  const out: Daily[] = []
+  const now = new Date()
+  for (let i = days - 1; i >= 0; i--) {
+    const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i)).toISOString().slice(0, 10)
+    out.push(byDay.get(day) ?? { day, tokens: 0, cost: 0, requests: 0 })
+  }
+  return out
 }
 
 /** Small KPI tile: Card + icon chip + value. */
@@ -79,8 +97,12 @@ export default function Analytics(){
   const [keyMap,setKeyMap]=useState<Record<string,string>>({})
   const [err,setErr]=useState('')
   const [loading,setLoading]=useState(true)
+  const [reloadKey,setReloadKey]=useState(0)
   useEffect(()=>{ fetchKeyMap().then(setKeyMap).catch(()=>{})},[])
-  useEffect(()=>{ setLoading(true); fetchStats(range).then(s=>{setStats(s);setErr('')}).catch(e=>setErr(String(e.message||e))).finally(()=>setLoading(false))},[range])
+  useEffect(()=>{
+    setLoading(true)
+    fetchStats(range).then(s=>{setStats(s);setErr('')}).catch(e=>setErr(String(e.message||e))).finally(()=>setLoading(false))
+  },[range, reloadKey])
 
   const ranges = [
     { value:'24h', label:'24h' },
@@ -89,6 +111,8 @@ export default function Analytics(){
   ] as { value:'24h'|'7d'|'30d'; label:string }[]
 
   const failPct = stats?.range_requests ? ((((stats as any).range_failed)||0)/stats.range_requests*100).toFixed(1) : '0'
+  // Zero-filled series: every day of the selected range gets a bar.
+  const filledDaily = zeroFillDaily(stats?.daily ?? [], range)
 
   return (
     <div className="space-y-6">
@@ -98,7 +122,16 @@ export default function Analytics(){
         actions={<SegmentedControl options={ranges} value={range} onChange={setRange}/>}
       />
 
-      {err && <ErrorNote message={err}/>}
+      {err && (
+        <Card>
+          <EmptyState
+            icon="alert"
+            title="Could not load analytics"
+            hint={err}
+            action={<Button variant="secondary" onClick={()=>setReloadKey(k=>k+1)}><Icon name="refresh" size={15}/>Retry</Button>}
+          />
+        </Card>
+      )}
 
       {loading ? (
         <div className="space-y-4">
@@ -119,7 +152,7 @@ export default function Analytics(){
             <Stat icon="zap" title="Tokens" value={Number(stats.range_tokens||0).toLocaleString()} sub={`${stats.range_requests} req`} tone="good"/>
             <Stat icon="chart" title="Cost" value={`$${Number(stats.range_cost||0).toFixed(4)}`} sub="estimated" tone="neutral"/>
             <Stat icon="check" title="Success" value={(stats as any).range_successful ?? 0} sub={`${(stats as any).range_failed ?? 0} failed`} tone="good"/>
-            <Stat icon="alert" title="Fail rate" value={`${failPct}%`} sub={`${(stats as any).successful ?? 0} total ok`} tone="warn"/>
+            <Stat icon="alert" title="Fail rate" value={`${failPct}%`} sub={`${(stats as any).range_failed ?? 0} failed in range`} tone="warn"/>
             <Stat icon="pulse" title="P50 / TTFT" value={`${stats.latency?.p50??0}ms`} sub={`TTFT ${(stats as any).range_ttft_avg ? Math.round((stats as any).range_ttft_avg) : 0}ms`} tone="neutral"/>
             <Stat icon="route" title="P95 / TPS" value={`${stats.latency?.p95??0}ms`} sub={`TPS ${(stats as any).range_tps_avg ? (stats as any).range_tps_avg.toFixed(1) : '—'}`} tone="neutral"/>
           </div>
@@ -149,9 +182,9 @@ export default function Analytics(){
                 <span className="text-xs text-muted">{stats.range}</span>
               </div>
               <div className="mt-4">
-                {stats.daily.length===0
+                {filledDaily.length===0
                   ? <EmptyState icon="chart" title="No activity in this range"/>
-                  : <DailyBars daily={stats.daily} extract={d=>d.requests} tip={d=>`${d.day} — ${d.requests} requests · ${d.tokens.toLocaleString()} tokens`}/>}
+                  : <DailyBars daily={filledDaily} extract={d=>d.requests} tip={d=>`${d.day} — ${d.requests} requests · ${d.tokens.toLocaleString()} tokens`}/>}
               </div>
             </Card>
             <Card>
@@ -160,9 +193,9 @@ export default function Analytics(){
                 <span className="text-xs text-muted">{stats.range}</span>
               </div>
               <div className="mt-4">
-                {stats.daily.length===0
+                {filledDaily.length===0
                   ? <EmptyState icon="chart" title="No activity in this range"/>
-                  : <DailyBars daily={stats.daily} dim extract={d=>d.cost} tip={d=>`${d.day} — $${d.cost.toFixed(4)} · ${d.requests} requests`}/>}
+                  : <DailyBars daily={filledDaily} dim extract={d=>d.cost} tip={d=>`${d.day} — $${d.cost.toFixed(4)} · ${d.requests} requests`}/>}
               </div>
             </Card>
           </div>
@@ -214,9 +247,9 @@ export default function Analytics(){
           </div>
 
           {/* Last days summary retained from the previous numeric strip */}
-          {stats.daily.slice(-6).reverse().length > 0 && (
+          {filledDaily.slice(-6).reverse().length > 0 && (
             <div className="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-6 gap-2">
-              {stats.daily.slice(-6).reverse().map(d=>(
+              {filledDaily.slice(-6).reverse().map(d=>(
                 <Card key={d.day} className="p-3">
                   <div className="font-mono text-xs text-paper">{d.day}</div>
                   <div className="font-mono text-[11px] tabular-nums text-teal mt-1">{d.tokens.toLocaleString()} tok</div>

@@ -155,6 +155,7 @@ export const api = {
     if (params.since) p.set('since', params.since)
     const res = await fetch(apiUrl(`/api/logs?${p.toString()}`), { credentials: 'same-origin' })
     if (!res.ok) {
+      if (res.status === 401) { setBearerToken(null); window.dispatchEvent(new CustomEvent('gw:unauthorized')) }
       const text = await res.text()
       throw new Error(extractApiError(text, `log query failed (${res.status})`))
     }
@@ -231,6 +232,7 @@ export const api = {
       if (params.actor) p.set('actor', params.actor)
       const res = await fetch(apiUrl(`/api/audit?${p.toString()}`), { credentials: 'same-origin' })
       if (!res.ok) {
+        if (res.status === 401) { setBearerToken(null); window.dispatchEvent(new CustomEvent('gw:unauthorized')) }
         const text = await res.text()
         throw new Error(extractApiError(text, `audit query failed (${res.status})`))
       }

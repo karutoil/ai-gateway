@@ -20,6 +20,7 @@ export default function Playground(){
   const [out, setOut] = useState('')
   const [running, setRunning] = useState(false)
   const [models, setModels] = useState<any[]>([])
+  const [catalogModels, setCatalogModels] = useState<string[]>([])
   const [catalogInfo, setCatalogInfo] = useState<any>(null)
   const [rawResponse, setRawResponse] = useState('')
   const [cacheStatus, setCacheStatus] = useState('')
@@ -45,6 +46,15 @@ export default function Playground(){
         setModel(list[0].model_id)
       }
     }).catch(()=>{})
+    // Merge catalog ids (and aliases resolve through the gateway anyway) so
+    // the picker works even before provider discovery has run.
+    api.catalog.list(undefined, undefined, undefined, 200).then((res:any)=>{
+      const arr = res?.data ?? res
+      if(Array.isArray(arr)){
+        const ids = arr.map((m:any)=> m?.model_id || m?.id).filter(Boolean).map(String)
+        setCatalogModels(ids)
+      }
+    }).catch(()=>{})
     api.keys.list().then(keys=>{
       setAvailableKeys(keys||[])
     }).catch(()=>{})
@@ -64,14 +74,14 @@ export default function Playground(){
   const reasoningLevels = parseLevels(catalogInfo?.reasoning_levels)
   const supportsReasoning = !!(catalogInfo?.reasoning) && reasoningLevels.length > 0
 
-  // Combobox options: distinct discovered model ids (presentation-only mapping).
-  const comboboxOptions = Array.from(new Set(models.map(m=> m.model_id).filter(Boolean))).sort((a,b)=> a.localeCompare(b))
+  // Combobox options: distinct discovered model ids merged with catalog ids
+  // (presentation-only mapping).
+  const comboboxOptions = Array.from(new Set([
+    ...models.map(m=> m.model_id).filter(Boolean),
+    ...catalogModels,
+  ] as string[])).sort((a,b)=> a.localeCompare(b))
 
   const run = async ()=>{
-    if(!authToken && !usingSession){
-      setOut('Sign in or paste a gateway key (sk-gw-...) to send.')
-      return
-    }
     setRunning(true); setOut(''); setRawResponse('')
     try {
       // Only attach a Bearer header for an explicit sk-gw- key; otherwise the
@@ -93,7 +103,8 @@ export default function Playground(){
         if(effort) body.thinking = { type: 'enabled', effort }
       } else if(mode==='responses'){
         url = buildApiUrl('/v1/responses')
-        body = { model, input: prompt, stream: false }
+        // Honor the Stream toggle — pass the requested mode explicitly.
+        body = { model, input: prompt, stream }
         if(system.trim()) body.instructions = system.trim()
         if(temp !== undefined && !Number.isNaN(temp)) body.temperature = temp
         if(maxTok && !Number.isNaN(maxTok)) body.max_output_tokens = maxTok
@@ -122,37 +133,57 @@ export default function Playground(){
         const reader = res.body.getReader()
         const decoder = new TextDecoder()
         let text=''
-        let buffer = ''
+        let all=''      // every byte received (fallback rendering)
+        let pending=''  // incomplete trailing line carried across chunks
+        const handleLine = (line: string)=>{
+          const trimmed = line.trim()
+          if(!trimmed) return
+          if(trimmed.startsWith('data: ')){
+            const data = trimmed.slice(6).trim()
+            if(data==='[DONE]') return
+            try{
+              const j = JSON.parse(data)
+              const delta = j.choices?.[0]?.delta?.content
+              if(delta) { text += delta; setOut(text) }
+              const anthDelta = j.delta?.text
+              if(anthDelta) { text += anthDelta; setOut(text) }
+              // Responses API streams text via response.output_text.delta events.
+              if(j.type === 'response.output_text.delta' && typeof j.delta === 'string'){
+                text += j.delta; setOut(text)
+              }
+            } catch{}
+          } else if(trimmed.startsWith('{')){
+            try{
+              const j = JSON.parse(trimmed)
+              const t = j.delta?.text || (j.type === 'response.output_text.delta' && typeof j.delta === 'string' ? j.delta : '') || j.output_text || j.text || j.content?.[0]?.text
+              if(t) { text += t; setOut(text) }
+            } catch{}
+          }
+        }
         while(true){
           const {done,value} = await reader.read()
           if(done) break
           const chunk = decoder.decode(value, {stream:true})
-          buffer += chunk
-          chunk.split('\n').forEach(line=>{
-            const trimmed = line.trim()
-            if(trimmed.startsWith('data: ')){
-              const data = trimmed.slice(6).trim()
-              if(data==='[DONE]' || data==='[DONE] ') return
-              try{
-                const j = JSON.parse(data)
-                const delta = j.choices?.[0]?.delta?.content
-                if(delta) { text += delta; setOut(text) }
-                const anthDelta = j.delta?.text
-                if(anthDelta) { text += anthDelta; setOut(text) }
-              } catch{}
-            } else if(trimmed && trimmed.startsWith('{')){
-              try{
-                const j = JSON.parse(trimmed)
-                const t = j.delta?.text || j.text || j.content?.[0]?.text
-                if(t) { text += t; setOut(text) }
-              } catch{}
-            }
-          })
+          all += chunk
+          // Split the accumulated buffer, not the raw chunk: JSON lines that
+          // straddle network reads stay intact because an incomplete trailing
+          // line is carried over to the next chunk.
+          pending += chunk
+          const nl = pending.lastIndexOf('\n')
+          if(nl === -1) continue
+          const complete = pending.slice(0, nl + 1)
+          pending = pending.slice(nl + 1)
+          complete.split('\n').forEach(handleLine)
         }
+        // Flush any final line that arrived without a trailing newline.
+        if(pending.trim()) handleLine(pending)
         if(!text){
+          const buffer = all
           try{
             const j = JSON.parse(buffer)
-            if(j.content && Array.isArray(j.content)){
+            if(j.output_text){
+              setOut(j.output_text)
+            } else if(j.content && Array.isArray(j.content)){
               const txt = j.content.map((c:any)=> c.text || '').join('')
               if(txt) setOut(txt)
               else setOut(JSON.stringify(j, null, 2))
@@ -176,8 +207,8 @@ export default function Playground(){
             else setOut(buffer.slice(0,3000))
           }
         }
-        if(!text && buffer.includes('thinking')){
-          setOut(buffer.slice(0,4000))
+        if(!text && all.includes('thinking')){
+          setOut(all.slice(0,4000))
         }
       } else {
         const j = await res.json()
@@ -261,7 +292,7 @@ export default function Playground(){
             </Button>
             {!model && <div className="mt-1.5 text-xs text-amber">Select a model.</div>}
 
-            {/* Telemetry strip */}
+            {/* Telemetry strip — status dot + real response headers only. */}
             <div className="mt-3 rounded-lg border border-stone bg-app/50 px-2.5 py-2 flex items-center gap-2 font-mono text-xs">
               <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-teal animate-pulse-soft shadow-glow' : 'bg-stone'}`} />
               <span className="text-muted shrink-0">{running ? 'streaming' : 'idle'}</span>
@@ -269,11 +300,6 @@ export default function Playground(){
                 ? <Badge tone="good">cached</Badge>
                 : <Badge tone="neutral">live</Badge>)}
               {fallbackUsed && <Badge tone="warn">fallback {fallbackUsed}</Badge>}
-              <div className="flex-1 flex gap-0.5 h-4 items-end justify-end">
-                {Array.from({length:16}).map((_,i)=>(
-                  <div key={i} className="flex-1 max-w-[4px] bg-teal/60 rounded-sm" style={{height: `${running? 4 + Math.random()*12 : 3}px`}} />
-                ))}
-              </div>
             </div>
             {rawResponse && (
               <details className="mt-2 text-xs font-mono text-muted">

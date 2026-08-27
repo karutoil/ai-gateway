@@ -28,20 +28,34 @@
 ✅ **Routing rules** — explicit curated provider groups per model with round-robin across requests and down-member skipping. **No silent failover by design**: qualified `provider/model` IDs and `X-Provider:` headers pin requests; retries hit the same provider only.  
 ✅ **Cache** — exact-match response cache (in-memory or Redis, `X-Cache: HIT|MISS`).  
 ✅ **Circuit breaker** — configurable fails/cooldown/half-open; tripped circuits short-circuit with `circuit_open`.  
-✅ **Retries** — bounded exponential backoff on 5xx/429 for non-streaming requests.
+✅ **Retries** — bounded exponential backoff on 5xx/429; streaming requests retry until the first byte is committed.
 
 **Ops**
 
-✅ **Observability** — Prometheus `/metrics`, OpenTelemetry support, structured request log with optional body capture and retention purge.  
+✅ **Observability** — Prometheus metrics (`/metrics`) plus an OpenTelemetry metrics API scaffold (OTLP export pending); structured request log with optional body capture and retention purge.  
 ✅ **Audit + webhooks** — audit trail plus optional webhook sink for billing export and over-quota events.  
-✅ **Hardening** — refuses to boot with weak config when `ENV=production`; brute-force-rate-limited login/passkey/recovery endpoints; trusted-proxy allowlist.  
+✅ **Hardening** — refuses to boot with weak config when `ENV=production`; login/passkey/recovery endpoints are rate-limited per account (where identifiable) or IP; trusted-proxy allowlist.  
 ✅ **Health** — `GET /health` (liveness + db), `GET /ready`, `GET /openapi.yaml`.
 
 ---
 
 ## Quick Start
 
-Requires Go 1.25+. The repository ships prebuilt UI assets, so you don't need Node unless you want to modify the web UI.
+### Install a release (no Go needed)
+
+Every push to `main` is versioned from commit history (conventional commits: `feat:` → minor, `fix:` → patch, `BREAKING CHANGE`/`!:` → major), built into a self-contained binary — web UI embedded, SQLite statically linked — and published as a [GitHub release](https://github.com/karutoil/ai-gateway/releases).
+
+```bash
+# interactive TUI: install (.env wizard) / update / uninstall / status
+curl -fsSL https://raw.githubusercontent.com/karutoil/ai-gateway/main/install.sh | bash
+# or: git clone && ./install.sh
+```
+
+The installer prompts for configuration with secure defaults (bare **Enter** accepts), can register a hardened systemd service, and `update` / `uninstall` never touch your `.env` and data unless you explicitly ask for a wipe. Scripted usage: `./install.sh install|update|uninstall|status` with optional `GATEWAY_VERSION`, `GATEWAY_INSTALL_DIR`, `GATEWAY_YES` overrides.
+
+### Build from source
+
+Requires Go 1.25+. `go build` needs **CGO with a C compiler (gcc/clang)** — the SQLite driver is `mattn/go-sqlite3`. On a bare container install `gcc` (Debian/Alpine: `apt-get install -y gcc` / `apk add gcc musl-dev`) or use the Dockerfile, which builds with CGO enabled. The repository ships prebuilt UI assets, so you don't need Node unless you want to modify the web UI.
 
 ```bash
 git clone https://github.com/karutoil/ai-gateway && cd ai-gateway
@@ -105,10 +119,12 @@ Full environment reference:
 | `LOG_BODIES` | `false` | Store request/response bodies in request logs (privacy-sensitive) |
 | `BODY_LOG_MAX_BYTES` | `8192` | Cap on stored body bytes per request log row |
 | `LOG_RETENTION_DAYS` | `0` (off) | Nightly purge of `request_logs` older than N days when >0 |
-| `STREAM_USAGE_INJECT` | `false` | Inject `stream_options.include_usage` into OpenAI-compatible upstreams for billing accuracy |
+| `STREAM_USAGE_INJECT` | `true` | Inject `stream_options.include_usage` into OpenAI-compatible upstreams for billing accuracy; set `STREAM_USAGE_INJECT=0` to opt out |
 | `METRICS_PROTECT` | `false` | Require admin auth on `/metrics` (enable behind hostile networks) |
 | `WEBHOOK_URL` | "" | Audit/billing-export/over-quota webhook sink |
+| `WEBHOOK_SECRET` | "" | HMAC-signs webhook deliveries as `X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the raw body>` so consumers can verify authenticity |
 | `OIDC_ISSUER` / `OIDC_CLIENT_ID` | "" | Optional SSO login via OIDC |
+| `OIDC_ADMIN_SUBJECTS` | "" | Comma-separated OIDC subjects auto-granted the admin role on first login (bootstrap path); existing users keep their stored role |
 
 ---
 
@@ -193,9 +209,22 @@ Set these **before** pointing real traffic at the gateway. With `ENV=production`
 - [ ] `TRUSTED_PROXIES` — defaults to trusting **loopback only**, which is correct for a `cloudflared` tunnel on the same host. Behind an external load balancer set your proxy IPs/CIDRs (comma-separated). `TRUSTED_PROXIES="*"` trusts every peer's forwarded headers — avoid unless network-isolated
 - [ ] `LOG_RETENTION_DAYS` (e.g. `30`) — enables nightly purging of `request_logs`; logs grow fast with `LOG_BODIES=true`
 - [ ] Redis (`REDIS_URL`) when running multiple replicas so cache/rate-limit state is shared
-- [ ] Brute-force protection: `/api/auth/login`, `/api/auth/passkey/login/begin|finish` and `/api/auth/recovery/verify` are already rate-limited per account/IP — don't front them with an LB that strips client IP
+- [ ] Brute-force protection: `/api/auth/login`, `/api/auth/passkey/login/begin|finish` and `/api/auth/recovery/verify` are already rate-limited per account (where identifiable) or IP — don't front them with an LB that strips client IP
 
 **Sessions after deploying:** all existing admin JWT sessions are invalidated on deploy by the token_version revocation upgrade — every user must log in again once. From then on, password changes, role changes, disabling and deleting a user revoke their outstanding sessions immediately.
+
+---
+
+## Operations
+
+- **MASTER_KEY rotation:** the key encrypts every stored provider credential (AES-256-GCM). Rotating `MASTER_KEY` **without re-encrypting** the database makes all saved provider credentials undecryptable — proxy calls fail until each provider's key is re-entered. To rotate safely: re-enter provider keys (or re-encrypt the DB) under the new key before/with the change; never just swap the env var on a live data dir.
+- **SQLite backups:** don't copy a live DB file alone. Either stop the gateway and copy `gateway.db` **including `-wal` and `-shm`**, or take an online snapshot: `sqlite3 data/gateway.db ".backup 'backups/gateway-$(date +%F).db'"`.
+- **Upgrades / migrations:** at boot the gateway runs the versioned migrations in `internal/db/migrations/` (tracked in `schema_migrations`) automatically. A failed migration is flagged **dirty** and the process aborts on the next start — inspect the DB state, fix/roll back manually, then clear the `dirty` flag before restarting. There is no automatic down-migration.
+- **Multi-replica caveats:** with `REDIS_URL` set, the response cache and rate-limit windows are shared across replicas. Everything else is per-instance/SQLite: the circuit-breaker state, in-memory limiter fallback, and the budgets/quota ledger live in the single SQLite DB — treat SQLite as the single writer (one gateway writing, others scaled read paths only) or move to Postgres (beta) before scaling out.
+- **Metrics:** Prometheus exposition at `/metrics` (admin-gated when `METRICS_PROTECT=true`):
+  - `gateway_requests_total{provider,model,endpoint,status}` — request counter with `2xx/4xx/5xx` status classes
+  - `gateway_latency_ms{provider,endpoint}` — latency histogram
+  - `gateway_cache_hits_total{result}` — cache hits vs misses
 
 ---
 
@@ -208,12 +237,12 @@ Client (OpenAI SDK / Anthropic SDK / curl)
 [ Chi Router :8080 ]
   ├─ /health, /ready, /metrics
   ├─ /api/*  (Admin JWT)
-  │    ├─ POST /api/auth/login (+ passkeys, recovery, OIDC)
-  │    ├─ GET/POST/DELETE /api/providers (incl. discovery)
-  │    ├─ GET/POST/DELETE /api/keys, /api/users, /api/teams
+  │    ├─ POST /api/auth/login (+ passkeys, recovery, OIDC, logout)
+  │    ├─ GET/POST/PUT/DELETE /api/providers (incl. discovery)
+  │    ├─ GET/POST/PUT/DELETE /api/keys, /api/admin/users, /api/orgs
   │    ├─ GET/PUT/DELETE /api/lb/rules (routing rules)
-  │    ├─ GET /api/models/catalog|aliases|sync (catalog)
-  │    ├─ GET /api/stats, /api/logs, /api/audit
+  │    ├─ GET /api/models/catalog|aliases|settings, /sync (catalog)
+  │    ├─ GET /api/stats, /api/logs, GET /api/audit
   │    └─ GET /*  (embedded UI)
   └─ /v1/*  (GatewayAuth: sk-gw-* + rate limits + budgets)
        ├─ POST /v1/chat/completions  ──┐
@@ -244,8 +273,10 @@ Unit tests run entirely against mock upstreams (httptest) covering streaming, pr
 
 ```bash
 ADMIN_PASSWORD=admin123 PORT=8989 ./bin/gateway &
-CKFF_API_KEY=sk-your-upstream-key GATEWAY_URL=http://localhost:8989 make e2e-live
+GATEWAY_URL=http://localhost:8989 make e2e-live
 ```
+
+The target reads `GATEWAY_URL`, `GATEWAY_KEY`, `MODEL` and `ADMIN_PASSWORD` (`internal/e2e`); without `GATEWAY_KEY` it mints one via admin login.
 
 There is also a tool-calling harness (`make harness-muse`, `cmd/harness-muse`) that exercises multi-turn + tool-calling behavior through the gateway with real upstreams — see `docs/muse-harness.md`.
 

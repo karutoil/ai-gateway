@@ -44,7 +44,10 @@ function sourceTone(source?: string): 'neutral'|'good'|'warn' {
   return 'neutral'
 }
 
-export default function Models(){
+export default function Models({ role = 'admin' }: { role?: string }){
+  // Provider-model mutations (add/edit/enrich/delete/discover/sync/aliases)
+  // are admin-only server-side.
+  const isAdmin = role === 'admin'
   const [providers, setProviders] = useState<any[]>([])
   const [list, setList] = useState<any[]>([])
   const [q, setQ] = useState('')
@@ -65,6 +68,7 @@ export default function Models(){
 
   // Presentation-only: initial skeleton grid + destructive confirm modal.
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [pendingDelete, setPendingDelete] = useState<PendingDelete|null>(null)
   const toast = useToast()
 
@@ -72,7 +76,8 @@ export default function Models(){
     try{
       const data = await api.providerModels.list(provider || undefined, q || undefined)
       setList(data.data || [])
-    }catch(e){ console.error(e)}
+      setLoadError('')
+    }catch(e:any){ setLoadError(e?.message || String(e)) }
     api.catalog.status().then(setStatus).catch(()=>{})
     api.catalog.aliases().then(setAliases).catch(()=>{})
     api.providers.list().then(setProviders).catch(()=>{})
@@ -142,30 +147,45 @@ export default function Models(){
         title="Models"
         description="Catalog and per-provider models. Search, enrich specs, add manual entries, and manage aliases."
         actions={
-          <>
-            <Button variant="secondary" onClick={syncCatalog} disabled={syncing}>
-              <Icon name="refresh" size={14} className={syncing?'animate-spin':''}/> {syncing?'Syncing':'Sync'}
-            </Button>
-            <Button variant="primary" onClick={discover} disabled={discovering || providers.length===0}>
-              <Icon name="zap" size={14}/> {discovering?'Discovering':'Discover'}
-            </Button>
-          </>
+          isAdmin ? (
+            <>
+              <Button variant="secondary" onClick={syncCatalog} disabled={syncing}>
+                <Icon name="refresh" size={14} className={syncing?'animate-spin':''}/> {syncing?'Syncing':'Sync'}
+              </Button>
+              <Button variant="primary" onClick={discover} disabled={discovering || providers.length===0}>
+                <Icon name="zap" size={14}/> {discovering?'Discovering':'Discover'}
+              </Button>
+            </>
+          ) : undefined
         }
       />
 
-      {status && <div className="font-mono text-xs text-muted">{status.count} catalog · {list.length} provider models{isSelectMode && <> · <span className="text-amber">{selected.size} selected</span></>}</div>}
+      {loadError && (
+        <Card>
+          <EmptyState
+            icon="alert"
+            title="Could not load models"
+            hint={loadError}
+            action={<Button variant="secondary" onClick={load}><Icon name="refresh" size={15}/>Retry</Button>}
+          />
+        </Card>
+      )}
+
+      {status && <div className="font-mono text-xs text-muted">{status.count} catalog · {list.length} provider models{isAdmin && isSelectMode && <> · <span className="text-amber">{selected.size} selected</span></>}</div>}
       {providers.length===0 && (
         <div className="border border-amber/30 bg-amber/10 rounded-xl p-3 text-sm flex items-center gap-2">
-          <Icon name="alert" size={14} className="text-amber shrink-0"/> Add a provider first, then Discover.
+          <Icon name="alert" size={14} className="text-amber shrink-0"/> Add a provider first{isAdmin ? ', then Discover.' : ' (admin-only).'}
         </div>
       )}
 
       {/* Search / filter row */}
       <Card className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2">
-        <label className="flex items-center gap-1.5 text-xs text-muted shrink-0 px-1 cursor-pointer">
-          <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll} aria-label="Select all models" className="accent-teal rounded"/>
-          All
-        </label>
+        {isAdmin && (
+          <label className="flex items-center gap-1.5 text-xs text-muted shrink-0 px-1 cursor-pointer">
+            <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll} aria-label="Select all models" className="accent-teal rounded"/>
+            All
+          </label>
+        )}
         <Select value={provider} onChange={e=>setProvider(e.target.value)} className="sm:w-48">
           <option value="">All providers</option>
           {providers.map((p:any)=> <option key={p.id} value={p.id}>{p.name}</option>)}
@@ -174,13 +194,15 @@ export default function Models(){
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={14}/></span>
           <Input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search model" className="pl-9"/>
         </div>
-        <Button variant="ghost" size="md" onClick={()=>setShowAdd(!showAdd)}>
-          <Icon name="plus" size={15}/> Add
-        </Button>
+        {isAdmin && (
+          <Button variant="ghost" size="md" onClick={()=>setShowAdd(!showAdd)}>
+            <Icon name="plus" size={15}/> Add
+          </Button>
+        )}
         <span className="font-mono text-xs text-muted self-center px-1">{list.length}</span>
       </Card>
 
-      {isSelectMode && (
+      {isAdmin && isSelectMode && (
         <div className="border border-amber/30 bg-amber/10 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
           <Badge tone="warn">{selected.size} model(s) selected</Badge>
           <div className="flex gap-2">
@@ -191,7 +213,7 @@ export default function Models(){
         </div>
       )}
 
-      {showAdd && (
+      {isAdmin && showAdd && (
         <Card className="flex flex-col sm:flex-row flex-wrap gap-2">
           <Select value={addProvider} onChange={e=>setAddProvider(e.target.value)} className="sm:w-48">
             <option value="">Provider</option>
@@ -224,7 +246,9 @@ export default function Models(){
             <Card key={m.id} pad={false} className={`p-4 flex flex-col ${isSelected && !isEdit ? 'border-amber/40 bg-amber/5' : ''}`}>
               {/* Head */}
               <div className="flex items-start gap-2">
-                <input type="checkbox" checked={isSelected} onChange={()=>toggleSelect(m.id)} aria-label={`Select ${fullId}`} className="mt-1 accent-teal rounded shrink-0"/>
+                {isAdmin && (
+                  <input type="checkbox" checked={isSelected} onChange={()=>toggleSelect(m.id)} aria-label={`Select ${fullId}`} className="mt-1 accent-teal rounded shrink-0"/>
+                )}
                 <div className="min-w-0 flex-1">
                   <div className="font-medium truncate" title={m.display_name}>{m.display_name || fullId}</div>
                   <div className="mt-0.5 flex items-center gap-0.5 text-xs text-muted font-mono min-w-0" title={fullId}>
@@ -312,9 +336,9 @@ export default function Models(){
                 </div>
               )}
 
-              {/* Actions */}
+              {/* Actions (admin-only mutations) */}
               <div className="mt-auto pt-3 -mx-1 flex justify-end gap-1">
-                {isEdit ? (
+                {isAdmin && isEdit ? (
                   <>
                     <Button variant="ghost" size="sm" onClick={()=>setEditId(null)} title="Cancel edit">
                       <Icon name="x" size={14}/> Cancel
@@ -333,7 +357,7 @@ export default function Models(){
                       <Icon name="check" size={14}/> Save
                     </Button>
                   </>
-                ) : (
+                ) : isAdmin ? (
                   <>
                     <Button variant="ghost" size="sm" onClick={async()=>{
                       try{ await api.providerModels.enrich(m.id); toast.success('Enriched'); load() }catch(e:any){ toast.error(e.message || String(e)) }
@@ -348,43 +372,47 @@ export default function Models(){
                       <Icon name="trash" size={14}/>
                     </Button>
                   </>
-                )}
+                ) : null}
               </div>
             </Card>
           )
         })}
-        {!loading && list.length===0 && (
+        {!loading && !loadError && list.length===0 && (
           <div className="col-span-full">
-            <EmptyState icon="box" title="No models." hint="Discover from a provider or add a model manually above."/>
+            <EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/>
           </div>
         )}
       </div>
 
-      {/* Aliases */}
+      {/* Aliases (writes are admin-only; everyone can read) */}
       <Card>
         <h3 className="font-semibold tracking-tight">Aliases</h3>
-        <div className="mt-3 flex flex-col sm:flex-row flex-wrap gap-2">
-          <Input value={newAlias} onChange={e=>setNewAlias(e.target.value)} placeholder="alias" className="sm:w-48"/>
-          <Input value={newTarget} onChange={e=>setNewTarget(e.target.value)} placeholder="target model" className="flex-1 min-w-[200px]"/>
-          <Button variant="primary" onClick={async()=>{
-            try{
-              await api.catalog.createAlias(newAlias, newTarget)
-              setNewAlias(''); setNewTarget('')
-              toast.success('Alias added')
-              load()
-            }catch(e:any){ toast.error(e.message || String(e)) }
-          }}>Add</Button>
-        </div>
-        <div className="mt-3 flex flex-wrap gap-2 font-mono text-xs">
+        {isAdmin && (
+          <div className="mt-3 flex flex-col sm:flex-row flex-wrap gap-2">
+            <Input value={newAlias} onChange={e=>setNewAlias(e.target.value)} placeholder="alias" className="sm:w-48"/>
+            <Input value={newTarget} onChange={e=>setNewTarget(e.target.value)} placeholder="target model" className="flex-1 min-w-[200px]"/>
+            <Button variant="primary" onClick={async()=>{
+              try{
+                await api.catalog.createAlias(newAlias, newTarget)
+                setNewAlias(''); setNewTarget('')
+                toast.success('Alias added')
+                load()
+              }catch(e:any){ toast.error(e.message || String(e)) }
+            }}>Add</Button>
+          </div>
+        )}
+        <div className={`${isAdmin ? 'mt-3' : 'mt-3'} flex flex-wrap gap-2 font-mono text-xs`}>
           {aliases.map((a:any)=> (
             <span key={a.alias} className="inline-flex items-center gap-1.5 border border-stone rounded-full pl-3 pr-1 py-1 bg-app/50">
               <b className="text-amber font-semibold">{a.alias}</b>
               <Icon name="chevronRight" size={11} className="text-muted"/>
               <span>{a.target}</span>
-              <button onClick={()=>setPendingDelete({kind:'alias', alias:a.alias})} aria-label={`Delete alias ${a.alias}`}
-                className="ml-0.5 w-5 h-5 rounded-full flex items-center justify-center text-muted hover:text-red-400 hover:bg-stone/60 transition-colors">
-                <Icon name="x" size={12}/>
-              </button>
+              {isAdmin && (
+                <button onClick={()=>setPendingDelete({kind:'alias', alias:a.alias})} aria-label={`Delete alias ${a.alias}`}
+                  className="ml-0.5 w-5 h-5 rounded-full flex items-center justify-center text-muted hover:text-red-400 hover:bg-stone/60 transition-colors">
+                  <Icon name="x" size={12}/>
+                </button>
+              )}
             </span>
           ))}
           {aliases.length===0 && <span className="text-muted text-sm">No aliases.</span>}
@@ -404,7 +432,7 @@ export default function Models(){
         body={
           pendingDelete?.kind==='model' ? `Delete "${pendingDelete.label}"? It will be removed from the catalog of provider models.`
           : pendingDelete?.kind==='alias' ? `Remove alias "${pendingDelete.alias}"? Requests resolving through it will stop mapping to its target.`
-          : ''
+          : `Delete ${selected.size} selected model(s)? This cannot be undone.`
         }
         confirmLabel={pendingDelete?.kind==='alias' ? 'Remove' : 'Delete'}
       />

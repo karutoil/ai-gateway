@@ -16,7 +16,9 @@ type ProviderRow = {
 
 type ProviderModelRow = { model_id?: string }
 
-export default function Routing(){
+export default function Routing({ role = 'admin' }: { role?: string }){
+  // LB rules (read AND write) are admin-only server-side.
+  const isAdmin = role === 'admin'
   const [rules, setRules] = useState<LBRule[]>([])
   const [providers, setProviders] = useState<ProviderRow[]>([])
   // Distinct model_ids discovered across providers — suggestions for the model input.
@@ -32,13 +34,18 @@ export default function Routing(){
   const [busy, setBusy] = useState(false)
   // Presentation-only: destructive confirmation for rule deletion.
   const [pendingDelete, setPendingDelete] = useState<LBRule | null>(null)
+  const [loadError, setLoadError] = useState('')
   const toast = useToast()
   const builderRef = useRef<HTMLDivElement>(null)
 
   const loadRules = async ()=>{
-    try{ const r = await api.lb.listRules(); setRules(Array.isArray(r) ? r : []) }catch{}
+    try{
+      const r = await api.lb.listRules()
+      setRules(Array.isArray(r) ? r : [])
+      setLoadError('')
+    }catch(e:any){ setLoadError(e?.message || String(e)) }
   }
-  useEffect(()=>{ loadRules() }, [])
+  useEffect(()=>{ if(isAdmin) loadRules() }, [isAdmin])
 
   // Reference data: all providers + discovered model ids. Non-fatal on failure.
   useEffect(()=>{
@@ -161,8 +168,26 @@ export default function Routing(){
 
       {err && <ErrorNote message={err} />}
 
-      {/* Rules table */}
-      {rules.length===0 ? (
+      {!isAdmin ? (
+        <Card>
+          <EmptyState
+            icon="route"
+            title="Routing is admin-only."
+            hint="Load-balancer rules are managed by admins. Bare model names still rotate through the configured groups — pin a provider with qualified IDs like openai/gpt-4o or an X-Provider header."
+          />
+        </Card>
+      ) : loadError ? (
+        <Card>
+          <EmptyState
+            icon="alert"
+            title="Could not load routing rules"
+            hint={loadError}
+            action={<Button variant="secondary" onClick={loadRules}><Icon name="refresh" size={15}/>Retry</Button>}
+          />
+        </Card>
+      ) : (
+      /* Rules table */
+      rules.length===0 ? (
         <Card>
           <EmptyState
             icon="route"
@@ -213,6 +238,7 @@ export default function Routing(){
             </tbody>
           </table>
         </TableShell>
+      )
       )}
 
       {/* Builder / editor */}

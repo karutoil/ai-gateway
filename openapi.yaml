@@ -4,8 +4,11 @@ info:
   version: 1.7.0
   description: |
     Unified AI Gateway — OpenAI / Anthropic / Responses under one domain.
-    Gateway auth: Bearer sk-gw-* or admin session JWT on /v1/*.
-    Admin: Bearer JWT on /api/*. Errors: {error:{message,type}}.
+    Gateway auth (/v1/* and the bare convenience aliases): `Authorization: Bearer sk-gw-…`
+    or `x-api-key: sk-gw-…`. Admin (/api/*): `Authorization: Bearer <JWT>` from
+    /api/auth/login, or the HttpOnly `gw_token` session cookie set by the login flows
+    for dashboard-origin calls (same-origin; cross-site mutations pass CSRF origin checks).
+    Errors: {error:{message,type}}.
 servers:
   - url: http://localhost:8080
     description: local
@@ -26,7 +29,7 @@ paths:
                 type: object
                 properties:
                   status: { type: string, example: ok }
-                  version: { type: string, example: "1.6.0" }
+                  version: { type: string, example: "1.7.0" }
                   db: { type: string, example: up }
                   config_ok: { type: boolean, example: true }
   /ready:
@@ -36,6 +39,20 @@ paths:
       responses:
         '200': { description: ready }
         '503': { description: not ready }
+  /api/health:
+    get:
+      summary: Dashboard health ping
+      tags: [ops]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string, example: "1.7.0" }
   /metrics:
     get:
       summary: Prometheus metrics exposition (admin-auth gated when METRICS_PROTECT=true)
@@ -56,19 +73,65 @@ paths:
           application/json:
             schema:
               type: object
-              required: [password]
+              required: [username, password]
+              description: Password-only bodies 401 once any dashboard user exists (usernameless login is a legacy bootstrap path only).
               properties:
+                username: { type: string, example: admin }
                 password: { type: string, example: admin123 }
       responses:
         '200':
-          description: JWT token
+          description: JWT token (also set as the HttpOnly gw_token session cookie)
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   token: { type: string }
+                  username: { type: string }
+                  role: { type: string }
         '401': { description: invalid credentials }
+  /api/auth/logout:
+    post:
+      summary: Revoke the caller's session (token_version bump) and clear the gw_token cookie
+      tags: [auth]
+      responses:
+        '200':
+          description: logged out
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+  /api/auth/oidc:
+    post:
+      summary: OIDC SSO login — verify an OIDC id_token and mint a dashboard session
+      description: |
+        Requires OIDC_ISSUER to be configured (503 otherwise). Roles are resolved
+        server-side: existing users keep their stored role; new subjects provision as
+        member unless listed in OIDC_ADMIN_SUBJECTS (comma-separated subjects auto-granted admin).
+      tags: [auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token: { type: string }
+      responses:
+        '200':
+          description: dashboard JWT (also set as the gw_token cookie)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '400': { description: invalid json or missing id_token }
+        '401': { description: invalid oidc token }
+        '503': { description: OIDC login not configured (set OIDC_ISSUER) }
   /api/providers:
     get:
       summary: List providers
@@ -88,6 +151,31 @@ paths:
       responses:
         '201': { description: created }
   /api/providers/{id}:
+    put:
+      summary: Update a provider — credential-rotation path (audited)
+      description: name, base_url and api_key are all optional; omitted fields keep their stored value.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 128 }
+                base_url: { type: string, maxLength: 2048 }
+                api_key: { type: string, description: "Empty/omitted keeps the stored credential" }
+      responses:
+        '200':
+          description: updated provider (api_key masked)
+        '400': { description: invalid input }
+        '404': { description: not found }
     delete:
       summary: Delete provider (audited)
       tags: [admin]
@@ -110,8 +198,14 @@ paths:
       summary: Create gateway key (audited)
       tags: [admin]
       security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateKey' }
       responses:
-        '201': { description: created }
+        '201':
+          description: created — the full sk-gw-… key is shown once
   /api/keys/{id}:
     delete:
       summary: Revoke gateway key (audited)
@@ -260,11 +354,49 @@ paths:
       responses:
         '200': { description: settings }
     put:
-      summary: Update system config (audited)
+      summary: Upsert system-config settings (audited, admin only)
+      description: |
+        Body is a flat JSON map of setting key → string value (max 50 keys; keys ≤128
+        chars, values ≤4096 chars). Internal keys (models_* or _*) are never stored —
+        they are reported in `skipped`.
       tags: [admin]
       security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: { type: string }
+              example:
+                default_temperature: "0.7"
       responses:
-        '200': { description: updated }
+        '200':
+          description: saved/skip report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved: { type: integer, example: 1, description: number of keys stored }
+                  skipped:
+                    type: array
+                    items: { type: string }
+                    description: keys rejected (internal/oversized)
+                    example: ["models_last_sync"]
+  /api/models/settings/{key}:
+    delete:
+      summary: Delete a system-config setting (audited, admin only)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '204': { description: deleted }
+        '400': { description: invalid key (internal or oversize) }
   /v1/chat/completions:
     post:
       summary: Chat completions (OpenAI compat, gateway auth)
@@ -278,7 +410,7 @@ paths:
               type: object
               required: [model, messages]
               properties:
-                model: { type: string, example: openai/gpt-4o-mini, maxLength: 256, description: "Prefer provider/model. Short ids still resolve." }
+                model: { type: string, example: openai/gpt-4o-mini, description: "Prefer provider/model. Short ids still resolve." }
                 messages: { type: array, items: { type: object } }
                 stream: { type: boolean, default: false }
                 temperature: { type: number }
@@ -338,6 +470,49 @@ paths:
                         id: { type: string, example: openai/gpt-4o-mini }
                         model_id: { type: string, example: gpt-4o-mini }
                         owned_by: { type: string, example: openai }
+  /chat/completions:
+    post:
+      summary: Convenience alias — same handler as /v1/chat/completions
+      description: Non-/v1 convenience proxies so SDK baseURLs work with or without a /v1 suffix. All take the same gateway auth.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: completion }
+  /completions:
+    post:
+      summary: Convenience alias — same handler as /v1/completions
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: completion }
+  /embeddings:
+    post:
+      summary: Convenience alias — same handler as /v1/embeddings
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: embeddings }
+  /messages:
+    post:
+      summary: Convenience alias — same handler as /v1/messages (Anthropic compat)
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: message }
+  /responses:
+    post:
+      summary: Convenience alias — same handler as /v1/responses
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: response }
+  /models:
+    get:
+      summary: Convenience alias — same handler as /v1/models
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: models }
   /api/orgs:
     get:
       summary: List organizations
@@ -773,11 +948,43 @@ paths:
         '200': { description: stats }
   /api/logs:
     get:
-      summary: Recent request logs (latest 100)
+      summary: Request logs with pagination and filters (default latest 100)
       tags: [admin]
       security: [{ bearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+        - name: model
+          in: query
+          schema: { type: string }
+          description: substring match on the model column
+        - name: key
+          in: query
+          schema: { type: string }
+          description: key-prefix prefix match
+        - name: endpoint
+          in: query
+          schema: { type: string }
+          description: substring match on the endpoint column
+        - name: status
+          in: query
+          schema: { type: string }
+          description: exact HTTP code, or "failed" (status >= 400)
+        - name: since
+          in: query
+          schema: { type: string }
+          description: RFC3339 timestamp or Go duration (e.g. "24h")
       responses:
-        '200': { description: logs }
+        '200':
+          description: log rows (array) — total matching count in X-Total-Count
+          headers:
+            X-Total-Count:
+              schema: { type: integer }
+              description: total rows matching the filters, independent of limit/offset
   /api/logs/{id}:
     get:
       summary: Single request log incl. stored bodies (org-scoped)
@@ -791,6 +998,41 @@ paths:
       responses:
         '200': { description: log detail }
         '404': { description: not found }
+  /api/audit:
+    get:
+      summary: Audit trail (admin only)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+        - name: actor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: audit rows, newest first — total in X-Total-Count
+          headers:
+            X-Total-Count:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    actor: { type: string }
+                    action: { type: string, example: post }
+                    target_type: { type: string, example: provider }
+                    target_id: { type: string }
+                    meta: { type: string }
+                    created_at: { type: string, format: date-time }
   /api/billing/export:
     get:
       summary: Billing export as CSV (attachment) over a lookback window; emits a billing.export webhook
@@ -864,6 +1106,7 @@ paths:
           schema: { type: string }
       responses:
         '204': { description: Deleted }
+components:
   responses:
     LBRuleSaved:
       description: Saved rule with joined member metadata
@@ -879,7 +1122,12 @@ paths:
       type: apiKey
       in: header
       name: Authorization
-      description: 'Bearer sk-gw-...'
+      description: 'Gateway key as `Authorization: Bearer sk-gw-...` — `x-api-key: sk-gw-...` is accepted equivalently'
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: gw_token
+      description: 'HttpOnly dashboard session cookie (set by /api/auth/login, /api/auth/oidc and the passkey flows). Accepted on /api/* in place of the Bearer JWT for dashboard-origin calls; cross-site mutations must pass the CSRF origin check.'
   schemas:
     LBRule:
       type: object
@@ -905,3 +1153,23 @@ paths:
         type: { type: string, enum: [openai, anthropic, azure, openai_compatible], example: openai }
         base_url: { type: string, example: https://api.openai.com/v1 }
         api_key: { type: string, example: sk-... }
+    CreateKey:
+      type: object
+      description: All fields optional except none — a key with no name gets key-<uuid8>.
+      properties:
+        name:
+          type: string
+          maxLength: 64
+          example: my-key
+        org_id:
+          type: string
+          description: Optional org scope; non-admin callers may only scope to their own org
+        rate_limit_rpm: { type: integer, example: 60 }
+        rate_limit_rph: { type: integer, example: 1000 }
+        rate_limit_rpd: { type: integer, example: 10000 }
+        rate_limit_tpm: { type: integer, example: 50000 }
+        allowed_models:
+          type: array
+          maxItems: 100
+          items: { type: string }
+          description: Allowlist with * wildcard; empty = all models

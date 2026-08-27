@@ -122,41 +122,60 @@ function DetailBody({ detail, selected, keyMap }: {
   )
 }
 
+const LIMIT_OPTIONS = [50, 100, 200, 500]
+const SINCE_OPTIONS = [
+  { value: '1h', label: '1h' },
+  { value: '24h', label: '24h' },
+  { value: '7d', label: '7d' },
+  { value: '30d', label: '30d' },
+] as const
+
 export default function Logs(){
   const navigate = useNavigate()
   const [logs, setLogs] = useState<any[]>([])
+  const [total, setTotal] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [query, setQuery] = useState('')
-  const [statusFilter, setStatusFilter] = useState<'all'|'ok'|'fail'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all'|'failed'>('all')
+  const [since, setSince] = useState<'1h'|'24h'|'7d'|'30d'>('24h')
+  const [limit, setLimit] = useState(100)
+  const [offset, setOffset] = useState(0)
   const [keyMap, setKeyMap] = useState<Record<string,string>>({})
   const [selected, setSelected] = useState<any|null>(null)
   const [detail, setDetail] = useState<any|null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
 
-  const loadLogs = ()=>{
+  // Server-side pagination + filters (GET /api/logs supports limit/offset/
+  // status/since and returns X-Total-Count).
+  const loadLogs = (opts?: { resetOffset?: boolean })=>{
+    const nextOffset = opts?.resetOffset ? 0 : offset
     setLoading(true)
-    api.logs().then(setLogs).catch(()=>{}).finally(()=>setLoading(false))
+    setLoadError('')
+    api.logsQuery({
+      limit,
+      offset: nextOffset,
+      status: statusFilter === 'failed' ? 'failed' : undefined,
+      since,
+    })
+      .then(({ rows, total })=>{
+        setLogs(rows)
+        setTotal(total)
+        if (opts?.resetOffset) setOffset(0)
+      })
+      .catch((e:any)=> setLoadError(e?.message || String(e)))
+      .finally(()=> setLoading(false))
   }
 
-  useEffect(()=>{ 
-    loadLogs()
+  useEffect(()=>{ loadLogs({ resetOffset: true }) }, [limit, statusFilter, since])
+
+  useEffect(()=>{
     api.keys.list().then(keys=>{
       const m:Record<string,string>={}
       for(const k of keys) m[k.prefix]=k.name
       setKeyMap(m)
     }).catch(()=>{})
   },[])
-
-  const openDetail = async (l:any)=>{
-    setSelected(l)
-    setLoadingDetail(true)
-    try{
-      const d:any = await (api as any).logsDetail ? (api as any).logsDetail(l.id) : fetch(`/api/logs/${l.id}`, { credentials: 'same-origin' }).then(r=>r.json())
-      setDetail(d)
-    }catch{
-      setDetail({ log: l })
-    }finally{ setLoadingDetail(false)}
-  }
 
   // Also support direct fetch via api if not yet added
   const fetchDetail = async (id:string)=>{
@@ -167,7 +186,6 @@ export default function Logs(){
     return null
   }
 
-  // Patch openDetail to use fetchDetail
   const handleRowClick = async (l:any)=>{
     setSelected(l)
     setDetail(null)
@@ -177,20 +195,24 @@ export default function Logs(){
     setLoadingDetail(false)
   }
 
-  // Client-side filtering (presentation only — no extra endpoint calls).
+  // Client-side search across the currently loaded page only — the text box
+  // narrows what you see; server filters (status/since) govern what is loaded.
   const q = query.trim().toLowerCase()
   const visible = logs.filter(l=>{
-    if(statusFilter==='ok' && !(l.status>=200 && l.status<400)) return false
-    if(statusFilter==='fail' && !(l.status>=400)) return false
     if(!q) return true
     return [l.model, l.endpoint, keyMap[l.key_prefix], String(l.status??'')]
       .some(v => typeof v==='string' && v.toLowerCase().includes(q))
   })
 
+  // Aggregates cover the loaded page only — labeled as such below.
   const totalCost = logs.reduce((acc,l)=> acc + (l.cost_usd||0), 0)
   const totalTokens = logs.reduce((acc,l)=> acc + (l.total_tokens||0), 0)
   const avgTTFT = logs.length ? Math.round(logs.reduce((a,l)=>a+(l.ttft_ms||0),0)/logs.length) : 0
   const avgTPS = logs.length ? (logs.reduce((a,l)=>a + tpsFor(l),0)/logs.length).toFixed(1) : '0'
+
+  const page = Math.floor(offset / limit) + 1
+  const hasPrev = offset > 0
+  const hasNext = total != null ? offset + logs.length < total : logs.length === limit
 
   const rawJson = detail ? JSON.stringify(detail || selected, null, 2) : ''
 
@@ -200,84 +222,136 @@ export default function Logs(){
         title="Request Logs"
         description="Every proxied call with status, latency, tokens and cost."
         actions={
-          <Button variant="primary" onClick={loadLogs} disabled={loading}>
+          <Button variant="primary" onClick={()=>loadLogs()} disabled={loading}>
             <Icon name="refresh" size={15}/>Refresh
           </Button>
         }
       />
 
-      {/* Totals strip */}
+      {/* Totals strip — aggregates cover the currently loaded rows only */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted font-mono tabular-nums -mt-2">
-        <span>{logs.length} requests</span>
-        <span>{totalTokens.toLocaleString()} tokens</span>
-        <span>${totalCost.toFixed(4)}</span>
+        <span>{logs.length} loaded{total != null ? ` of ${total.toLocaleString()} matching` : ''}</span>
+        <span title="Sum over the currently loaded rows">{totalTokens.toLocaleString()} tokens (loaded)</span>
+        <span title="Sum over the currently loaded rows">${totalCost.toFixed(4)} (loaded)</span>
         <span>avg TTFT {avgTTFT}ms</span>
         <span>avg TPS {avgTPS}</span>
       </div>
 
-      {/* Filter bar (client-side only) */}
+      {/* Filter bar — status + time range + page size hit the server; search is within the loaded page */}
       <Card className="!p-3 flex flex-col sm:flex-row sm:items-center gap-2">
         <div className="relative flex-1 min-w-[180px]">
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
-          <Input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter by model, endpoint, key…" className="pl-9"/>
+          <Input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter loaded rows by model, endpoint, key…" className="pl-9"/>
         </div>
-        <SegmentedControl<'all'|'ok'|'fail'>
-          options={[{value:'all',label:'All'},{value:'ok',label:'OK'},{value:'fail',label:'Fail'}]}
+        <SegmentedControl<'all'|'failed'>
+          options={[{value:'all',label:'All'},{value:'failed',label:'Failed'}]}
           value={statusFilter}
           onChange={setStatusFilter}
         />
+        <SegmentedControl<'1h'|'24h'|'7d'|'30d'>
+          options={SINCE_OPTIONS.map(o=>({ value:o.value, label:o.label }))}
+          value={since}
+          onChange={setSince}
+        />
+        <label className="flex items-center gap-2 text-xs text-muted shrink-0">
+          Rows
+          <select
+            value={limit}
+            onChange={e=>setLimit(Number(e.target.value))}
+            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60"
+          >
+            {LIMIT_OPTIONS.map(n=> <option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
       </Card>
 
-      <TableShell>
-        <thead>
-          <tr>
-            <Th>Time</Th>
-            <Th>Model</Th>
-            <Th>Provider</Th>
-            <Th className="text-center">Status</Th>
-            <Th className="!text-right">Latency</Th>
-            <Th className="!text-right">Tokens</Th>
-            <Th className="!text-right">Cost</Th>
-          </tr>
-        </thead>
-        {loading ? (
-          <TableSkeleton rows={8} cols={7}/>
-        ) : visible.length===0 ? (
-          <tbody>
-            <tr><td colSpan={7}>
-              <EmptyState
-                icon="logs"
-                title={logs.length===0 ? 'No requests yet' : 'No matching requests'}
-                hint={logs.length===0
-                  ? 'Send your first call from the Playground and it will appear here instantly.'
-                  : 'Try a different search term or status filter.'}
-                action={logs.length===0
-                  ? <Button variant="secondary" onClick={()=>navigate('/playground')}><Icon name="play" size={15}/>Open Playground</Button>
-                  : undefined}
-              />
-            </td></tr>
-          </tbody>
-        ) : (
-          <tbody>
-            {visible.map(l=>(
-              <tr key={l.id} onClick={()=>handleRowClick(l)}
-                  className="hover:bg-raised/50 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/50">
-                <Td className="whitespace-nowrap text-xs text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
-                <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}`}>{l.model}</span></Td>
-                <Td><span className="block font-mono text-xs truncate max-w-[110px] text-muted" title={String(l.provider_id||'')}>{l.provider_id || '—'}</span></Td>
-                <Td className="text-center"><Badge tone={statusTone(l.status)} dot>{l.status}</Badge></Td>
-                <Td className="text-right tabular-nums text-xs">{l.latency_ms}ms</Td>
-                <Td className="text-right tabular-nums text-xs">
-                  <span className="block" title={`${l.prompt_tokens ?? 0} prompt · ${l.completion_tokens ?? 0} completion`}>
-                    {l.total_tokens ? l.total_tokens.toLocaleString() : '—'}
-                  </span>
-                </Td>
-                <Td className="text-right tabular-nums text-xs">{l.cost_usd ? `$${Number(l.cost_usd).toFixed(4)}` : '—'}</Td>
-              </tr>
-            ))}
-          </tbody>
-        )}
-      </TableShell>
+      {loadError && (
+        <Card>
+          <EmptyState
+            icon="alert"
+            title="Could not load request logs"
+            hint={loadError}
+            action={<Button variant="secondary" onClick={()=>loadLogs()}><Icon name="refresh" size={15}/>Retry</Button>}
+          />
+        </Card>
+      )}
+
+      {!loadError && (
+        <TableShell>
+          <thead>
+            <tr>
+              <Th>Time</Th>
+              <Th>Model</Th>
+              <Th>Provider</Th>
+              <Th className="text-center">Status</Th>
+              <Th className="!text-right">Latency</Th>
+              <Th className="!text-right">Tokens</Th>
+              <Th className="!text-right">Cost</Th>
+            </tr>
+          </thead>
+          {loading ? (
+            <TableSkeleton rows={8} cols={7}/>
+          ) : visible.length===0 ? (
+            <tbody>
+              <tr><td colSpan={7}>
+                <EmptyState
+                  icon="logs"
+                  title={logs.length===0
+                    ? (offset > 0 ? 'No requests on this page' : 'No requests match these filters')
+                    : 'No matching requests on this page'}
+                  hint={logs.length===0
+                    ? (offset > 0
+                        ? 'Go back a page, or widen the time range / clear the failed filter.'
+                        : 'Send your first call from the Playground and it will appear here instantly.')
+                    : 'Try a different search term.'}
+                  action={logs.length===0 && offset === 0
+                    ? <Button variant="secondary" onClick={()=>navigate('/playground')}><Icon name="play" size={15}/>Open Playground</Button>
+                    : undefined}
+                />
+              </td></tr>
+            </tbody>
+          ) : (
+            <tbody>
+              {visible.map(l=>(
+                <tr key={l.id} onClick={()=>handleRowClick(l)}
+                    className="hover:bg-raised/50 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/50">
+                  <Td className="whitespace-nowrap text-xs text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
+                  <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}`}>{l.model}</span></Td>
+                  <Td><span className="block font-mono text-xs truncate max-w-[110px] text-muted" title={String(l.provider_id||'')}>{l.provider_id || '—'}</span></Td>
+                  <Td className="text-center"><Badge tone={statusTone(l.status)} dot>{l.status}</Badge></Td>
+                  <Td className="text-right tabular-nums text-xs">{l.latency_ms}ms</Td>
+                  <Td className="text-right tabular-nums text-xs">
+                    <span className="block" title={`${l.prompt_tokens ?? 0} prompt · ${l.completion_tokens ?? 0} completion`}>
+                      {l.total_tokens ? l.total_tokens.toLocaleString() : '—'}
+                    </span>
+                  </Td>
+                  <Td className="text-right tabular-nums text-xs">{l.cost_usd ? `$${Number(l.cost_usd).toFixed(4)}` : '—'}</Td>
+                </tr>
+              ))}
+            </tbody>
+          )}
+        </TableShell>
+      )}
+
+      {/* Server-side pagination controls */}
+      {!loadError && (
+        <div className="flex items-center justify-between gap-2 -mt-2">
+          <span className="text-xs text-muted tabular-nums">
+            Page {page}{total != null ? ` · ${total.toLocaleString()} request(s) matching` : ''}
+            {' '}· rows {offset + 1}–{offset + logs.length}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <Button variant="secondary" size="sm" disabled={!hasPrev || loading}
+              onClick={()=>setOffset(Math.max(0, offset - limit))}>
+              <Icon name="chevronLeft" size={13}/>Prev
+            </Button>
+            <Button variant="secondary" size="sm" disabled={!hasNext || loading}
+              onClick={()=>setOffset(offset + limit)}>
+              Next<Icon name="chevronRight" size={13}/>
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Request detail modal */}
       <Modal

@@ -25,7 +25,7 @@ function ago(iso?: string | null): string {
   return new Date(iso).toLocaleDateString()
 }
 
-export default function Profile(){
+export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () => void }){
   const [me, setMe] = useState<Me|null>(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
@@ -76,12 +76,16 @@ export default function Profile(){
 
   const changePassword = async()=>{
     if(newPw !== confirmPw){ setPwError('Passwords do not match.'); return}
-    if(newPw.length < 4){ setPwError('New password must be at least 4 characters.'); return}
+    if(newPw.length < 8){ setPwError('New password must be at least 8 characters.'); return}
     setPwError('')
     try{
       await api.profile.changePassword(oldPw, newPw)
-      toast.success('Password changed')
+      // The backend bumps the user's token_version on password change, which
+      // revokes this session immediately — every later call would 401. Log
+      // out right away and tell the user to sign in again.
+      toast.success('Password changed — please sign in again')
       setOldPw(''); setNewPw(''); setConfirmPw('')
+      onSessionRevoked?.()
     }catch(e:any){ setPwError(e.message || String(e)); toast.error('Could not change password')}
   }
 
@@ -143,7 +147,7 @@ export default function Profile(){
     <div className="space-y-6 max-w-4xl">
       <PageHeader title="Profile" description="Your account, security and recent gateway activity." />
 
-      {/* show-once recovery code */}
+      {/* show-once recovery code — explicit acknowledgment, no bare dismiss */}
       {recovery && (
         <div className="rounded-xl border border-teal/30 bg-teal/10 p-4">
           <div className="flex items-start gap-3">
@@ -157,8 +161,12 @@ export default function Profile(){
                 <code className="font-mono text-sm text-paper break-all min-w-0 flex-1">{recovery}</code>
                 <CopyButton value={recovery} label="Copy recovery code" />
               </div>
+              <div className="mt-3">
+                <Button variant="primary" size="sm" onClick={()=>setRecovery(null)}>
+                  <Icon name="check" size={14} /> I&apos;ve saved it
+                </Button>
+              </div>
             </div>
-            <Button variant="ghost" size="sm" onClick={()=>setRecovery(null)} title="Dismiss"><Icon name="x" size={14} /></Button>
           </div>
         </div>
       )}
@@ -201,7 +209,7 @@ export default function Profile(){
             <Field label="New password">
               <Input type="password" value={newPw} onChange={e=>setNewPw(e.target.value)} placeholder="••••••••" autoComplete="new-password" />
             </Field>
-            <Field label="Confirm new" hint="Minimum 4 characters.">
+            <Field label="Confirm new" hint="Minimum 8 characters.">
               <Input type="password" value={confirmPw} onChange={e=>setConfirmPw(e.target.value)} placeholder="••••••••" autoComplete="new-password"
                 onKeyDown={e=>{ if(e.key==='Enter') changePassword() }} />
             </Field>
@@ -326,9 +334,9 @@ export default function Profile(){
         open={confirmDisable}
         onClose={()=>setConfirmDisable(false)}
         onConfirm={disable}
-        title="Disable passkey?"
-        confirmLabel="Disable"
-        body="Disable passkey sign-in? Your existing recovery code remains valid until regenerated — after this you will need your password to sign in."
+        title="Disable passkeys?"
+        confirmLabel="Disable all"
+        body="This removes ALL your passkeys on this account — every credential enrolled from any device stops working, and you will need your password (or recovery code) to sign in."
       />
     </div>
   )

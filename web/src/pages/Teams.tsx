@@ -16,7 +16,9 @@ const roleTone: Record<Role, 'brand' | 'good' | 'neutral'> = {
   readonly: 'neutral',
 }
 
-export default function Teams() {
+export default function Teams({ role = 'admin' }: { role?: string }) {
+  // Org writes (create org, add member) are admin-only server-side.
+  const isAdmin = role === 'admin'
   const toast = useToast()
   const [orgs, setOrgs] = useState<Org[]>([])
   const [activeId, setActiveId] = useState<string>('')
@@ -27,7 +29,9 @@ export default function Teams() {
   const [members, setMembers] = useState<Member[]>([])
   const [membersLoading, setMembersLoading] = useState(false)
   const [membersErr, setMembersErr] = useState('')
-  const [inviteUser, setInviteUser] = useState('')
+  const [directory, setDirectory] = useState<{ id: string; username: string; role: string }[]>([])
+  const [directoryLoading, setDirectoryLoading] = useState(false)
+  const [inviteUserId, setInviteUserId] = useState('')
   const [inviteRole, setInviteRole] = useState<Role>('member')
   const [inviting, setInviting] = useState(false)
   const [filterRole, setFilterRole] = useState<Role | 'all'>('all')
@@ -77,17 +81,35 @@ export default function Teams() {
     }catch(e:any){ setCreateErr(e.message||String(e)) } finally{setCreating(false)}
   }
   const addMember = async () => {
-    const uid=inviteUser.trim()
-    if(!uid){ setInviteErr('User id or email required'); return }
+    const uid=inviteUserId
+    if(!uid){ setInviteErr('Select a user to invite'); return }
     if(!activeId){ setInviteErr('Select an organization first'); return }
     setInviting(true); setInviteErr('')
     try{
+      // Send the existing user's id — the backend validates existence and
+      // rejects duplicate membership.
       await api.orgs.addMember(activeId, uid, inviteRole)
-      toast.success(`Invited ${uid}`)
-      setInviteUser('')
+      const label = directory.find(u=>u.id===uid)?.username || uid.slice(0,8)
+      toast.success(`Invited ${label}`)
+      setInviteUserId('')
       await loadMembers(activeId)
       setInviteOpen(false)
     }catch(e:any){ setInviteErr(e.message||String(e)) }finally{ setInviting(false) }
+  }
+
+  // Load the user directory for the invite dropdown (admin-only endpoint).
+  const openInvite = () => {
+    setInviteUserId(''); setInviteRole('member'); setInviteErr('')
+    setInviteOpen(true)
+    if (directory.length > 0 || directoryLoading) return
+    setDirectoryLoading(true)
+    api.users.list()
+      .then((data:any)=>{
+        const rows = Array.isArray(data) ? data : data?.data ?? []
+        setDirectory(rows.map((u:any)=>({ id: u.id, username: u.username || u.id, role: u.role || '' })))
+      })
+      .catch((e:any)=> setInviteErr(e?.message || 'Could not load user list'))
+      .finally(()=> setDirectoryLoading(false))
   }
 
   const filtered = filterRole==='all'? members : members.filter(m=>m.role===filterRole)
@@ -99,16 +121,25 @@ export default function Teams() {
       <PageHeader
         title="Teams"
         description="Organizations, members and their roles across the gateway."
-        actions={
+        actions={isAdmin ? (
           <Button variant="primary" onClick={openCreate} disabled={loading}>
             <Icon name="plus" size={15}/>New organization
           </Button>
-        }
+        ) : undefined}
       />
 
-      {err && <ErrorNote message={err}/>}
+      {err && (
+        <Card>
+          <EmptyState
+            icon="alert"
+            title="Could not load organizations"
+            hint={err}
+            action={<Button variant="secondary" onClick={loadOrgs}><Icon name="refresh" size={15}/>Retry</Button>}
+          />
+        </Card>
+      )}
 
-      {loading ? (
+      {!err && loading ? (
         <Card className="space-y-2">
           <Skeleton className="h-12 w-full"/>
           <Skeleton className="h-12 w-3/4"/>
@@ -118,8 +149,8 @@ export default function Teams() {
         <EmptyState
           icon="users"
           title="No organizations yet"
-          hint="Create your first organization, then invite teammates by user id or email."
-          action={<Button variant="primary" onClick={openCreate}><Icon name="plus" size={15}/>New organization</Button>}
+          hint={isAdmin ? 'Create your first organization, then invite teammates from the user directory.' : 'No organizations exist yet — ask an admin to create one.'}
+          action={isAdmin ? <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15}/>New organization</Button> : undefined}
         />
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-4 items-start">
@@ -161,11 +192,13 @@ export default function Teams() {
                   value={filterRole}
                   onChange={setFilterRole}
                 />
-                <Button variant="secondary" size="sm" disabled={!activeId}
-                  title={activeId? 'Add a member to this organization':'Select an organization first'}
-                  onClick={()=>{ setInviteUser(''); setInviteRole('member'); setInviteErr(''); setInviteOpen(true) }}>
-                  <Icon name="userCog" size={14}/>Invite member
-                </Button>
+                {isAdmin && (
+                  <Button variant="secondary" size="sm" disabled={!activeId}
+                    title={activeId? 'Add a member to this organization':'Select an organization first'}
+                    onClick={openInvite}>
+                    <Icon name="userCog" size={14}/>Invite member
+                  </Button>
+                )}
               </div>
             </div>
 
@@ -227,10 +260,13 @@ export default function Teams() {
 
       {/* Invite member */}
       <Modal open={inviteOpen} onClose={()=>{ if(!inviting) setInviteOpen(false) }} title={`Invite member${active ? ` — ${active.name}` : ''}`}>
-        <Field label="User id or email" hint="Exact user id of an existing account, or their email.">
-          <Input autoFocus value={inviteUser} placeholder="user_id or email"
-            onChange={e=>setInviteUser(e.target.value)}
-            onKeyDown={e=>{ if(e.key==='Enter') addMember() }}/>
+        <Field label="User" hint={directoryLoading ? 'Loading users…' : 'Only existing accounts can be invited — duplicates are rejected.'}>
+          <Select autoFocus value={inviteUserId} onChange={e=>setInviteUserId(e.target.value)} disabled={directoryLoading}>
+            <option value="">{directoryLoading ? 'Loading…' : 'Select a user…'}</option>
+            {directory.map(u=> (
+              <option key={u.id} value={u.id}>{u.username}{u.role ? ` (${u.role})` : ''}</option>
+            ))}
+          </Select>
         </Field>
         <Field label="Role" className="mt-4"
           hint="Admin manages providers & teams. Member can use the gateway. Readonly is view-only.">
@@ -243,7 +279,7 @@ export default function Teams() {
         {inviteErr && <div className="mt-3"><ErrorNote message={inviteErr}/></div>}
         <div className="flex justify-end gap-2 mt-5">
           <Button variant="ghost" onClick={()=>setInviteOpen(false)} disabled={inviting}>Cancel</Button>
-          <Button variant="primary" onClick={addMember} disabled={inviting}>
+          <Button variant="primary" onClick={addMember} disabled={inviting || !inviteUserId}>
             {inviting ? 'Inviting…' : 'Send invite'}
           </Button>
         </div>

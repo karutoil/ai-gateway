@@ -6,6 +6,9 @@ import {
   TableShell, Th, Td, TableSkeleton, EmptyState, ErrorNote, Modal, Confirm, useToast,
 } from '../components/ui'
 
+/** Roles allowed to mutate keys (mirrors backend RequireRole). */
+const KEY_WRITER_ROLES = ['admin', 'support', 'member']
+
 type EditModalState = {
   id: string
   prefix: string
@@ -17,13 +20,13 @@ type EditModalState = {
   allowed: string[]
 }
 
-type CreateForm = { name: string; rpm: string; rph: string; rpd: string; tpm: string; allowed: string }
+type CreateForm = { name: string; rpm: string; rph: string; rpd: string; tpm: string; allowed: string[] }
 
-const EMPTY_CREATE: CreateForm = { name: '', rpm: '', rph: '', rpd: '', tpm: '', allowed: '' }
+const EMPTY_CREATE: CreateForm = { name: '', rpm: '', rph: '', rpd: '', tpm: '', allowed: [] }
 
-const CREATED_COL = 6
+const CREATED_COL = 7
 
-function ago(iso?: string): string {
+function ago(iso?: string | null): string {
   if (!iso) return '—'
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
   if (s < 60) return 'just now'
@@ -36,7 +39,8 @@ function ago(iso?: string): string {
   return new Date(iso).toLocaleDateString()
 }
 
-export default function Keys(){
+export default function Keys({ role = 'admin' }: { role?: string }){
+  const canWrite = KEY_WRITER_ROLES.includes(role)
   const [list, setList] = useState<any[]>([])
   const [name, setName] = useState('')
   const [newKey, setNewKey] = useState<string | null>(null)
@@ -51,6 +55,7 @@ export default function Keys(){
 
   // presentation-only state (design system): loading skeleton, modals, sticky errors
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [createForm, setCreateForm] = useState<CreateForm>(EMPTY_CREATE)
   const [createBusy, setCreateBusy] = useState(false)
@@ -61,8 +66,8 @@ export default function Keys(){
   const toast = useToast()
 
   const load = () => api.keys.list()
-    .then((r) => { setList(r as any[]); setLoading(false) })
-    .catch(() => setLoading(false))
+    .then((r) => { setList(r as any[]); setLoadError(''); setLoading(false) })
+    .catch((e:any) => { setLoadError(e?.message || String(e)); setLoading(false) })
   useEffect(() => { load() }, [])
 
   const loadModels = async ()=>{
@@ -82,6 +87,14 @@ export default function Keys(){
           const display = providerLabel ? `${providerLabel}/${String(modelId)}` : String(modelId)
           providerIds.push(display)
         }
+      }
+      // Merge catalog ids so keys can restrict to models not yet discovered
+      // from a provider (e.g. freshly synced catalog entries).
+      const catalogRes = await api.catalog.list(undefined, undefined, undefined, 200).catch(()=>null)
+      const catalogArr = (catalogRes as any)?.data ?? catalogRes
+      if(Array.isArray(catalogArr)) for(const m of catalogArr) {
+        const id = m?.model_id || m?.id
+        if(id) providerIds.push(String(id))
       }
       const merged = Array.from(new Set(providerIds)).sort((a,b)=> a.localeCompare(b))
       setAvailableModels(merged)
@@ -114,7 +127,7 @@ export default function Keys(){
       if (parsed === 'invalid') { setCreateError(`${field.toUpperCase()} must be a number.`); return }
       if (typeof parsed === 'number') opts[key] = parsed
     }
-    const allowed = Array.from(new Set(createForm.allowed.split(',').map(t=>t.trim()).filter(Boolean)))
+    const allowed = Array.from(new Set(createForm.allowed))
     if (allowed.length > 0) opts['allowed_models'] = allowed
     setCreateBusy(true)
     try{
@@ -184,7 +197,7 @@ export default function Keys(){
       id: k.id,
       prefix: k.prefix || '',
       name: k.name || '',
-      rpm: String(k.rate_limit_rpm ?? 60),
+      rpm: k.rate_limit_rpm != null ? String(k.rate_limit_rpm) : '',
       rph: k.rate_limit_rph ? String(k.rate_limit_rph) : '',
       rpd: k.rate_limit_rpd ? String(k.rate_limit_rpd) : '',
       tpm: k.rate_limit_tpm ? String(k.rate_limit_tpm) : '',
@@ -204,20 +217,22 @@ export default function Keys(){
       if(original && trimmed !== original.name){
         await api.keys.update(editModal.id, { name: trimmed })
       }
-      const parseIntOrZero = (v:string): number | undefined =>{
+      // Empty string = leave the stored value untouched (omit from the PUT
+      // payload). Sending 0 for RPM would reset it to the 60/min default.
+      const parseIntField = (v:string): number | undefined =>{
         const s = v.trim()
-        if(!s) return 0
+        if(!s) return undefined
         const n = parseInt(s,10)
-        return isNaN(n) ? undefined : n
+        return Number.isNaN(n) ? undefined : n
       }
-      const rpm = parseIntOrZero(editModal.rpm)
-      const rph = parseIntOrZero(editModal.rph)
-      const rpd = parseIntOrZero(editModal.rpd)
-      const tpm = parseIntOrZero(editModal.tpm)
       const payload: Record<string, unknown> = {}
+      const rpm = parseIntField(editModal.rpm)
       if(rpm !== undefined) payload['rate_limit_rpm'] = rpm
+      const rph = parseIntField(editModal.rph)
       if(rph !== undefined) payload['rate_limit_rph'] = rph
+      const rpd = parseIntField(editModal.rpd)
       if(rpd !== undefined) payload['rate_limit_rpd'] = rpd
+      const tpm = parseIntField(editModal.tpm)
       if(tpm !== undefined) payload['rate_limit_tpm'] = tpm
       payload['allowed_models'] = editModal.allowed
       await api.keys.setLimits(editModal.id, payload)
@@ -255,10 +270,23 @@ export default function Keys(){
         actions={
           <>
             <Badge tone="neutral">{list.length} {list.length === 1 ? 'key' : 'keys'}</Badge>
-            <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button>
+            {canWrite && (
+              <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button>
+            )}
           </>
         }
       />
+
+      {loadError && (
+        <Card>
+          <EmptyState
+            icon="alert"
+            title="Could not load API keys"
+            hint={loadError}
+            action={<Button variant="secondary" onClick={load}><Icon name="refresh" size={15}/>Retry</Button>}
+          />
+        </Card>
+      )}
 
       {/* show-once secret — unmissable, secure-feeling */}
       {newKey && (
@@ -297,7 +325,7 @@ export default function Keys(){
       )}
 
       <TableShell>
-        <table className="w-full text-sm min-w-[720px]">
+        <table className="w-full text-sm min-w-[860px]">
           <thead>
             <tr>
               <Th className="w-10">
@@ -308,6 +336,7 @@ export default function Keys(){
               <Th>Prefix</Th>
               <Th>Limits</Th>
               <Th>Created</Th>
+              <Th>Last used</Th>
               <Th className="text-right">Actions</Th>
             </tr>
           </thead>
@@ -324,9 +353,9 @@ export default function Keys(){
                   <Td>
                     <div className="group flex items-center gap-1.5 max-w-[220px]">
                       <span className="font-medium truncate" title={k.name}>{k.name}</span>
-                      {!isSelectMode && (
+                      {canWrite && !isSelectMode && (
                         <button onClick={()=>startEdit(k)} title="Rename"
-                          className="shrink-0 opacity-0 group-hover:opacity-100 text-muted hover:text-paper transition-opacity focus-visible:opacity-100">
+                          className="shrink-0 text-muted hover:text-paper transition-colors focus-visible:text-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal/50 rounded">
                           <Icon name="pencil" size={13} />
                         </button>
                       )}
@@ -356,16 +385,25 @@ export default function Keys(){
                     <span className="text-xs text-muted whitespace-nowrap" title={k.created_at ? new Date(k.created_at).toLocaleString() : ''}>{ago(k.created_at)}</span>
                   </Td>
                   <Td>
-                    <div className="flex items-center justify-end gap-1">
-                      <Button variant="secondary" size="sm" onClick={()=>openEditModal(k)} title="Edit limits & models">
-                        <Icon name="pencil" size={13} /> Edit
-                      </Button>
-                      <Button variant="ghost" size="sm" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
-                        title="Revoke key"
-                        onClick={()=>setConfirmRevoke({ ids: [k.id], label: `"${k.name}"` })}>
-                        <Icon name="trash" size={14} />
-                      </Button>
-                    </div>
+                    <span className="text-xs text-muted whitespace-nowrap" title={k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'never used'}>
+                      {ago(k.last_used_at)}
+                    </span>
+                  </Td>
+                  <Td>
+                    {canWrite ? (
+                      <div className="flex items-center justify-end gap-1">
+                        <Button variant="secondary" size="sm" onClick={()=>openEditModal(k)} title="Edit limits & models">
+                          <Icon name="pencil" size={13} /> Edit
+                        </Button>
+                        <Button variant="ghost" size="sm" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                          title="Revoke key"
+                          onClick={()=>setConfirmRevoke({ ids: [k.id], label: `"${k.name}"` })}>
+                          <Icon name="trash" size={14} />
+                        </Button>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-muted/50">read-only</span>
+                    )}
                   </Td>
                 </tr>
               ))}
@@ -373,8 +411,10 @@ export default function Keys(){
                 <tr>
                   <td colSpan={CREATED_COL}>
                     <EmptyState icon="key" title="No API keys yet"
-                      hint="Generate a key and give it a nickname — nicknames appear in logs and analytics as prefix → nickname."
-                      action={<Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button>} />
+                      hint={canWrite
+                        ? 'Generate a key and give it a nickname — nicknames appear in logs and analytics as prefix → nickname.'
+                        : 'No keys exist yet — ask an admin or support user to create one.'}
+                      action={canWrite ? <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button> : undefined} />
                   </td>
                 </tr>
               )}
@@ -411,10 +451,22 @@ export default function Keys(){
             <p className="text-xs text-muted mt-2">Optional rate limits — blank = unlimited.</p>
           </div>
 
-          <Field label="Allowed models" hint="Comma-separated · exact id or prefix* wildcard · empty = every model allowed.">
-            <Input value={createForm.allowed} onChange={e=>setCreateForm({...createForm, allowed: e.target.value})}
-              placeholder="gpt-4o-mini, Muse-*, openai/gpt-4*" className="font-mono text-xs" spellCheck={false} />
-          </Field>
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-xs font-medium text-muted uppercase tracking-wide">Allowed models</span>
+              <span className="text-[11px] text-muted tabular-nums">{createForm.allowed.length ? `${createForm.allowed.length} restricted` : 'All models allowed'}</span>
+            </div>
+            <ModelCombobox
+              value={createForm.allowed}
+              onChange={v=> setCreateForm(prev=> ({...prev, allowed: v}))}
+              options={availableModels}
+              loading={modelsLoading}
+              placeholder="Search models — e.g. gpt-4o-mini"
+            />
+            <p className="text-[11px] text-muted mt-2 leading-relaxed">
+              Empty = gateway allows every model. Exact id or prefix* wildcard (gpt-4*, Muse-*, openai/gpt-4o-mini). Type a custom wildcard and press Enter.
+            </p>
+          </div>
         </div>
         <div className="flex justify-end gap-2 mt-6">
           <Button variant="ghost" onClick={()=>setCreateOpen(false)} disabled={createBusy}>Cancel</Button>
@@ -470,7 +522,7 @@ export default function Keys(){
                     inputMode="numeric" className="tabular-nums" autoComplete="off" />
                 </Field>
               </div>
-              <p className="text-xs text-muted mt-2">Leave RPH / RPD / TPM empty or 0 for unlimited. RPM defaults to 60.</p>
+              <p className="text-xs text-muted mt-2">Leave a field empty to keep its current value. RPM unset/0 falls back to the 60/min default; RPH / RPD / TPM 0 = unlimited.</p>
             </div>
 
             <div>
