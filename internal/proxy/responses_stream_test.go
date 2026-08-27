@@ -505,11 +505,15 @@ func TestResponsesStreamNativeTricklesFirstChunkEarly(t *testing.T) {
 				fl.Flush()
 			}
 			time.Sleep(100 * time.Millisecond)
+			// Record the timestamp BEFORE the final write: once the client has
+			// read the completed event off the wire, wroteLast is guaranteed
+			// set (TCP causality), so the assertion below can't race the
+			// handler goroutine on a loaded -race runner.
+			wroteLast.Store(time.Now().UnixNano())
 			io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":3,\"total_tokens\":14}}}\n\n")
 			if fl != nil {
 				fl.Flush()
 			}
-			wroteLast.Store(time.Now().UnixNano())
 		},
 	})
 
