@@ -1,5 +1,6 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+import os
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         l=int(self.headers.get('Content-Length',0))
@@ -42,4 +43,9 @@ class H(BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
     def log_message(self, *a): pass
-HTTPServer(("127.0.0.1", 8788), H).serve_forever()
+if __name__ == "__main__":
+    # MOCK_PORT=0 binds an ephemeral port; the chosen port is printed so
+    # launch scripts can discover it. Default 8788 preserves old behavior.
+    srv = HTTPServer(("127.0.0.1", int(os.environ.get("MOCK_PORT", "8788"))), H)
+    print(f"mock_upstream listening on 127.0.0.1:{srv.server_port}", flush=True)
+    srv.serve_forever()

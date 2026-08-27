@@ -115,9 +115,11 @@ Full environment reference:
 ## Using the API
 
 ```bash
-# login
+# login — the dev boot bootstraps a dashboard user (admin / admin123),
+# so the username must be included
 TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" -d '{"password":"admin123"}' | jq -r .token)
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r .token)
 
 # add provider
 curl -X POST http://localhost:8080/api/providers \

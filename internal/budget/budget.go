@@ -204,7 +204,7 @@ func (d *DBLimiter) backfillFromRequestLogs() {
 			return
 		}
 		for _, a := range aggs {
-			d.recordLocked(countersKey(a.prefix), period, start, a.tokens, usdToMicros(a.cost))
+			d.seedLocked(countersKey(a.prefix), period, start, a.tokens, usdToMicros(a.cost))
 		}
 	}
 	seed("day", day)
@@ -223,14 +223,35 @@ func usdToMicros(usd float64) int64 {
 	return int64(m)
 }
 
+// accumulateTail is the ON CONFLICT clause for live usage deltas: on a
+// conflicting (scope,period,start_utc) row the incoming delta is ADDED to the
+// running totals. It deliberately does not use db.UpsertEnd, which renders
+// `SET col=excluded.col` replace semantics — replacing the window total with
+// each request's own delta zeroed out all prior spend after the first write,
+// so admission checks under-counted and quotas never tripped.
+// SQLite ≥3.24 and Postgres share this syntax (via db.Q for placeholders only).
+const accumulateTail = ` ON CONFLICT(scope,period,start_utc) DO UPDATE SET` + `
+	tokens = tokens + excluded.tokens,` + `
+	cost_micros = cost_micros + excluded.cost_micros,` + `
+	updated_at = excluded.updated_at`
+
 // recordLocked atomically accumulates into one (scope, period) row using an
-// UPSERT; SQLite ≥3.24 and Postgres share this syntax (via db.Q rebinding for
-// placeholders only).
+// UPSERT that adds the delta to any existing totals.
 func (d *DBLimiter) recordLocked(scope, period string, start time.Time, tokensDelta int64, costMicrosDelta int64) error {
 	_, err := d.DB.Exec(
-		db.Q(`INSERT INTO spend_counters(scope,period,start_utc,tokens,cost_micros,updated_at) VALUES(?,?,?,?,?,?)`)+
-			db.UpsertEnd([]string{"scope", "period", "start_utc"}, []string{"tokens", "cost_micros", "updated_at"}),
+		db.Q(`INSERT INTO spend_counters(scope,period,start_utc,tokens,cost_micros,updated_at) VALUES(?,?,?,?,?,?)`)+accumulateTail,
 		scope, period, start.Format(time.RFC3339Nano), tokensDelta, costMicrosDelta, time.Now().UTC())
+	return err
+}
+
+// seedLocked seeds a counter row from authoritative history exactly once:
+// an existing row already reflects all live increments, so re-seeding would
+// double-count. Idempotent via DO NOTHING.
+func (d *DBLimiter) seedLocked(scope, period string, start time.Time, tokens, costMicros int64) error {
+	_, err := d.DB.Exec(
+		db.Q(`INSERT INTO spend_counters(scope,period,start_utc,tokens,cost_micros,updated_at) VALUES(?,?,?,?,?,?)`)+
+			` ON CONFLICT(scope,period,start_utc) DO NOTHING`,
+		scope, period, start.Format(time.RFC3339Nano), tokens, costMicros, time.Now().UTC())
 	return err
 }
 

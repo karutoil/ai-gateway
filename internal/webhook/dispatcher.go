@@ -35,9 +35,11 @@ type HTTPDispatcher struct {
 	URL    string
 	Client *http.Client
 
-	queue   chan queuedEvent
-	stop    chan struct{}
-	started sync.Once
+	queue    chan queuedEvent
+	stop     chan struct{}
+	done     chan struct{}
+	started  sync.Once
+	stopOnce sync.Once
 }
 
 type queuedEvent struct {
@@ -69,6 +71,7 @@ func New(url string) Dispatcher {
 		Client: &http.Client{Timeout: WebhookTimeout},
 		queue:  make(chan queuedEvent, QueueDepth),
 		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -110,8 +113,11 @@ func (h *HTTPDispatcher) Emit(event string, payload any) {
 }
 
 // worker drains the queue. Two attempts with backoff keep delivery best-effort
-// without ever stalling callers.
+// without ever stalling callers. On Stop the remaining backlog is flushed with
+// a single best-effort attempt per event so queued audit events are not
+// silently lost at shutdown.
 func (h *HTTPDispatcher) worker() {
+	defer close(h.done)
 	for {
 		select {
 		case ev := <-h.queue:
@@ -120,9 +126,29 @@ func (h *HTTPDispatcher) worker() {
 				h.deliver(ev.event, ev.body)
 			}
 		case <-h.stop:
-			return
+			for {
+				select {
+				case ev := <-h.queue:
+					if !h.deliver(ev.event, ev.body) {
+						h.deliver(ev.event, ev.body) // final attempt, no backoff sleep on shutdown
+					}
+				default:
+					return
+				}
+			}
 		}
 	}
+}
+
+// Stop halts the background worker after draining already-queued events and
+// waits for its exit (each pending delivery is bounded by WebhookTimeout).
+// Safe to call repeatedly or concurrently with Emit; events emitted after Stop
+// are enqueued but no worker remains to deliver them. Exists so embedders and
+// tests can shut down without leaking the worker goroutine.
+func (h *HTTPDispatcher) Stop() {
+	h.started.Do(func() { go h.worker() }) // ensure a worker exists to observe the stop
+	h.stopOnce.Do(func() { close(h.stop) })
+	<-h.done
 }
 
 func (h *HTTPDispatcher) deliver(event string, body []byte) bool {
