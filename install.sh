@@ -165,7 +165,10 @@ detect_platform() {
     aarch64|arm64) ARCH="arm64" ;;
     *) die "unsupported architecture: $(uname -m)" ;;
   esac
-  [ "$OS" = "linux" ] || [ "$OS" = "darwin" ] || die "unsupported OS: $OS"
+  if [ "$OS" != "linux" ]; then
+    warn "this installer ships Linux binaries only (macOS is not built by the release pipeline)"
+    die "detected OS: ${OS} — build from source instead: make release-build (see README)"
+  fi
 }
 
 asset_name() { # asset_name <version>

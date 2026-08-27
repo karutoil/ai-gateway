@@ -8,9 +8,8 @@
 # SQLite statically linked — the binary runs without Go or any dependencies),
 # and publishes a GitHub Release with commit-based notes.
 #
-# Binaries produced:
+# Binaries produced (Linux only):
 #   linux amd64 / arm64  — fully static (musl via zig cc)
-#   macOS amd64 / arm64  — native build (needs macOS system libs only)
 name: Release
 
 'on':
@@ -96,14 +95,6 @@ jobs:
             goos: linux
             goarch: arm64
             cross: zig-aarch64-linux-musl
-          - os: macos-13
-            goos: darwin
-            goarch: amd64
-            cross: native
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-            cross: native
     runs-on: ${{ matrix.os }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -123,7 +114,8 @@ jobs:
           mkdir -p "$HOME/.zig"
           tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig" --strip-components=1
           echo "$HOME/.zig" >> "$GITHUB_PATH"
-          zig version
+          # GITHUB_PATH only applies to later steps, so verify via full path here
+          "$HOME/.zig/zig" version
 
       - name: Download embedded web UI
         uses: actions/download-artifact@v4
