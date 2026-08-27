@@ -2,65 +2,75 @@
 
 > **One domain for every model.** Fast Go gateway + Signal Terminal UI. Bring OpenAI, Anthropic, Azure, Groq — expose OpenAI / Anthropic / Responses compat under one domain.
 
-![Phase](https://img.shields.io/badge/Phase-2_Resilience-2CF6B3) ![Go](https://img.shields.io/badge/Go-1.25-2CF6B3) ![license](https://img.shields.io/badge/license-MIT-lightgrey)
+[![CI](https://github.com/karutoil/ai-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/karutoil/ai-gateway/actions/workflows/ci.yml)
+![Go](https://img.shields.io/badge/Go-1.25-2CF6B3)
 
 ---
 
-## What's working
+## Features
 
-✅ **Models.dev sync** — 6k+ models auto-synced on boot from `https://models.dev/api.json`; `GET /api/models/catalog?q=gpt&provider=openai&reasoning=true`, `POST /api/models/sync`, `GET /api/models/status`.  
-✅ **Virtual Aliases** — `POST /api/models/aliases {"alias":"fast","target":"openai/gpt-4o-mini"}`.  
-✅ **Rich /v1/models** — `id` is `provider/model` (plus `model_id` short name) so harnesses can parse owner vs model. Aliases stay bare.  
-✅ **Token & Cost tracking** — OpenAI + Anthropic usage, catalog $/1M, `GET /api/stats`, `GET /api/logs`.  
-✅ **Rate limiting + budgets** — per-key RPM/RPH/RPD/TPM; daily/monthly token and cost quotas (`429 over_quota_error`).  
-✅ **Resilience** — in-memory/Redis cache (`X-Cache: HIT|MISS`), 2 retries on 5xx/429 (non-stream), circuit breaker (configurable; `health_status=circuit_open`). **Provider failover is disabled by design** — each request is served by exactly one provider (retries hit the same provider only). Load distribution across same-model providers happens via explicit **Routing rules** instead.  
-✅ **Playground** — session JWT can call `/v1/*`; reasoning/advanced options; cached vs live badge.  
-✅ **Control plane** — Providers, keys, users, passkeys, teams/orgs, analytics, settings, admin JWT.  
-✅ **Ops** — `GET /health` (liveness + `db`/`version`), `GET /ready`, `GET /metrics`, `GET /openapi.yaml`.
+**Proxy**
 
----
+✅ **Endpoints** — `POST /v1/chat/completions` (stream + non-stream), `POST /v1/completions`, `POST /v1/embeddings`, `GET /v1/models` (aggregated), `POST /v1/messages` (Anthropic compat), `POST /v1/responses`.  
+✅ **Translation layer** — Anthropic `messages` ↔ OpenAI `chat`, Responses `input` → `messages`, tool-call schemas included.  
+✅ **SSE streaming** — passthru flush, idle-timeout watchdog, usage injection option.
 
-## What's working (Phase 1)
+**Control plane**
 
-✅ **Providers** — CRUD for `openai | anthropic | azure | openai_compatible`, AES-GCM encrypted keys, base URL per provider.  
-✅ **Gateway Keys** — `POST /api/keys` → `sk-gw-...` (hashed SHA256, prefix indexed), list/revoke, `Authorization: Bearer sk-gw-*` for all `/v1/*`.  
-✅ **Proxy + Streaming** — SSE passthru flush, non-stream JSON.  
-✅ **Endpoints:**
-- `POST /v1/chat/completions` (stream + non-stream)
-- `POST /v1/completions`
-- `POST /v1/embeddings`
-- `GET  /v1/models` (aggregated)
-- `POST /v1/messages` (Anthropic compat, translates ↔ OpenAI as needed)
-- `POST /v1/responses` (OpenAI Responses, native or translated to chat)
-✅ **Translation layer** — Anthropic `messages` ↔ OpenAI `chat`, Responses `input` → `messages`.  
-✅ **Admin auth** — `ADMIN_PASSWORD` → `POST /api/auth/login` → JWT, protected `/api/*`, cookie + Bearer.  
-✅ **SQLite** — WAL, migrations, `data/gateway.db` (or `DATABASE_URL=:memory:`), request logs.  
-✅ **Beautiful UI** — React + Vite + Tailwind, Signal Terminal theme (graphite/amber/teal), Dashboard / Providers / Keys / Playground (SSE waveform) / Logs. Embedded into Go binary.
+✅ **Providers** — CRUD for `openai | anthropic | azure | openai_compatible`, AES-GCM encrypted keys, base URL per provider, auto-discovery of available models.  
+✅ **Gateway Keys** — `sk-gw-…` (SHA256-hashed, prefix indexed, shown once), per-key RPM/RPH/RPD/TPM limits, daily/monthly token and cost quotas (`429 over_quota_error`).  
+✅ **Auth** — dashboard password → JWT, **passkeys + recovery codes**, optional OIDC SSO, role-based access control scoped by org/team, session revocation on password/role change.  
+✅ **Catalog** — 6k+ models synced on boot from `https://models.dev/api.json`; virtual aliases (`fast` → `openai/gpt-4o-mini`); rich `/v1/models` output (`provider/model` IDs).  
+✅ **Cost tracking** — OpenAI + Anthropic usage parsed, catalog $/1M pricing, `GET /api/stats`, `GET /api/logs`.
+
+**Resilience & routing**
+
+✅ **Routing rules** — explicit curated provider groups per model with round-robin across requests and down-member skipping. **No silent failover by design**: qualified `provider/model` IDs and `X-Provider:` headers pin requests; retries hit the same provider only.  
+✅ **Cache** — exact-match response cache (in-memory or Redis, `X-Cache: HIT|MISS`).  
+✅ **Circuit breaker** — configurable fails/cooldown/half-open; tripped circuits short-circuit with `circuit_open`.  
+✅ **Retries** — bounded exponential backoff on 5xx/429 for non-streaming requests.
+
+**Ops**
+
+✅ **Observability** — Prometheus `/metrics`, OpenTelemetry support, structured request log with optional body capture and retention purge.  
+✅ **Audit + webhooks** — audit trail plus optional webhook sink for billing export and over-quota events.  
+✅ **Hardening** — refuses to boot with weak config when `ENV=production`; brute-force-rate-limited login/passkey/recovery endpoints; trusted-proxy allowlist.  
+✅ **Health** — `GET /health` (liveness + db), `GET /ready`, `GET /openapi.yaml`.
 
 ---
 
 ## Quick Start
 
-### 1. Build
+Requires Go 1.25+. The repository ships prebuilt UI assets, so you don't need Node unless you want to modify the web UI.
 
 ```bash
-make web      # builds UI into cmd/gateway/web
-make build    # go build -o bin/gateway ./cmd/gateway
-# or
-go build -o /tmp/gateway ./cmd/gateway
+git clone https://github.com/karutoil/ai-gateway && cd ai-gateway
+go build -o bin/gateway ./cmd/gateway    # or: make build
+ADMIN_PASSWORD=admin123 PORT=8080 ./bin/gateway
+# -> http://localhost:8080  (UI)  +  http://localhost:8080/v1/* API
 ```
 
-### 2. Run
+To rebuild the embedded UI after changing it: `make web` (runs `npm ci` + Vite build into `cmd/gateway/web`).
+
+### Docker
 
 ```bash
-ADMIN_PASSWORD=admin123 PORT=8787 ./bin/gateway
-# or
-ADMIN_PASSWORD=admin123 PORT=8787 go run ./cmd/gateway
-# -> http://localhost:8787  (UI)  +  http://localhost:8787/health
+cp .env.example .env                # then edit secrets
+docker compose up --build           # data persisted to ./data
 ```
 
-Env:
-- `PORT` (default 8080)
+Or directly:
+
+```bash
+docker build -t ai-gateway .
+docker run -p 8080:8080 -v gateway-data:/data --env-file .env ai-gateway
+```
+
+The image is Debian slim with CA certs, runs as non-root, and keeps SQLite at `/data/gateway.db` inside the volume. There is no in-image HEALTHCHECK — probe `GET /health` or `GET /ready` from your orchestrator.
+
+Core env vars (full reference below):
+
+- `PORT` (default `8080`)
 - `ADMIN_PASSWORD` (default `admin123`; forbidden as-is when `ENV=production`)
 - `DATABASE_URL` (default `./data/gateway.db`; `postgres://` enables **beta** Postgres — see below)
 
@@ -100,39 +110,41 @@ Full environment reference:
 | `WEBHOOK_URL` | "" | Audit/billing-export/over-quota webhook sink |
 | `OIDC_ISSUER` / `OIDC_CLIENT_ID` | "" | Optional SSO login via OIDC |
 
-### 3. E2E Use
+---
+
+## Using the API
 
 ```bash
 # login
-TOKEN=$(curl -s -X POST http://localhost:8787/api/auth/login \
+TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
   -H "Content-Type: application/json" -d '{"password":"admin123"}' | jq -r .token)
 
 # add provider
-curl -X POST http://localhost:8787/api/providers \
+curl -X POST http://localhost:8080/api/providers \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"openai","type":"openai","api_key":"sk-...","base_url":"https://api.openai.com/v1"}'
 
 # create gateway key (shown once!)
-curl -X POST http://localhost:8787/api/keys \
+curl -X POST http://localhost:8080/api/keys \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"name":"my-key"}' | jq
 # -> sk-gw-...
 
 # use gateway as OpenAI
-curl http://localhost:8787/v1/chat/completions \
+curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk-gw-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
 
 # streaming
-curl http://localhost:8787/v1/chat/completions \
+curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer sk-gw-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
 # Anthropic
-curl http://localhost:8787/v1/messages \
+curl http://localhost:8080/v1/messages \
   -H "Authorization: Bearer sk-gw-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
@@ -191,46 +203,49 @@ Set these **before** pointing real traffic at the gateway. With `ENV=production`
 Client (OpenAI SDK / Anthropic SDK / curl)
    |  Authorization: Bearer sk-gw-*
    v
-[ Chi Router :8787 ]
-  ├─ /health
+[ Chi Router :8080 ]
+  ├─ /health, /ready, /metrics
   ├─ /api/*  (Admin JWT)
-  │    ├─ POST /api/auth/login
-  │    ├─ GET/POST/DELETE /api/providers
-  │    ├─ GET/POST/DELETE /api/keys
-  │    ├─ GET /api/stats, /api/logs
+  │    ├─ POST /api/auth/login (+ passkeys, recovery, OIDC)
+  │    ├─ GET/POST/DELETE /api/providers (incl. discovery)
+  │    ├─ GET/POST/DELETE /api/keys, /api/users, /api/teams
+  │    ├─ GET/PUT/DELETE /api/lb/rules (routing rules)
+  │    ├─ GET /api/models/catalog|aliases|sync (catalog)
+  │    ├─ GET /api/stats, /api/logs, /api/audit
   │    └─ GET /*  (embedded UI)
-  └─ /v1/*  (GatewayAuth: sk-gw-*)
+  └─ /v1/*  (GatewayAuth: sk-gw-* + rate limits + budgets)
        ├─ POST /v1/chat/completions  ──┐
-       ├─ POST /v1/completions        ─┤  translate? → resolve provider by model/prefix
-       ├─ POST /v1/embeddings         ─┤  → decrypt provider key → proxyRequest (SSE-aware)
-       ├─ GET  /v1/models (aggregate) ─┤  → log to request_logs
+       ├─ POST /v1/completions        ─┤  translate? → resolve route/provider
+       ├─ POST /v1/embeddings         ─┤  → decrypt provider key → proxy (SSE-aware,
+       ├─ GET  /v1/models (aggregate) ─┤     retry, breaker, cache) → log usage/cost
        ├─ POST /v1/messages           ─┘
        └─ POST /v1/responses
 
 Provider registry: SQLite + AES-GCM
 ```
 
-See `ARCHITECTURE.md` for full design + Phase 2/3 roadmap.
+See `ARCHITECTURE.md` for design details and history.
 
 ---
 
-## Testing — Phase 1 Proof
+## Testing
 
 ```bash
-go test ./... -v
-# proxy + translate httptest (mock upstream)
-./scripts/smoke.sh        # live health/login/providers/keys/401 check
+make test         # go test ./... -v
+make test-race    # full suite under the race detector
+make lint         # golangci-lint (if installed)
+make smoke        # live smoke: health/login/providers/keys/401 against a running gateway
+make ci           # local parity with GitHub Actions: fmt-check + vet + build + race tests
 ```
 
-Live E2E against mock upstream (8788) validated:
-- `chat/completions` non-stream & stream ✅
-- `completions` ✅
-- `embeddings` ✅
-- `messages` (Anthropic) ✅
-- `models` ✅
-- `responses` ✅
-- `logs` + `stats` ✅
-- 401 without key ✅
+Unit tests run entirely against mock upstreams (httptest) covering streaming, protocol translation, budgets, cache scoping, routing, and more. Live end-to-end tests against a real provider are gated behind the `live` build tag:
+
+```bash
+ADMIN_PASSWORD=admin123 PORT=8989 ./bin/gateway &
+CKFF_API_KEY=sk-your-upstream-key GATEWAY_URL=http://localhost:8989 make e2e-live
+```
+
+There is also a tool-calling harness (`make harness-muse`, `cmd/harness-muse`) that exercises multi-turn + tool-calling behavior through the gateway with real upstreams — see `docs/muse-harness.md`.
 
 ---
 
@@ -238,11 +253,11 @@ Live E2E against mock upstream (8788) validated:
 
 - `web/` — Vite + React + Tailwind + React Router + Zustand
 - Theme: Signal Terminal — graphite `#0F1311`, amber `#FFB84D`, teal `#2CF6B3`, paper `#F8F6F1`, IBM Plex Mono + Fraunces/Inter
-- Pages: Dashboard, Providers, Keys, Playground (SSE waveform, model toggle openai/anthropic/responses), Logs
-- Build outputs to `cmd/gateway/web` and is `embed.FS`ed
+- Pages: Dashboard, Providers, Models (catalog + aliases), Routing, Keys, Playground (SSE waveform, openai/anthropic/responses toggles), Logs, Analytics, Users, Teams, Profile, Settings
+- Built with `make web`, output embedded into the Go binary via `embed.FS`
 
 ```bash
-cd web && npm install && npm run dev   # dev on :5173 proxied to :8787
+cd web && npm install && npm run dev   # dev on :5173 proxied to :8080
 npm run build                          # production embeds
 ```
 
@@ -252,19 +267,37 @@ npm run build                          # production embeds
 
 ```
 ai-gateway/
-  cmd/gateway/main.go
+  cmd/
+    gateway/        # server binary + embedded web assets (embed.FS)
+    harness-muse/   # live tool-calling harness
+    harness/        # generic request harness
+    test_translate/ # translation REPL/probe
   internal/
-    config/ db/ models/ provider/ apikey/ auth/ proxy/ translate/ middleware/ handler/
-  web/ (React)
-  ARCHITECTURE.md  Makefile  scripts/smoke.sh
+    config/         # env parsing, production hardening validation, persistence
+    db/             # SQLite wiring, migrations (00x_*.sql)
+    models/         # shared domain types
+    provider/ apikey/ user/ budget/ catalog/ discovery/
+    auth/           # JWT sessions, passwords, OAuth/OIDC bootstrap
+    passkey/        # WebAuthn registration/login + recovery codes
+    middleware/     # authn/z, rate limiting, roles, header hardening
+    handler/        # admin control-plane routes + routing rules
+    proxy/          # reverse proxy, SSE, caching, retries, breakers, LB routing
+    translate/      # anthropic <-> openai <-> responses protocol translation
+    httperr/ lb/ resilience/ webhook/ audit/ cache/ otel/
+    e2e/            # live E2E (build tag: live)
+  web/              # React dashboard source
+  scripts/          # smoke.sh, dev tooling
+  docs/             # operational guides
+  ARCHITECTURE.md  openapi.yaml  Makefile  Dockerfile  docker-compose.yml
 ```
 
 ---
 
-## Remaining
+## Roadmap
 
-- **Phase 3 polish:** mock-OIDC e2e, Postgres soak-testing (dialect works but remains **beta** — see Quick Start), Stripe billing, OTel traces, region status.
-- Docs in `ARCHITECTURE.md` still describe the original phase buffers; the binary is ahead of that snapshot.
+- Postgres dialect soak-testing (works today but remains **beta** — prefer SQLite)
+- Stripe billing, OTel trace export, mock-OIDC e2e suite
+- Semantics-aware response caching
 
 ---
 
