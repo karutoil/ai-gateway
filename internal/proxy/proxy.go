@@ -2270,6 +2270,16 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		upstreamBody = translated2
 		target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
 		isAnthropicUpstream = true
+	} else {
+		// The translated chat body goes to an OpenAI-compat upstream: apply
+		// the same hygiene as the chat endpoint and strip the provider
+		// prefix (chat does both; responses previously sent
+		// "provider/model" verbatim, which strict/real upstreams reject).
+		upstream := stripProviderPrefix(model, p)
+		if upstream != translate.ExtractModel(upstreamBody) {
+			upstreamBody = replaceModelInBody(upstreamBody, upstream)
+		}
+		upstreamBody = sanitizeOpenAICompatBody(upstreamBody)
 	}
 	if isStream {
 		// Translated-path streaming: force stream:true on the outbound chat

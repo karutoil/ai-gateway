@@ -49,22 +49,23 @@ type OpenAIMessage struct {
 }
 
 type OpenAIChatRequest struct {
-	Model            string            `json:"model"`
-	Messages         []OpenAIMessage   `json:"messages"`
-	Stream           bool              `json:"stream,omitempty"`
-	Temperature      *float64          `json:"temperature,omitempty"`
-	TopP             *float64          `json:"top_p,omitempty"`
-	Stop             interface{}       `json:"stop,omitempty"`
-	MaxTokens        *int              `json:"max_tokens,omitempty"`
-	MaxOutputTokens  *int              `json:"max_output_tokens,omitempty"`
-	Tools            []json.RawMessage `json:"tools,omitempty"`
-	ToolChoice       interface{}       `json:"tool_choice,omitempty"`
-	ReasoningEffort  *string           `json:"reasoning_effort,omitempty"` // low, medium, high, etc. - OpenAI chat
-	Reasoning        *OpenAIReasoning  `json:"reasoning,omitempty"`        // alternative field some clients use
-	ResponseFormat   json.RawMessage   `json:"response_format,omitempty"`  // preserve structured outputs
-	FrequencyPenalty *float64          `json:"frequency_penalty,omitempty"`
-	PresencePenalty  *float64          `json:"presence_penalty,omitempty"`
-	Seed             *int64            `json:"seed,omitempty"`
+	Model             string            `json:"model"`
+	Messages          []OpenAIMessage   `json:"messages"`
+	Stream            bool              `json:"stream,omitempty"`
+	Temperature       *float64          `json:"temperature,omitempty"`
+	TopP              *float64          `json:"top_p,omitempty"`
+	Stop              interface{}       `json:"stop,omitempty"`
+	MaxTokens         *int              `json:"max_tokens,omitempty"`
+	MaxOutputTokens   *int              `json:"max_output_tokens,omitempty"`
+	Tools             []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice        interface{}       `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort   *string           `json:"reasoning_effort,omitempty"` // low, medium, high, etc. - OpenAI chat
+	Reasoning         *OpenAIReasoning  `json:"reasoning,omitempty"`        // alternative field some clients use
+	ResponseFormat    json.RawMessage   `json:"response_format,omitempty"`  // preserve structured outputs
+	FrequencyPenalty  *float64          `json:"frequency_penalty,omitempty"`
+	PresencePenalty   *float64          `json:"presence_penalty,omitempty"`
+	Seed              *int64            `json:"seed,omitempty"`
 }
 
 type OpenAIReasoning struct {
@@ -1016,6 +1017,10 @@ type ResponsesRequest struct {
 	Temperature  *float64         `json:"temperature,omitempty"`
 	MaxTokens    *int             `json:"max_output_tokens,omitempty"`
 	Reasoning    *OpenAIReasoning `json:"reasoning,omitempty"`
+	// Agent-loop + tool fields: dropped silently before this fix.
+	Tools             []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice        json.RawMessage   `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
 	// also support direct reasoning_effort for compatibility
 	ReasoningEffort *string         `json:"reasoning_effort,omitempty"`
 	ResponseFormat  json.RawMessage `json:"response_format,omitempty"`
@@ -1067,6 +1072,44 @@ func ResponsesToChat(body []byte) ([]byte, string, error) {
 	case []interface{}:
 		for _, item := range v {
 			if m, ok := item.(map[string]interface{}); ok {
+				// Agent-loop items that have no role/content of their own.
+				// Before this fix they fell into the generic message branch
+				// below and became user messages with nil content — the tool
+				// call context vanished and tool results were silently
+				// dropped from the conversation.
+				switch itemType, _ := m["type"].(string); itemType {
+				case "function_call":
+					name, _ := m["name"].(string)
+					if name == "" {
+						continue
+					}
+					args, _ := m["arguments"].(string)
+					if args == "" {
+						args = "{}"
+					}
+					callID, _ := m["call_id"].(string)
+					messages = append(messages, OpenAIMessage{
+						Role: "assistant",
+						ToolCalls: []map[string]interface{}{{
+							"id":       callID,
+							"type":     "function",
+							"function": map[string]interface{}{"name": name, "arguments": args},
+						}},
+					})
+					continue
+				case "function_call_output":
+					callID, _ := m["call_id"].(string)
+					messages = append(messages, OpenAIMessage{
+						Role:       "tool",
+						ToolCallID: callID,
+						Content:    functionOutputToText(m["output"]),
+					})
+					continue
+				case "reasoning", "item_reference":
+					// No chat-format counterpart; forwarding them as user
+					// messages injected null-content turns into the convo.
+					continue
+				}
 				role, _ := m["role"].(string)
 				content := m["content"]
 				if role == "" {
@@ -1117,6 +1160,49 @@ func ResponsesToChat(body []byte) ([]byte, string, error) {
 		Temperature: rReq.Temperature,
 		MaxTokens:   rReq.MaxTokens,
 	}
+	// Clients that send legacy max_tokens to /v1/responses still deserve a
+	// working cap instead of a silently-unbounded generation.
+	if oReq.MaxTokens == nil {
+		if mtRaw, ok := raw["max_tokens"]; ok {
+			var mt int
+			if json.Unmarshal(mtRaw, &mt) == nil && mt > 0 {
+				oReq.MaxTokens = &mt
+			}
+		}
+	}
+	if rReq.ParallelToolCalls != nil {
+		oReq.ParallelToolCalls = rReq.ParallelToolCalls
+	}
+	// Responses uses a flat tool shape ({type,name,parameters}); chat uses
+	// {type:"function",function:{...}}. Chat-shaped tools pass through.
+	if len(rReq.Tools) > 0 {
+		chatTools := make([]json.RawMessage, 0, len(rReq.Tools))
+		for _, t := range rReq.Tools {
+			if ct, ok := responsesToolToChat(t); ok {
+				chatTools = append(chatTools, ct)
+			}
+		}
+		if len(chatTools) > 0 {
+			oReq.Tools = chatTools
+		}
+	}
+	if len(rReq.ToolChoice) > 0 && string(rReq.ToolChoice) != "null" {
+		var tcStr string
+		if json.Unmarshal(rReq.ToolChoice, &tcStr) == nil {
+			oReq.ToolChoice = tcStr
+		} else {
+			var tc struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(rReq.ToolChoice, &tc) == nil && tc.Type == "function" && tc.Name != "" {
+				oReq.ToolChoice = map[string]interface{}{
+					"type":     "function",
+					"function": map[string]string{"name": tc.Name},
+				}
+			}
+		}
+	}
 	// Preserve structured output: response_format or text.format
 	if len(rReq.ResponseFormat) > 0 {
 		oReq.ResponseFormat = rReq.ResponseFormat
@@ -1148,6 +1234,86 @@ func ResponsesToAnthropic(body []byte) ([]byte, string, error) {
 	}
 	out, _, err := OpenAIToAnthropic(chatBody)
 	return out, model, err
+}
+
+// responsesToolToChat converts one Responses-API tool definition to chat
+// format. Flat function tools ({type:"function",name,…}) become nested
+// ({type:"function",function:{…}}); already-chat-shaped tools pass through;
+// non-function tool types (web_search, file_search, …) have no chat
+// counterpart and are dropped rather than forwarded to a validator that
+// 400s on unknown tool shapes.
+func responsesToolToChat(t json.RawMessage) (json.RawMessage, bool) {
+	var tm map[string]json.RawMessage
+	if err := json.Unmarshal(t, &tm); err != nil {
+		return nil, false
+	}
+	if _, nested := tm["function"]; nested {
+		return t, true
+	}
+	var tf struct {
+		Type        string          `json:"type"`
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+		Strict      bool            `json:"strict"`
+	}
+	if err := json.Unmarshal(t, &tf); err != nil || tf.Type != "function" || tf.Name == "" {
+		return nil, false
+	}
+	fn := map[string]interface{}{"name": tf.Name}
+	if tf.Description != "" {
+		fn["description"] = tf.Description
+	}
+	if len(tf.Parameters) > 0 && string(tf.Parameters) != "null" {
+		fn["parameters"] = tf.Parameters
+	}
+	if tf.Strict {
+		fn["strict"] = true
+	}
+	return mustJSON(map[string]interface{}{"type": "function", "function": fn}), true
+}
+
+// functionOutputToText flattens a function_call_output's output value into
+// chat tool-message content: strings pass through; arrays of output_text
+// parts are joined; anything else is preserved as its JSON encoding so no
+// tool result is silently lost.
+func functionOutputToText(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case []interface{}:
+		var texts []string
+		sawTextPart := false
+		for _, p := range t {
+			if pm, ok := p.(map[string]interface{}); ok {
+				if pt, _ := pm["type"].(string); pt == "output_text" {
+					if txt, ok := pm["text"].(string); ok {
+						texts = append(texts, txt)
+						sawTextPart = true
+						continue
+					}
+				}
+			}
+			sawTextPart = false
+			break
+		}
+		if sawTextPart && len(texts) > 0 {
+			return strings.Join(texts, "\n")
+		}
+		b, err := json.Marshal(t)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }
 
 // ExtractModel extracts model field from raw json quickly
@@ -1257,4 +1423,14 @@ func TranslateOpenAIErrorToAnthropic(body []byte, status int) []byte {
 		}
 	}
 	return body
+}
+
+// mustJSON marshals v or returns an empty JSON string on failure; only
+// called with JSON-safe values built here.
+func mustJSON(v interface{}) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`""`)
+	}
+	return b
 }
