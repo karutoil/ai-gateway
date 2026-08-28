@@ -255,14 +255,21 @@ func normalizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 			// Other unknown types are tolerated upstream — leave as-is.
 		}
 	}
-	if !changed {
-		return raw, false
-	}
 	if len(parts) == 0 {
-		parts = append(parts, map[string]json.RawMessage{
+		// A natively-empty content array (any role) is rejected upstream
+		// ("Prompt must contain at least one message"). null content never
+		// reaches here (unmarshal of null yields a nil slice, handled above).
+		empty := []map[string]json.RawMessage{{
 			"type": json.RawMessage(`"text"`),
 			"text": json.RawMessage(`""`),
-		})
+		}}
+		if out, err := json.Marshal(empty); err == nil {
+			return out, true
+		}
+		return raw, false
+	}
+	if !changed {
+		return raw, false
 	}
 	out, err := json.Marshal(parts)
 	if err != nil {
@@ -452,6 +459,12 @@ func fixToolCalls(raw json.RawMessage) (json.RawMessage, bool) {
 		if name == "" {
 			changed = true
 			continue
+		}
+		// A tool_call without an id leaves the following tool result
+		// unmatchable; synthesize a deterministic one.
+		if needsToolCallID(c["id"]) {
+			c["id"] = mustJSON(fmt.Sprintf("call_%d", len(out)))
+			changed = true
 		}
 		if _, hasArgs := fn["arguments"]; !hasArgs {
 			fn["arguments"] = json.RawMessage(`"{}"`)

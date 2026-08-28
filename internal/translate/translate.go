@@ -1015,6 +1015,7 @@ type ResponsesRequest struct {
 	Instructions interface{}      `json:"instructions,omitempty"`
 	Stream       bool             `json:"stream,omitempty"`
 	Temperature  *float64         `json:"temperature,omitempty"`
+	TopP         *float64         `json:"top_p,omitempty"`
 	MaxTokens    *int             `json:"max_output_tokens,omitempty"`
 	Reasoning    *OpenAIReasoning `json:"reasoning,omitempty"`
 	// Agent-loop + tool fields: dropped silently before this fix.
@@ -1083,7 +1084,17 @@ func ResponsesToChat(body []byte) ([]byte, string, error) {
 					if name == "" {
 						continue
 					}
-					args, _ := m["arguments"].(string)
+					// Arguments may arrive as a JSON string (spec) or as an
+					// already-parsed object (loose SDKs); stringifying the
+					// latter beats silently dropping the real arguments.
+					var args string
+					if s, ok := m["arguments"].(string); ok {
+						args = s
+					} else if m["arguments"] != nil {
+						if b, err := json.Marshal(m["arguments"]); err == nil {
+							args = string(b)
+						}
+					}
 					if args == "" {
 						args = "{}"
 					}
@@ -1158,6 +1169,7 @@ func ResponsesToChat(body []byte) ([]byte, string, error) {
 		Messages:    messages,
 		Stream:      rReq.Stream,
 		Temperature: rReq.Temperature,
+		TopP:        rReq.TopP,
 		MaxTokens:   rReq.MaxTokens,
 	}
 	// Clients that send legacy max_tokens to /v1/responses still deserve a

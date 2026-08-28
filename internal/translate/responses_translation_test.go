@@ -240,3 +240,30 @@ func TestResponsesToolPassthroughUnchanged(t *testing.T) {
 		t.Fatalf("chat-shaped tools mutated:\n orig=%v\n got =%v", orig, got)
 	}
 }
+
+func FuzzResponsesToChat(f *testing.F) {
+	seeds := []string{
+		`{"model":"m","input":"hi"}`,
+		`{"model":"m","input":[{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}`,
+		`{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":[{"type":"output_text","text":"a"}]}]}`,
+		`{"model":"m","input":[{"type":"reasoning","summary":[]}],"tools":[{"type":"function","name":"f"}]}`,
+		`{"model":"m","input":{"role":"user","content":[{"type":"input_text","text":"x"}]}}`,
+		`{"model":"m","input":[1,2,3]}`,
+		`{"model":"m","input":[null,{"role":5}]}`,
+		`not json`,
+		`{"model":"m","input":"hi","tool_choice":{"type":"function","name":"f"},"max_tokens":5}`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, in string) {
+		out, _, err := ResponsesToChat([]byte(in))
+		if err != nil {
+			return // rejected input is fine
+		}
+		var req OpenAIChatRequest
+		if err := json.Unmarshal(out, &req); err != nil {
+			t.Errorf("ResponsesToChat produced invalid JSON from %q: %v", in, err)
+		}
+	})
+}
