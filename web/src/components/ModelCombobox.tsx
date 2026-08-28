@@ -1,13 +1,25 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
+type Option = string | { value: string; label: string; group?: string }
+
 type Props = {
   value: string[]
   onChange: (next: string[]) => void
-  options: string[]
+  options: Option[]
   placeholder?: string
   disabled?: boolean
   loading?: boolean
+}
+
+// normalizeOptions accepts plain strings (label = value, no group) and
+// richer {value,label,group} objects; grouping is presentation-only.
+function normalizeOptions(options: Option[]): { value: string; label: string; group: string }[] {
+  return options.map(o =>
+    typeof o === 'string'
+      ? { value: o, label: o, group: '' }
+      : { value: o.value, label: o.label || o.value, group: o.group || '' }
+  )
 }
 
 export default function ModelCombobox({ value, onChange, options, placeholder = 'Search models...', disabled, loading }: Props) {
@@ -19,18 +31,21 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
   const dropdownRef = useRef<HTMLDivElement>(null)
   const [rect, setRect] = useState<DOMRect | null>(null)
 
+  const opts = normalizeOptions(options)
   const trimmed = query.trim()
   const showAddCustom = trimmed.length > 0 && !value.includes(trimmed)
   const filtered = (() => {
     const q = query.toLowerCase().trim()
-    if (!q) return options.slice(0, 100)
-    return options.filter(o => o.toLowerCase().includes(q)).slice(0, 100)
+    const match = (o: { value: string; label: string; group: string }) =>
+      o.value.toLowerCase().includes(q) || o.label.toLowerCase().includes(q) || o.group.toLowerCase().includes(q)
+    if (!q) return opts.slice(0, 200)
+    return opts.filter(match).slice(0, 200)
   })()
 
-  type Row = { kind: 'add'; value: string } | { kind: 'opt'; value: string }
+  type Row = { kind: 'add'; value: string } | { kind: 'opt'; value: string; label: string; group: string }
   const rows: Row[] = []
   if (showAddCustom) rows.push({ kind: 'add', value: trimmed })
-  for (const o of filtered) rows.push({ kind: 'opt', value: o })
+  for (const o of filtered) rows.push({ kind: 'opt', value: o.value, label: o.label, group: o.group })
 
   const selectedSet = new Set(value)
 
@@ -156,9 +171,17 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
               const isAdd = r.kind === 'add'
               const isSelected = !isAdd && selectedSet.has(r.value)
               const isActive = idx === highlight
+              // Group header when this row starts a new provider group.
+              const prev = idx > 0 ? rows[idx - 1] : null
+              const showGroup = !isAdd && !!r.group && (!prev || prev.kind === 'add' || prev.group !== r.group)
               return (
+                <div key={`${r.kind}-${r.value}-${idx}`}>
+                  {showGroup && (
+                    <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-amber/80 bg-graphite/40 border-t border-stone/40 first:border-t-0">
+                      {r.group}
+                    </div>
+                  )}
                 <button
-                  key={`${r.kind}-${r.value}`}
                   type="button"
                   onMouseEnter={() => setHighlight(idx)}
                   onMouseDown={e => { e.preventDefault(); if (isAdd) add(r.value); else toggle(r.value) }}
@@ -176,7 +199,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
                         <span className={`w-5 h-5 rounded-md border flex items-center justify-center text-[10px] leading-none shrink-0 ${isSelected ? 'bg-teal border-teal text-ink' : 'border-stone bg-graphite text-transparent'}`}>
                           {isSelected ? '✓' : ''}
                         </span>
-                        <span className="truncate" title={r.value}>{r.value}</span>
+                        <span className="truncate" title={r.value}>{r.label}</span>
                       </>
                     )}
                   </span>
@@ -186,6 +209,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
                     <span className="font-mono text-[10px] text-teal shrink-0">selected</span>
                   ) : null}
                 </button>
+                </div>
               )
             })
           )}

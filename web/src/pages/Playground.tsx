@@ -20,8 +20,6 @@ export default function Playground(){
   const [out, setOut] = useState('')
   const [running, setRunning] = useState(false)
   const [models, setModels] = useState<any[]>([])
-  const [catalogModels, setCatalogModels] = useState<string[]>([])
-  const [catalogInfo, setCatalogInfo] = useState<any>(null)
   const [rawResponse, setRawResponse] = useState('')
   const [cacheStatus, setCacheStatus] = useState('')
   const [fallbackUsed, setFallbackUsed] = useState('')
@@ -43,16 +41,7 @@ export default function Playground(){
       const list = d.data||[]
       setModels(list)
       if(list.length>0 && !model){
-        setModel(list[0].model_id)
-      }
-    }).catch(()=>{})
-    // Merge catalog ids (and aliases resolve through the gateway anyway) so
-    // the picker works even before provider discovery has run.
-    api.catalog.list(undefined, undefined, undefined, 200).then((res:any)=>{
-      const arr = res?.data ?? res
-      if(Array.isArray(arr)){
-        const ids = arr.map((m:any)=> m?.model_id || m?.id).filter(Boolean).map(String)
-        setCatalogModels(ids)
+        setModel(`${list[0].provider_name}/${list[0].model_id}`)
       }
     }).catch(()=>{})
     api.keys.list().then(keys=>{
@@ -60,26 +49,31 @@ export default function Playground(){
     }).catch(()=>{})
   },[])
 
-  useEffect(()=>{
-    const q = model
-    if(!q) return
-    const found = models.find(m=> m.model_id===q || m.id===q)
-    if(found){
-      setCatalogInfo(found)
-      return
-    }
-    api.catalog.get(q).then(setCatalogInfo).catch(()=> setCatalogInfo(null))
-  },[model, models])
+  // The selected value is the provider-prefixed model id ("provider/model"),
+  // which pins requests to the chosen provider even when several providers
+  // serve the same model name.
+  const selectedPair = models.find(m=> `${m.provider_name}/${m.model_id}` === model)
+  const catalogInfo = selectedPair || null
 
   const reasoningLevels = parseLevels(catalogInfo?.reasoning_levels)
   const supportsReasoning = !!(catalogInfo?.reasoning) && reasoningLevels.length > 0
 
-  // Combobox options: distinct discovered model ids merged with catalog ids
-  // (presentation-only mapping).
-  const comboboxOptions = Array.from(new Set([
-    ...models.map(m=> m.model_id).filter(Boolean),
-    ...catalogModels,
-  ] as string[])).sort((a,b)=> a.localeCompare(b))
+  // Picker options: one entry per provider+model pair, grouped by provider.
+  // Same model name on two providers = two separate entries; selecting one
+  // pins requests to that provider via the gateway's provider/model form.
+  const seenPairs = new Set<string>()
+  const comboboxOptions = models
+    .filter(m=>{
+      const key = `${m.provider_name}/${m.model_id}`
+      if(seenPairs.has(key)) return false
+      seenPairs.add(key)
+      return true
+    })
+    .map(m=> ({
+      value: `${m.provider_name}/${m.model_id}`,
+      label: m.model_id,
+      group: m.provider_name,
+    }))
 
   const run = async ()=>{
     setRunning(true); setOut(''); setRawResponse('')
@@ -262,13 +256,14 @@ export default function Playground(){
 
             {catalogInfo && (
               <div className="mt-3 rounded-lg border border-stone bg-app/50 p-3 text-xs space-y-1.5">
-                <div className="font-semibold text-sm">{catalogInfo.display_name || catalogInfo.model_id || catalogInfo.name || catalogInfo.id}</div>
-                <div className="font-mono text-xs text-muted truncate">{catalogInfo.model_id || catalogInfo.id} · {catalogInfo.provider_name || catalogInfo.provider}</div>
+                <div className="font-semibold text-sm">{catalogInfo.display_name || catalogInfo.model_id}</div>
+                <div className="font-mono text-xs text-muted truncate">{catalogInfo.model_id} · via <span className="text-teal">{catalogInfo.provider_name}</span></div>
                 <div className="flex gap-1.5 flex-wrap pt-0.5">
-                  {catalogInfo.context_window && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">ctx {(catalogInfo.context_window/1000).toFixed(0)}k</span>}
-                  {catalogInfo.max_output && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">out {(catalogInfo.max_output/1000).toFixed(0)}k</span>}
+                  {catalogInfo.context_window > 0 && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">ctx {(catalogInfo.context_window/1000).toFixed(0)}k</span>}
+                  {catalogInfo.max_output > 0 && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">out {(catalogInfo.max_output/1000).toFixed(0)}k</span>}
                   {catalogInfo.reasoning && <Badge tone="warn">reasoning: {catalogInfo.reasoning_type||'effort'} {reasoningLevels.join('/')}</Badge>}
-                  {(catalogInfo.input_cost||catalogInfo.output_cost) && <span className="font-mono tabular-nums border border-teal/30 text-teal rounded-full px-2 py-0.5">${catalogInfo.input_cost}/${catalogInfo.output_cost}/1M</span>}
+                  {catalogInfo.tool_call && <Badge tone="good">tools</Badge>}
+                  {(catalogInfo.input_cost>0||catalogInfo.output_cost>0) && <span className="font-mono tabular-nums border border-teal/30 text-teal rounded-full px-2 py-0.5">${catalogInfo.input_cost}/${catalogInfo.output_cost}/1M</span>}
                 </div>
               </div>
             )}
