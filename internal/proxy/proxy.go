@@ -1186,23 +1186,49 @@ func chatToResponsesJSON(body []byte, model string) []byte {
 	if finish != "" && finish != "stop" && finish != "tool_calls" {
 		status = "incomplete"
 	}
-	respObj := map[string]interface{}{
-		"id":         id,
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     status,
-		"model":      model,
-		"output": []map[string]interface{}{
-			{
-				"type":   "message",
-				"id":     "msg_" + uuid.NewString()[:8],
-				"role":   "assistant",
-				"status": "completed",
-				"content": []map[string]interface{}{
-					{"type": "output_text", "text": text, "annotations": []interface{}{}},
-				},
-			},
+	// Tool calls: a chat tool_call must become a Responses function_call
+	// output item, or /v1/responses agents can never see the model's tool
+	// invocations (the pre-fix behavior emitted an empty assistant message
+	// and dropped the calls on the floor).
+	output := []map[string]interface{}{{
+		"type":   "message",
+		"id":     "msg_" + uuid.NewString()[:8],
+		"role":   "assistant",
+		"status": "completed",
+		"content": []map[string]interface{}{
+			{"type": "output_text", "text": text, "annotations": []interface{}{}},
 		},
+	}}
+	if tcs, ok := msg["tool_calls"].([]interface{}); ok {
+		for _, tcRaw := range tcs {
+			tc, ok := tcRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fn, _ := tc["function"].(map[string]interface{})
+			name, _ := fn["name"].(string)
+			if name == "" {
+				continue
+			}
+			args, _ := fn["arguments"].(string)
+			callID, _ := tc["id"].(string)
+			output = append(output, map[string]interface{}{
+				"type":      "function_call",
+				"id":        "fc_" + uuid.NewString()[:8],
+				"call_id":   callID,
+				"name":      name,
+				"arguments": args,
+				"status":    "completed",
+			})
+		}
+	}
+	respObj := map[string]interface{}{
+		"id":          id,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      status,
+		"model":       model,
+		"output":      output,
 		"output_text": text,
 		"usage": map[string]interface{}{
 			"input_tokens":  inTok,

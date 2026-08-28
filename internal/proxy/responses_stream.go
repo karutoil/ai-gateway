@@ -368,6 +368,39 @@ func (s *sseEventWriter) emit(event string, payload map[string]interface{}) {
 
 func (s *sseEventWriter) sample() []byte { return s.buf.Bytes() }
 
+// respToolCall accumulates one streaming tool call (chat delta.tool_calls or
+// an anthropic tool_use block) for re-emission as Responses function_call
+// output items. Without this accumulation a model tool call on
+// /v1/responses vanished mid-stream and agents could never loop.
+type respToolCall struct {
+	itemID  string
+	callID  string
+	name    string
+	args    strings.Builder
+	outIdx  int
+	started bool
+}
+
+// emitToolCallAdded announces a function_call output item the first time a
+// fragment for it arrives.
+func emitToolCallAdded(em *sseEventWriter, acc *respToolCall) {
+	if acc.started {
+		return
+	}
+	acc.started = true
+	em.emit("response.output_item.added", map[string]interface{}{
+		"output_index": acc.outIdx,
+		"item": map[string]interface{}{
+			"id":        acc.itemID,
+			"type":      "function_call",
+			"call_id":   acc.callID,
+			"name":      acc.name,
+			"arguments": "",
+			"status":    "in_progress",
+		},
+	})
+}
+
 // responsesPumpResult carries what pumpResponsesFromStream harvested.
 type responsesPumpResult struct {
 	midStreamFailure bool
@@ -540,7 +573,24 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		completeTok int
 		started     bool // headers committed + created/in_progress emitted
 		blockTypes  = map[int]string{}
+		// Tool-call accumulation (chat delta.tool_calls keyed by their
+		// index; anthropic tool_use blocks keyed by block index).
+		toolCalls = map[int]*respToolCall{}
+		fcOrder   []int
 	)
+
+	toolSlot := func(key int) *respToolCall {
+		if acc, ok := toolCalls[key]; ok {
+			return acc
+		}
+		acc := &respToolCall{
+			itemID: "fc_" + uuid.NewString()[:8],
+			outIdx: len(fcOrder) + 1, // 0 is the message item
+		}
+		toolCalls[key] = acc
+		fcOrder = append(fcOrder, key)
+		return acc
+	}
 
 	responseBase := func(status string) map[string]interface{} {
 		return map[string]interface{}{
@@ -614,6 +664,46 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 				},
 			},
 		})
+		// Close out accumulated tool calls and assemble the final output
+		// array: message item first, then each function_call in arrival
+		// order. The completed frame carries the whole output so clients
+		// can consume tool calls from either the events or the terminal
+		// response object.
+		outputArr := []interface{}{map[string]interface{}{
+			"id":     itemID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []interface{}{
+				map[string]interface{}{"type": "output_text", "text": full, "annotations": []interface{}{}},
+			},
+		}}
+		for _, key := range fcOrder {
+			acc := toolCalls[key]
+			args := acc.args.String()
+			em.emit("response.function_call_arguments.done", map[string]interface{}{
+				"item_id":      acc.itemID,
+				"output_index": acc.outIdx,
+				"arguments":    args,
+			})
+			item := map[string]interface{}{
+				"id":        acc.itemID,
+				"type":      "function_call",
+				"status":    "completed",
+				"arguments": args,
+			}
+			if acc.callID != "" {
+				item["call_id"] = acc.callID
+			}
+			if acc.name != "" {
+				item["name"] = acc.name
+			}
+			em.emit("response.output_item.done", map[string]interface{}{
+				"output_index": acc.outIdx,
+				"item":         item,
+			})
+			outputArr = append(outputArr, item)
+		}
 		usage := map[string]interface{}{
 			"input_tokens":  promptTok,
 			"output_tokens": completeTok,
@@ -621,6 +711,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		}
 		robj := responseBase("completed")
 		robj["usage"] = usage
+		robj["output"] = outputArr
 		em.emit("response.completed", map[string]interface{}{"response": robj})
 
 		cost := h.costForModel(model, promptTok, completeTok)
@@ -680,6 +771,18 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 				cb, _ := m["content_block"].(map[string]interface{})
 				bt, _ := cb["type"].(string)
 				blockTypes[idx] = bt
+				if bt == "tool_use" {
+					// Anthropic tool invocation: capture id/name now, args
+					// arrive as input_json_delta fragments.
+					acc := toolSlot(idx)
+					if id, ok := cb["id"].(string); ok && id != "" {
+						acc.callID = id
+					}
+					if n, ok := cb["name"].(string); ok && n != "" {
+						acc.name = n
+					}
+					emitToolCallAdded(em, acc)
+				}
 			case "content_block_delta":
 				idx := int(toInt(m["index"]))
 				if bt := blockTypes[idx]; bt == "thinking" || bt == "redacted_thinking" {
@@ -687,6 +790,25 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 				}
 				d, _ := m["delta"].(map[string]interface{})
 				dt, _ := d["type"].(string)
+				if bt := blockTypes[idx]; bt == "tool_use" {
+					// Tool arguments stream as partial JSON fragments.
+					if dt == "input_json_delta" {
+						acc := toolCalls[idx]
+						if acc == nil {
+							acc = toolSlot(idx)
+							emitToolCallAdded(em, acc)
+						}
+						if frag, ok := d["partial_json"].(string); ok && frag != "" {
+							acc.args.WriteString(frag)
+							em.emit("response.function_call_arguments.delta", map[string]interface{}{
+								"delta":        frag,
+								"item_id":      acc.itemID,
+								"output_index": acc.outIdx,
+							})
+						}
+					}
+					return
+				}
 				if dt != "text_delta" {
 					return
 				}
@@ -711,6 +833,35 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 						if piece, ok := d["content"].(string); ok && piece != "" {
 							text.WriteString(piece)
 							emitDelta(piece)
+						}
+						// Streaming tool calls: delta.tool_calls entries
+						// carry {index,id,function{name,arguments-frag}}.
+						if tcs, ok := d["tool_calls"].([]interface{}); ok {
+							for _, tcRaw := range tcs {
+								tc, ok := tcRaw.(map[string]interface{})
+								if !ok {
+									continue
+								}
+								idx := int(toInt(tc["index"]))
+								acc := toolSlot(idx)
+								if id, ok := tc["id"].(string); ok && id != "" {
+									acc.callID = id
+								}
+								if fn, ok := tc["function"].(map[string]interface{}); ok {
+									if n, ok := fn["name"].(string); ok && n != "" {
+										acc.name += n
+									}
+									if frag, ok := fn["arguments"].(string); ok && frag != "" {
+										emitToolCallAdded(em, acc)
+										acc.args.WriteString(frag)
+										em.emit("response.function_call_arguments.delta", map[string]interface{}{
+											"delta":        frag,
+											"item_id":      acc.itemID,
+											"output_index": acc.outIdx,
+										})
+									}
+								}
+							}
 						}
 					}
 				}
