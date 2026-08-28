@@ -20,15 +20,29 @@ import (
 type CircuitBreaker interface {
 	Allow(providerID string) bool
 	Record(providerID string, status int)
+	// Release returns a probe slot granted by Allow without classifying the
+	// outcome — for exits that are not the provider's fault (gateway-side
+	// request-build failure, client vanished mid-flight). Never call both
+	// Release and Record for the same admission.
+	Release(providerID string)
 	State(providerID string) string // closed | open | half_open
 }
 
 type breakerState struct {
 	failures      []time.Time
 	openUntil     time.Time
-	probeInFlight int // half-open: probes currently executing (admission gate)
-	probeSuccess  int // consecutive probe successes toward closing
+	probeInFlight int       // half-open: probes currently executing (admission gate)
+	probeSuccess  int       // consecutive probe successes toward closing
+	probeStarted  time.Time // when the current probe slot was granted (leak reclaim)
 }
+
+// defaultProbeReclaimAfter bounds how long a half-open probe slot may stay
+// checked out. A request path that calls Allow but exits without Record
+// (newUpstreamRequest failure, mid-stream death with a vanished client, a
+// recovered panic) used to wedge the circuit open FOREVER: every later Allow
+// saw probeInFlight >= max and denied, with nothing left alive to ever Record.
+// Slots older than this deadline are reclaimed on the next Allow.
+const defaultProbeReclaimAfter = 2 * time.Minute
 
 type MemoryCircuitBreaker struct {
 	mu         sync.Mutex
@@ -108,9 +122,18 @@ func (c *MemoryCircuitBreaker) Allow(providerID string) bool {
 	default:
 		// Cooldown elapsed → half-open. Admit bounded single-flight probes.
 		if s.probeInFlight >= maxHalfOpenConcurrentProbes {
-			return false
+			// Leak reclaim: a slot checked out longer than the deadline can
+			// only belong to a request that died without recording. Take it
+			// back so the circuit can never wedge permanently.
+			if !s.probeStarted.IsZero() && now.Sub(s.probeStarted) >= defaultProbeReclaimAfter {
+				s.probeInFlight = 0
+				s.probeStarted = time.Time{}
+			} else {
+				return false
+			}
 		}
 		s.probeInFlight++
+		s.probeStarted = now
 		return true
 	}
 }
@@ -125,6 +148,7 @@ func (c *MemoryCircuitBreaker) Record(providerID string, status int) {
 		s.probeSuccess = 0
 		if s.probeInFlight > 0 {
 			s.probeInFlight--
+			s.probeStarted = time.Time{}
 			// Probe failed during half-open: reopen immediately.
 			s.openUntil = now.Add(c.openFor)
 			return
@@ -149,6 +173,7 @@ func (c *MemoryCircuitBreaker) Record(providerID string, status int) {
 	if status == 429 {
 		if s.probeInFlight > 0 {
 			s.probeInFlight--
+			s.probeStarted = time.Time{}
 		}
 		return
 	}
@@ -156,6 +181,7 @@ func (c *MemoryCircuitBreaker) Record(providerID string, status int) {
 	// Real success (status < 500).
 	if s.probeInFlight > 0 {
 		s.probeInFlight--
+		s.probeStarted = time.Time{}
 		s.probeSuccess++
 		if s.probeSuccess >= c.closeAfter {
 			s.openUntil = time.Time{}
@@ -175,6 +201,18 @@ func (c *MemoryCircuitBreaker) Record(providerID string, status int) {
 			}
 		}
 		s.failures = kept
+	}
+}
+
+// Release hands back a half-open probe slot without classifying the outcome.
+// No-op when no slot is held or the circuit is fully closed.
+func (c *MemoryCircuitBreaker) Release(providerID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.state(providerID)
+	if s.probeInFlight > 0 {
+		s.probeInFlight--
+		s.probeStarted = time.Time{}
 	}
 }
 

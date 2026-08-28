@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -200,6 +201,7 @@ type noopBreaker struct{}
 
 func (n *noopBreaker) Allow(string) bool   { return true }
 func (n *noopBreaker) Record(string, int)  {}
+func (n *noopBreaker) Release(string)      {}
 func (n *noopBreaker) State(string) string { return "closed" }
 
 func (h *Handler) cacheOrNoop() cache.Cache {
@@ -587,6 +589,9 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	for attempt := 0; ; attempt++ {
 		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, body, isStream, isAnthropicUpstream)
 		if err != nil {
+			// Gateway-side failure, not the provider's — but the half-open
+			// probe slot taken by Allow must go back or the circuit wedges.
+			breaker.Release(providerID)
 			httperr.Write(w, http.StatusInternalServerError, "failed to create upstream request", httperr.TypeProxy)
 			return attemptOutcome{committed: true, status: http.StatusInternalServerError}
 		}
@@ -646,6 +651,10 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				breaker.Record(providerID, midStreamFailStatus)
 			} else if !out.midStreamFailure {
 				breaker.Record(providerID, lastStatus)
+			} else {
+				// Mid-stream death AND the client is gone: not the provider's
+				// fault, but the probe slot still has to go back.
+				breaker.Release(providerID)
 			}
 			return attemptOutcome{committed: true, status: lastStatus}
 		}
@@ -661,6 +670,20 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				continue
 			}
 			return attemptOutcome{committed: false, status: 0, retriable: true}
+		}
+		// Strict upstreams (new-api style) can answer 200 with an EMPTY body
+		// when their channel dies mid-request. Relaying that hands the client
+		// a "success" with no content — and caches it. Treat it as a
+		// transport-level failure: retry, then fail over / 502.
+		if lastStatus == 200 && len(bodyBytes) == 0 {
+			breaker.Record(providerID, 0)
+			lastErr, lastStatus = errEmptyUpstreamBody, 0
+			lastBody = nil
+			if retry.ShouldRetry(attempt, 0) {
+				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
+				continue
+			}
+			return attemptOutcome{committed: false, status: 0, retriable: true, errText: errEmptyUpstreamBody.Error()}
 		}
 		if retry.ShouldRetry(attempt, resp.StatusCode) {
 			breaker.Record(providerID, resp.StatusCode)
@@ -758,6 +781,10 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		return attemptOutcome{committed: true, status: lastStatus}
 	}
 }
+
+// errEmptyUpstreamBody marks an upstream 200 that carried no body — a
+// channel-death signature on new-api style upstreams, not a real completion.
+var errEmptyUpstreamBody = errors.New("upstream returned 200 with empty body")
 
 // retryableCode maps transport failures to a synthetic retry-polling code.
 func retryableCode(status int) int {
@@ -2193,7 +2220,11 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	// For anthropic providers, /v1/responses does not exist — skip native and translate directly
-	if p.Type != models.ProviderAnthropic {
+	if p.Type != models.ProviderAnthropic && h.breakerOrNoop().Allow(p.ID) {
+		// The native probe consumed a breaker admission: every exit below
+		// must either Record (relay success, committed stream) or Release
+		// (fall-through to the translated path). Skipping this check let
+		// /v1/responses hammer an upstream even with the circuit open.
 		target := strings.TrimRight(p.BaseURL, "/") + "/responses"
 		if strings.HasSuffix(p.BaseURL, "/v1") {
 			target = p.BaseURL + "/responses"
@@ -2248,6 +2279,8 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		} else if resp != nil {
 			resp.Body.Close()
 		}
+		// Falling through to the translated path: give the probe slot back.
+		h.breakerOrNoop().Release(p.ID)
 	}
 	translated, _, err := translate.ResponsesToChat(body)
 	if err != nil {
@@ -2296,7 +2329,14 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream)
 		return
 	}
-	h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true})
+	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true})
+	if !out.committed {
+		// Pre-commit terminal failure (e.g. upstream answered 200 with an
+		// empty body): without this, nothing is written and net/http's
+		// implicit 200 + empty body goes out — the exact bug that served
+		// silent empty successes to /v1/responses clients.
+		httperr.Proxy(w, outboundStatus(out.status), "upstream unavailable")
+	}
 }
 
 func replaceModelInBody(body []byte, newModel string) []byte {
