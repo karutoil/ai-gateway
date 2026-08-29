@@ -108,6 +108,19 @@ func streamUsageInjectDefault() bool {
 	return true
 }
 
+// logBodiesDefault: LOG_BODIES defaults to true — the usage log stores
+// request/response bodies (including assembled stream text) truncated to
+// BODY_LOG_MAX_BYTES and credential-scrubbed, which is what makes the Logs
+// page actually useful. Privacy-sensitive deployments can opt out with
+// LOG_BODIES=0/false/off; the gateway then logs metadata only.
+func logBodiesDefault() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOG_BODIES"))) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
 // IsWeakProductionPassword reports whether the config uses the insecure default
 // ADMIN_PASSWORD while ENV==production. Health handlers should expose config_ok accordingly.
 func (c *Config) IsWeakProductionPassword() bool {
@@ -347,7 +360,7 @@ func Load() (*Config, error) {
 		BreakerCooldownSeconds:   getInt("BREAKER_COOLDOWN_SECONDS", 30),
 		BreakerHalfOpenSuccesses: getInt("BREAKER_HALF_OPEN_SUCCESSES", 2),
 
-		LogBodies:        getBool("LOG_BODIES"),
+		LogBodies:        logBodiesDefault(),
 		BodyLogMaxBytes:  getInt("BODY_LOG_MAX_BYTES", 8192),
 		LogRetentionDays: getInt("LOG_RETENTION_DAYS", 0),
 

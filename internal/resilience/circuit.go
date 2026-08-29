@@ -97,9 +97,19 @@ func (c *MemoryCircuitBreaker) state(providerID string) *breakerState {
 	return s
 }
 
-// isFailure classifies an HTTP status for breaker accounting.
+// isFailureStatus classifies an HTTP status for breaker accounting.
 // status == 0 means transport-level failure (connection refused/reset/timeout).
+// IsFailureStatus is the exported form for callers documenting breaker
+// classification invariants in tests.
 func isFailureStatus(status int) bool {
+	return IsFailureStatus(status)
+}
+
+// IsFailureStatus reports whether an upstream status should feed the circuit
+// breaker as a provider failure: transport-level (0) or any 5xx. Client
+// errors (4xx) are the caller's fault and never penalize the provider — a
+// stream of malformed requests must not be able to open the circuit.
+func IsFailureStatus(status int) bool {
 	if status == 0 {
 		return true
 	}

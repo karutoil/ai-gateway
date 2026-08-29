@@ -49,23 +49,24 @@ type OpenAIMessage struct {
 }
 
 type OpenAIChatRequest struct {
-	Model             string            `json:"model"`
-	Messages          []OpenAIMessage   `json:"messages"`
-	Stream            bool              `json:"stream,omitempty"`
-	Temperature       *float64          `json:"temperature,omitempty"`
-	TopP              *float64          `json:"top_p,omitempty"`
-	Stop              interface{}       `json:"stop,omitempty"`
-	MaxTokens         *int              `json:"max_tokens,omitempty"`
-	MaxOutputTokens   *int              `json:"max_output_tokens,omitempty"`
-	Tools             []json.RawMessage `json:"tools,omitempty"`
-	ToolChoice        interface{}       `json:"tool_choice,omitempty"`
-	ParallelToolCalls *bool             `json:"parallel_tool_calls,omitempty"`
-	ReasoningEffort   *string           `json:"reasoning_effort,omitempty"` // low, medium, high, etc. - OpenAI chat
-	Reasoning         *OpenAIReasoning  `json:"reasoning,omitempty"`        // alternative field some clients use
-	ResponseFormat    json.RawMessage   `json:"response_format,omitempty"`  // preserve structured outputs
-	FrequencyPenalty  *float64          `json:"frequency_penalty,omitempty"`
-	PresencePenalty   *float64          `json:"presence_penalty,omitempty"`
-	Seed              *int64            `json:"seed,omitempty"`
+	Model               string            `json:"model"`
+	Messages            []OpenAIMessage   `json:"messages"`
+	Stream              bool              `json:"stream,omitempty"`
+	Temperature         *float64          `json:"temperature,omitempty"`
+	TopP                *float64          `json:"top_p,omitempty"`
+	Stop                interface{}       `json:"stop,omitempty"`
+	MaxTokens           *int              `json:"max_tokens,omitempty"`
+	MaxOutputTokens     *int              `json:"max_output_tokens,omitempty"`
+	MaxCompletionTokens *int              `json:"max_completion_tokens,omitempty"` // newer OpenAI spelling of max_tokens
+	Tools               []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice          interface{}       `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool             `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort     *string           `json:"reasoning_effort,omitempty"` // low, medium, high, etc. - OpenAI chat
+	Reasoning           *OpenAIReasoning  `json:"reasoning,omitempty"`        // alternative field some clients use
+	ResponseFormat      json.RawMessage   `json:"response_format,omitempty"`  // preserve structured outputs
+	FrequencyPenalty    *float64          `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64          `json:"presence_penalty,omitempty"`
+	Seed                *int64            `json:"seed,omitempty"`
 }
 
 type OpenAIReasoning struct {
@@ -720,9 +721,12 @@ func OpenAIToAnthropic(body []byte) ([]byte, string, error) {
 			}
 		}
 	}
-	// max_tokens handling: prefer MaxTokens, fallback MaxOutputTokens
+	// max_tokens handling: prefer MaxTokens, then the newer
+	// max_completion_tokens spelling, then MaxOutputTokens
 	if oReq.MaxTokens != nil {
 		aReq.MaxTokens = *oReq.MaxTokens
+	} else if oReq.MaxCompletionTokens != nil {
+		aReq.MaxTokens = *oReq.MaxCompletionTokens
 	} else if oReq.MaxOutputTokens != nil {
 		aReq.MaxTokens = *oReq.MaxOutputTokens
 	}

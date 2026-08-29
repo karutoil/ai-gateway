@@ -6,11 +6,13 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	pathpkg "path"
 	"strings"
 	"syscall"
 	"time"
@@ -629,8 +631,25 @@ func serveWeb(database *sql.DB) http.HandlerFunc {
 		if path == "" {
 			path = "index.html"
 		}
+		// SPA fallback: unknown paths (client-side routes like /keys) get
+		// index.html. Serve it explicitly — http.FileServer re-resolves
+		// r.URL.Path itself and would 404 the original path.
 		if _, err := fs.Stat(sub, path); err != nil {
-			path = "index.html"
+			// Guard against path traversal ("/../"): only serve the app shell
+			// when the request path is clean.
+			if r.URL.Path != pathpkg.Clean(r.URL.Path) {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			f, err := sub.Open("index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			defer f.Close()
+			_, _ = io.Copy(w, f)
+			return
 		}
 		http.FileServer(http.FS(sub)).ServeHTTP(w, r)
 	}

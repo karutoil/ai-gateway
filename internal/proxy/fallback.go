@@ -252,6 +252,9 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		lastProviderID   string
 		lastProviderName string
 		lastDetail       string
+		// chain records every provider that was tried and failed over from,
+		// persisted onto the final request_logs row's fallback_chain column.
+		chain []providerAttempt
 	)
 
 	for idx, p := range candidates {
@@ -268,7 +271,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		if p.ID != primaryID && idx > 0 && candidates[0] != nil {
 			fallbackName = p.Name
 		}
-		opts := proxyOpts{fallbackFrom: fallbackName}
+		opts := proxyOpts{fallbackFrom: fallbackName, attempts: chain}
 
 		if isStream {
 			outcome := h.proxyWithMetricsOpts(w, r, target, apiKey, outBody, true, model, p.ID, keyPrefix, endpoint, start, isAnth, opts)
@@ -277,11 +280,22 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			if outcome.errSnippet == "" {
 				lastDetail = outcome.errText
 			}
+			// Client-caused 5xx (upstream "invalid_request" semantics):
+			// relay the upstream's verdict — no failover, no generic 502.
+			if outcome.clientCaused {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(outboundStatus(outcome.status))
+				if outcome.errSnippet != "" {
+					_, _ = w.Write([]byte(outcome.errSnippet))
+				}
+				return
+			}
 			if outcome.committed || !outcome.retriable {
 				return // headers already flowed (or hard client-side stop)
 			}
 			log.Info().Str("candidate", p.Name).Str("model", model).Int("status", outcome.status).Str("detail", truncateDetail(lastDetail)).Msg("stream candidate failed pre-commit, failing over")
 			lastFailStatus = outcome.status
+			chain = append(chain, providerAttempt{ProviderID: p.ID, Name: p.Name, Status: outcome.status})
 			continue
 		}
 
@@ -294,8 +308,20 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			if lastDetail == "" {
 				lastDetail = outcome.errText
 			}
+			// Client-caused 5xx (upstream "invalid_request" semantics):
+			// relay the upstream's verdict instead of the retryable-looking
+			// generic envelope.
+			if outcome.clientCaused {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(outboundStatus(outcome.status))
+				if outcome.errSnippet != "" {
+					_, _ = w.Write([]byte(outcome.errSnippet))
+				}
+				return
+			}
 			lastFailStatus = outcome.status
 			if shouldFailoverFrom(outcome.status) {
+				chain = append(chain, providerAttempt{ProviderID: p.ID, Name: p.Name, Status: outcome.status})
 				continue
 			}
 			httperr.Proxy(w, outboundStatus(outcome.status), "upstream unavailable")
@@ -311,6 +337,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		}
 		lastBW, lastProvider = bw, p
 		if shouldFailoverFrom(bw.code) {
+			chain = append(chain, providerAttempt{ProviderID: p.ID, Name: p.Name, Status: bw.code})
 			continue
 		}
 		bw.flushTo(w)
@@ -340,7 +367,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	// request_logs row was written — failures were invisible in the dashboard.
 	// Log the upstream's own answer and persist the failed request.
 	log.Error().Str("provider", lastProviderName).Str("model", model).Str("endpoint", endpoint).Int("upstream_status", lastFailStatus).Str("detail", truncateDetail(lastDetail)).Msg("all provider attempts failed")
-	h.logRequestExtended(keyPrefix, lastProviderID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+	h.logRequestExtendedBodies(keyPrefix, lastProviderID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{FallbackChain: marshalAttemptChain(chain)})
 	httperr.Proxy(w, status, "all provider attempts failed")
 }
 

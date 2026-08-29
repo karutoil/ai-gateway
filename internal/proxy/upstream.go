@@ -190,7 +190,7 @@ func GatewayHTTPClient(transport *http.Transport) *http.Client {
 
 var (
 	ssnLike         = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}`)
-	bearerLike      = regexp.MustCompile(`(?i)(bearer|authorization["':= ]+)[A-Za-z0-9._\-]+`)
+	bearerLike      = regexp.MustCompile(`(?i)(bearer\s+|authorization["':= ]+)[A-Za-z0-9._\-]+`)
 	apiKeyJSONField = regexp.MustCompile(`("(?:api[_-]?key|x-api-key)"\s*:\s*")[^"]+(")`)
 )
 

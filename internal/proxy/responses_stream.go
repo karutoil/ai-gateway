@@ -82,11 +82,8 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	flusher, _ := w.(http.Flusher)
 
 	idle := h.Timeouts.StreamIdle
-	timer := time.NewTimer(idle)
-	if idle <= 0 {
-		timer.Stop() // disabled watchdog
-	}
-	defer timer.Stop()
+	wd := newIdleWatchdog(idle)
+	defer wd.stop()
 
 	chunks := make(chan nativeStreamChunk) // sized copies avoid aliasing
 	go func() {
@@ -108,6 +105,11 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	var promptTok, completionTok int
 	sampleCap := h.sseSampleCap()
 	sample := &bytes.Buffer{}
+	// Assembled-text capture for the usage log (nil when body logging is off).
+	var capture *streamCapture
+	if h.LogBodies {
+		capture = newStreamCapture(h.BodyLogMaxBytes)
+	}
 
 	commit := func() {
 		copyHeader(w.Header(), resp.Header)
@@ -133,6 +135,15 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 			}
 			if bytes.Equal(bytes.TrimSpace(ev.data), []byte("[DONE]")) {
 				continue
+			}
+			var evMap map[string]interface{}
+			if len(ev.data) > 0 && ev.data[0] == '{' {
+				if err := json.Unmarshal(ev.data, &evMap); err != nil {
+					evMap = nil
+				}
+			}
+			if capture != nil {
+				capture.observe(ev, evMap, false)
 			}
 			// Usage lives on response.completed (nested under "response")
 			// for OpenAI and inside message_start/message_delta for exotic
@@ -170,7 +181,7 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		cost := h.costForModel(model, promptTok, completionTok)
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Bool("client_gone", clientGone).Msg("native responses stream terminated abnormally")
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completionTok, cost, true, nil, sample.Bytes())
+		h.logRequestStreamed(keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture)
 		res.committed = true
 		return res
 	}
@@ -184,7 +195,7 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		breaker.Record(providerID, resp.StatusCode)
 		cost := h.costForModel(model, promptTok, completionTok)
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completionTok, cost, true, nil, sample.Bytes())
+		h.logRequestStreamed(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture)
 		res.committed = true
 		return res
 	}
@@ -205,16 +216,11 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 			}
 			return fail("gateway client disconnected", true)
 
-		case <-timer.C:
-			if idle <= 0 {
-				continue // stopped zero-timer never fires; keeps compiler honest
-			}
+		case <-wd.c:
 			return fail("upstream idle timeout: no data received within "+idle.String(), false)
 
 		case cm := <-chunks:
-			if idle > 0 {
-				timer.Reset(idle) // watchdog resets per delivered chunk
-			}
+			wd.reset(idle) // watchdog resets per delivered chunk
 
 			// Process payload FIRST: Read may deliver n>0 together with err==io.EOF.
 			if cm.n > 0 {
@@ -336,6 +342,37 @@ type sseEventWriter struct {
 	seq     int
 	buf     bytes.Buffer
 	cap     int
+}
+
+// idleWatchdog bounds the gap between upstream chunks. A zero/negative idle
+// means "disabled": time.NewTimer(0) fires immediately and Stop() cannot
+// retract the already-queued value, so a disabled watchdog built from
+// NewTimer(0) still spuriously fires once. A nil channel blocks forever when
+// received from in a select — exactly "disabled".
+type idleWatchdog struct {
+	timer *time.Timer
+	c     <-chan time.Time
+}
+
+func newIdleWatchdog(idle time.Duration) *idleWatchdog {
+	if idle <= 0 {
+		return &idleWatchdog{}
+	}
+	t := time.NewTimer(idle)
+	return &idleWatchdog{timer: t, c: t.C}
+}
+
+// reset re-arms the watchdog after each delivered chunk (no-op when disabled).
+func (w *idleWatchdog) reset(idle time.Duration) {
+	if w.timer != nil {
+		w.timer.Reset(idle)
+	}
+}
+
+func (w *idleWatchdog) stop() {
+	if w.timer != nil {
+		w.timer.Stop()
+	}
 }
 
 func newSSEEventWriter(w http.ResponseWriter, h *Handler) *sseEventWriter {
@@ -540,11 +577,8 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 	upstreamCtx := resp.Request.Context()
 
 	idle := h.Timeouts.StreamIdle
-	timer := time.NewTimer(idle)
-	if idle <= 0 {
-		timer.Stop() // disabled watchdog
-	}
-	defer timer.Stop()
+	wd := newIdleWatchdog(idle)
+	defer wd.stop()
 
 	chunks := make(chan nativeStreamChunk)
 	go func() {
@@ -577,6 +611,19 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		// index; anthropic tool_use blocks keyed by block index).
 		toolCalls = map[int]*respToolCall{}
 		fcOrder   []int
+		// streamErrMsg/Code capture an in-band upstream error frame
+		// (chat `{"error":{...}}` / anthropic `event: error`). The stream
+		// must terminate with response.failed carrying the upstream's
+		// message — never launder it into response.completed.
+		streamErrMsg  string
+		streamErrCode string
+		// finishReason captures the upstream's terminal finish_reason
+		// ("length"/"content_filter") so truncation is reported honestly
+		// as response.incomplete instead of a certified-complete response.
+		finishReason string
+		// streamDetail accumulates the usage-log metadata (cache/reasoning
+		// token split + normalized finish reason) harvested from frames.
+		streamDetail usageDetail
 	)
 
 	toolSlot := func(key int) *respToolCall {
@@ -640,6 +687,13 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 
 	finalizeSuccess := func() {
 		full := text.String()
+		// Truncation-aware statuses: a length/content_filter-capped response
+		// is "incomplete" at both the response and message-item level.
+		msgStatus := "completed"
+		switch finishReason {
+		case "length", "content_filter":
+			msgStatus = "incomplete"
+		}
 		em.emit("response.output_text.done", map[string]interface{}{
 			"text":          full,
 			"item_id":       itemID,
@@ -658,7 +712,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 				"id":     itemID,
 				"type":   "message",
 				"role":   "assistant",
-				"status": "completed",
+				"status": msgStatus,
 				"content": []interface{}{
 					map[string]interface{}{"type": "output_text", "text": full, "annotations": []interface{}{}},
 				},
@@ -673,7 +727,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			"id":     itemID,
 			"type":   "message",
 			"role":   "assistant",
-			"status": "completed",
+			"status": msgStatus,
 			"content": []interface{}{
 				map[string]interface{}{"type": "output_text", "text": full, "annotations": []interface{}{}},
 			},
@@ -709,14 +763,47 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			"output_tokens": completeTok,
 			"total_tokens":  promptTok + completeTok,
 		}
+		// Truncation honesty: finish_reason "length"/"content_filter" means
+		// the response is NOT complete — certify it as response.incomplete
+		// with incomplete_details, never as a clean response.completed.
+		// (A truncated json_schema payload marked "completed" is the worst
+		// case: clients parse and trust it.)
+		incompleteReason := ""
+		switch finishReason {
+		case "length":
+			incompleteReason = "max_output_tokens"
+		case "content_filter":
+			incompleteReason = "content_filter"
+		}
+		terminalEvent := "response.completed"
 		robj := responseBase("completed")
+		if incompleteReason != "" {
+			terminalEvent = "response.incomplete"
+			robj = responseBase("incomplete")
+			robj["incomplete_details"] = map[string]interface{}{"reason": incompleteReason}
+		}
 		robj["usage"] = usage
 		robj["output"] = outputArr
-		em.emit("response.completed", map[string]interface{}{"response": robj})
+		em.emit(terminalEvent, map[string]interface{}{"response": robj})
 
 		cost := h.costForModel(model, promptTok, completeTok)
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample())
+		if streamDetail.FinishReason == "" && finishReason != "" {
+			streamDetail.FinishReason = normalizeFinishReason(finishReason)
+		}
+		// Assembled responses payload (output items + usage) is far more
+		// useful in the usage log than the raw SSE sample; keep the sample
+		// as fallback when assembly produced nothing.
+		if assembled, err := json.Marshal(robj); err == nil && len(assembled) > 0 {
+			h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, assembled, &logMeta{
+				FinishReason: streamDetail.FinishReason,
+				CacheRead:    streamDetail.CacheRead,
+				CacheWrite:   streamDetail.CacheWrite,
+				Reasoning:    streamDetail.Reasoning,
+			})
+		} else {
+			h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample())
+		}
 	}
 
 	failTerminated := func(reason, code string, clientGone bool) {
@@ -765,6 +852,13 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 				}
 				if ct > 0 {
 					completeTok = ct
+				}
+				if typ == "message_delta" {
+					if delta, ok := m["delta"].(map[string]interface{}); ok {
+						if s := normalizeFinishReason(delta["stop_reason"]); s != "" {
+							streamDetail.FinishReason = s
+						}
+					}
 				}
 			case "content_block_start":
 				idx := int(toInt(m["index"]))
@@ -820,6 +914,17 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 				emitDelta(piece)
 			case "message_stop":
 				// Terminal marker; completion frames follow below on EOF.
+			case "error":
+				// In-band upstream failure (e.g. overloaded_error). Surface
+				// it as response.failed rather than a clean completion.
+				if e, ok := m["error"].(map[string]interface{}); ok {
+					if msg, ok := e["message"].(string); ok && msg != "" {
+						streamErrMsg = msg
+					}
+					if t, ok := e["type"].(string); ok && t != "" {
+						streamErrCode = t
+					}
+				}
 			}
 			return
 		}
@@ -827,8 +932,27 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		// Chat dialect: bare data frames carrying choices[]/usage.
 		switch typ {
 		case "", "chat.completion.chunk":
+			// In-band error frame: classic OpenAI-style
+			// `data: {"error":{"message":...,"type":...}}` carries no choices.
+			if e, ok := m["error"]; ok && e != nil {
+				switch ev := e.(type) {
+				case map[string]interface{}:
+					if msg, ok := ev["message"].(string); ok && msg != "" {
+						streamErrMsg = msg
+					}
+					if t, ok := ev["type"].(string); ok && t != "" {
+						streamErrCode = t
+					}
+				case string:
+					streamErrMsg = ev
+				}
+				return
+			}
 			if chArr, ok := m["choices"].([]interface{}); ok && len(chArr) > 0 {
 				if c0, ok := chArr[0].(map[string]interface{}); ok {
+					if fr, ok := c0["finish_reason"].(string); ok && fr != "" {
+						finishReason = fr
+					}
 					if d, ok := c0["delta"].(map[string]interface{}); ok {
 						if piece, ok := d["content"].(string); ok && piece != "" {
 							text.WriteString(piece)
@@ -871,12 +995,36 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		// extractUsage understands prompt/completion_tokens AND
 		// input/output_tokens spellings. Zero means "not present here" —
 		// never fabricated.
-		pt, ct := extractUsage(data)
+		pt, ct, ud := extractUsageDetailFromMap(m)
+		if ud.CacheRead+ud.CacheWrite > 0 {
+			// Billing fold: ONLY anthropic cache fields are additive — OpenAI's
+			// prompt_tokens_details.cached_tokens is a breakdown of
+			// prompt_tokens and must not be counted twice.
+			anthropicCache := ud.CacheWrite
+			if usageMap, ok := m["usage"].(map[string]interface{}); ok {
+				if _, hasFlatCache := usageMap["cache_read_input_tokens"]; hasFlatCache {
+					anthropicCache += ud.CacheRead
+				}
+			}
+			pt += anthropicCache
+		}
 		if pt > 0 {
 			promptTok = pt
 		}
 		if ct > 0 {
 			completeTok = ct
+		}
+		if ud.CacheRead > 0 {
+			streamDetail.CacheRead = ud.CacheRead
+		}
+		if ud.CacheWrite > 0 {
+			streamDetail.CacheWrite = ud.CacheWrite
+		}
+		if ud.Reasoning > 0 {
+			streamDetail.Reasoning = ud.Reasoning
+		}
+		if ud.FinishReason != "" {
+			streamDetail.FinishReason = ud.FinishReason
 		}
 	}
 
@@ -899,10 +1047,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			stopSilently()
 			return res
 
-		case <-timer.C:
-			if idle <= 0 {
-				continue // stopped zero-timer never fires; keeps compiler honest
-			}
+		case <-wd.c:
 			resp.Body.Close()
 			drainChan(chunks)
 			res.midStreamFailure = true
@@ -913,9 +1058,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			return res
 
 		case cm := <-chunks:
-			if idle > 0 {
-				timer.Reset(idle) // watchdog resets per delivered chunk
-			}
+			wd.reset(idle) // watchdog resets per delivered chunk
 
 			// Process payload FIRST: Read may deliver n>0 together with err==io.EOF.
 			if cm.n > 0 {
@@ -939,13 +1082,22 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			if cm.err != nil {
 				resp.Body.Close()
 				drainChan(chunks)
-				// Success requires a TRUE io.EOF (properly terminated body);
-				// io.ErrUnexpectedEOF etc. mean the upstream died mid-stream.
-				if started && cm.err == io.EOF {
+				// Success requires a TRUE io.EOF (properly terminated body)
+				// AND no in-band upstream error frame; io.ErrUnexpectedEOF
+				// etc. mean the upstream died mid-stream.
+				if started && cm.err == io.EOF && streamErrMsg == "" {
 					finalizeSuccess()
 					return res
 				}
 				res.midStreamFailure = true
+				if streamErrMsg != "" {
+					// The upstream told us it failed; relay its verdict.
+					if streamErrCode == "" {
+						streamErrCode = "upstream_error"
+					}
+					failTerminated(streamErrMsg, streamErrCode, false)
+					return res
+				}
 				if !started {
 					commitAndStart() // guarantee a parseable transcript
 				}

@@ -43,6 +43,9 @@ var migration008SQL string
 //go:embed migrations/009_lb_rules.sql
 var migration009SQL string
 
+//go:embed migrations/010_usage_logging.sql
+var migration010SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -214,6 +217,7 @@ func Migrate(db *sql.DB) error {
 		{7, migration007SQL},
 		{8, migration008SQL},
 		{9, migration009SQL},
+		{10, migration010SQL},
 	}
 
 	for _, m := range migrations {
@@ -384,6 +388,7 @@ func Migrate(db *sql.DB) error {
 	applyErrorAlters(db)
 	applyGatewayKeyLimitsAlters(db)
 	applyHardeningV2Alters(db)
+	applyUsageLoggingAlters(db)
 	return nil
 }
 
@@ -498,6 +503,22 @@ func applyErrorAlters(db *sql.DB) {
 	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN error TEXT`)
 	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN request_body TEXT`)
 	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN response_body TEXT`)
+}
+
+// applyUsageLoggingAlters adds the per-request usage-metadata columns
+// (finish reason, fallback chain, cache/reasoning token detail) idempotently,
+// mirroring migrations/010_usage_logging.sql for legacy unversioned DBs.
+func applyUsageLoggingAlters(db *sql.DB) {
+	cols := []string{
+		"ALTER TABLE request_logs ADD COLUMN finish_reason TEXT",
+		"ALTER TABLE request_logs ADD COLUMN fallback_chain TEXT",
+		"ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+		"ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER DEFAULT 0",
+		"ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER DEFAULT 0",
+	}
+	for _, stmt := range cols {
+		execAlterIdempotent(db, stmt)
+	}
 }
 
 func applyGatewayKeyLimitsAlters(db *sql.DB) {

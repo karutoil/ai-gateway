@@ -7,7 +7,8 @@ import {
 type Daily = { day: string; tokens: number; cost: number; requests: number }
 type TopModel = { model: string; tokens: number; cost: number; requests: number }
 type TopKey = { key_prefix: string; tokens: number; cost: number; requests: number }
-type Stats = { providers:number; keys:number; requests:number; total_tokens:number; total_cost:number; range:string; daily:Daily[]; top_models:TopModel[]; top_keys:TopKey[]; latency:{p50:number;p95:number;avg:number;count:number}; range_tokens:number; range_cost:number; range_requests:number; range_successful?:number; range_failed?:number; successful?:number; failed?:number; range_ttft_avg?:number; range_tps_avg?:number; ttft?:{avg:number}; tps?:{avg:number} }
+type ErrorRow = { status: number; count: number; sample?: string }
+type Stats = { providers:number; keys:number; requests:number; total_tokens:number; total_cost:number; range:string; daily:Daily[]; top_models:TopModel[]; top_keys:TopKey[]; latency:{p50:number;p95:number;avg:number;count:number}; range_tokens:number; range_cost:number; range_requests:number; range_successful?:number; range_failed?:number; successful?:number; failed?:number; range_ttft_avg?:number; range_tps_avg?:number; ttft?:{avg:number}; tps?:{avg:number}; errors?:ErrorRow[]; cache_hit_rate?:number; cache_read_tokens?:number }
 
 async function fetchStats(range:string):Promise<Stats>{
   // Auth rides on the HttpOnly session cookie sent with same-origin requests.
@@ -21,19 +22,50 @@ async function fetchKeyMap():Promise<Record<string,string>>{
 
 const RANGE_DAYS: Record<'24h'|'7d'|'30d', number> = { '24h': 1, '7d': 7, '30d': 30 }
 
+/** Canonical status coloring: 2xx/3xx good, 4xx warn, 5xx bad (same as Logs). */
+function statusTone(s:number): 'good'|'warn'|'bad' {
+  return s>=500 ? 'bad' : s>=400 ? 'warn' : 'good'
+}
+
+/** Hourly bucket keys look like "2026-01-01T14:00:00Z" (24h range); daily are plain dates. */
+function isHourly(day: string): boolean {
+  return day.includes('T')
+}
+
+/** Bar label: "MM-DD" for daily buckets, "DD HH:00" for hourly ones. */
+function bucketLabel(day: string): string {
+  if (isHourly(day)) return `${day.slice(8, 10)} ${day.slice(11, 13)}:00`
+  return day.slice(5)
+}
+
+/** Hover title for a bucket. */
+function bucketTitle(d: Daily): string {
+  const when = isHourly(d.day) ? d.day.slice(0, 13).replace('T', ' ') + ':00' : d.day
+  return `${when} — ${d.requests} requests · ${d.tokens.toLocaleString()} tokens`
+}
+
 /**
- * Zero-fill missing days so the bar charts always span the selected range —
- * days without traffic render as 0-height bars instead of silently shifting
- * the axis. Bucket keys are UTC day strings, matching the backend grouping.
+ * Zero-fill missing buckets so the bar charts always span the selected range —
+ * gaps render as 0-height bars instead of silently shifting the axis. 24h
+ * ranges use hourly buckets (24 bars); longer ranges use UTC days, matching
+ * the backend grouping.
  */
 function zeroFillDaily(daily: Daily[], range: '24h'|'7d'|'30d'): Daily[] {
-  const byDay = new Map(daily.map(d => [d.day, d]))
-  const days = RANGE_DAYS[range]
+  const byKey = new Map(daily.map(d => [d.day, d]))
   const out: Daily[] = []
   const now = new Date()
+  if (range === '24h') {
+    for (let i = 23; i >= 0; i--) {
+      const t = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours() - i))
+      const key = t.toISOString().slice(0, 13) + ':00:00Z'
+      out.push(byKey.get(key) ?? { day: key, tokens: 0, cost: 0, requests: 0 })
+    }
+    return out
+  }
+  const days = RANGE_DAYS[range]
   for (let i = days - 1; i >= 0; i--) {
     const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - i)).toISOString().slice(0, 10)
-    out.push(byDay.get(day) ?? { day, tokens: 0, cost: 0, requests: 0 })
+    out.push(byKey.get(day) ?? { day, tokens: 0, cost: 0, requests: 0 })
   }
   return out
 }
@@ -83,7 +115,7 @@ function DailyBars({ daily, extract, tip, dim = false }: {
                 style={{ height: `${pct}%` }}
               />
             </div>
-            <span className="font-mono text-[9px] text-muted truncate w-full text-center">{d.day.slice(5)}</span>
+            <span className="font-mono text-[9px] text-muted truncate w-full text-center">{bucketLabel(d.day)}</span>
           </div>
         )
       })}
@@ -155,6 +187,9 @@ export default function Analytics(){
             <Stat icon="alert" title="Fail rate" value={`${failPct}%`} sub={`${(stats as any).range_failed ?? 0} failed in range`} tone="warn"/>
             <Stat icon="pulse" title="P50 / TTFT" value={`${stats.latency?.p50??0}ms`} sub={`TTFT ${(stats as any).range_ttft_avg ? Math.round((stats as any).range_ttft_avg) : 0}ms`} tone="neutral"/>
             <Stat icon="route" title="P95 / TPS" value={`${stats.latency?.p95??0}ms`} sub={`TPS ${(stats as any).range_tps_avg ? (stats as any).range_tps_avg.toFixed(1) : '—'}`} tone="neutral"/>
+            {!!stats.cache_read_tokens && (
+              <Stat icon="zap" title="Cache hits" value={`${((stats.cache_hit_rate ?? 0) * 100).toFixed(1)}%`} sub={`${Number(stats.cache_read_tokens).toLocaleString()} cached tok`} tone="good"/>
+            )}
           </div>
 
           {(stats.range_requests > 0) && (
@@ -174,6 +209,33 @@ export default function Analytics(){
             </Card>
           )}
 
+          {/* Error breakdown: per-status counts with the most recent sample message */}
+          {(stats.errors?.length ?? 0) > 0 && (
+            <Card>
+              <div className="flex items-baseline justify-between gap-3">
+                <h3 className="text-sm font-semibold tracking-tight">Errors</h3>
+                <span className="text-xs text-muted">{stats.range}</span>
+              </div>
+              <div className="mt-3 space-y-2">
+                {(() => {
+                  const maxCount = Math.max(...(stats.errors ?? []).map(e => e.count), 1)
+                  return (stats.errors ?? []).map(e => (
+                    <div key={e.status} className="flex items-center gap-3">
+                      <Badge tone={statusTone(e.status)}>{e.status}</Badge>
+                      <div className="flex-1 h-3 rounded-full bg-app border border-stone overflow-hidden">
+                        <div className="h-full bg-red-500/70 rounded-full" style={{ width: `${Math.max(3, Math.round(e.count / maxCount * 100))}%` }}/>
+                      </div>
+                      <span className="font-mono text-xs tabular-nums text-muted w-16 text-right">{e.count.toLocaleString()}</span>
+                      {e.sample && (
+                        <span className="hidden md:block text-xs text-muted truncate max-w-[280px] font-mono" title={e.sample}>{e.sample}</span>
+                      )}
+                    </div>
+                  ))
+                })()}
+              </div>
+            </Card>
+          )}
+
           {/* Daily charts */}
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
             <Card>
@@ -184,7 +246,7 @@ export default function Analytics(){
               <div className="mt-4">
                 {filledDaily.length===0
                   ? <EmptyState icon="chart" title="No activity in this range"/>
-                  : <DailyBars daily={filledDaily} extract={d=>d.requests} tip={d=>`${d.day} — ${d.requests} requests · ${d.tokens.toLocaleString()} tokens`}/>}
+                  : <DailyBars daily={filledDaily} extract={d=>d.requests} tip={bucketTitle}/>}
               </div>
             </Card>
             <Card>
@@ -195,7 +257,7 @@ export default function Analytics(){
               <div className="mt-4">
                 {filledDaily.length===0
                   ? <EmptyState icon="chart" title="No activity in this range"/>
-                  : <DailyBars daily={filledDaily} dim extract={d=>d.cost} tip={d=>`${d.day} — $${d.cost.toFixed(4)} · ${d.requests} requests`}/>}
+                  : <DailyBars daily={filledDaily} dim extract={d=>d.cost} tip={d=>`${bucketTitle(d)} · $${d.cost.toFixed(4)}`}/>}
               </div>
             </Card>
           </div>

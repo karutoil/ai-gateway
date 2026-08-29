@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // sanitizeOpenAICompatBody normalizes legal-but-sloppy OpenAI chat shapes that
@@ -42,6 +43,18 @@ import (
 // Anything unparseable — or a body without a messages array — is returned
 // unchanged, so opaque or non-chat bodies relay exactly as before.
 func sanitizeOpenAICompatBody(body []byte) []byte {
+	return sanitizeOpenAICompatBodyOpts(body, sanitizeOpts{})
+}
+
+// sanitizeOpts tunes which destructive rewrites apply. keepAttachments=true
+// preserves audio/file/image parts verbatim for upstreams (and models) known
+// to accept them — stripping them silently degrades legal multimodal requests
+// and bills the client for content the model never sees.
+type sanitizeOpts struct {
+	keepAttachments bool
+}
+
+func sanitizeOpenAICompatBodyOpts(body []byte, opts sanitizeOpts) []byte {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {
 		return body
@@ -89,7 +102,7 @@ func sanitizeOpenAICompatBody(body []byte) []byte {
 
 		// 5. content part fixes (all roles)
 		if c, ok := m["content"]; ok {
-			if nc, did := normalizeContentParts(c); did {
+			if nc, did := normalizeContentPartsOpts(c, opts); did {
 				m["content"] = nc
 				msgChanged = true
 			}
@@ -160,6 +173,120 @@ func sanitizeOpenAICompatBody(body []byte) []byte {
 	return out
 }
 
+// validateChatParamTypes rejects wrong-typed sampling/limit params locally
+// with a 400 naming the parameter. Strict-but-confusing upstreams answer these
+// with HTTP 500 "cannot unmarshal number 2.5 into field n of type int" (a
+// retryable-looking 5xx for a deterministic client mistake) or vary by vendor;
+// OpenAI itself 400s ("Invalid type for 'n': expected an integer"). Only type
+// errors are rejected here — out-of-range values stay the upstream's call.
+func validateChatParamTypes(body []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil // opaque body: let the existing pipeline deal with it
+	}
+	// Integer-typed params: OpenAI spec types n / max_tokens /
+	// max_completion_tokens / seed as integers. A float like n:2.5 is a
+	// client error, not a provider failure.
+	for _, param := range []string{"n", "max_tokens", "max_completion_tokens", "seed"} {
+		raw, ok := top[param]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		var i int64
+		if err := json.Unmarshal(raw, &i); err != nil {
+			return fmt.Errorf("invalid type for '%s': expected an integer", param)
+		}
+	}
+	// Float-typed params: strings/objects/bools are never legal.
+	for _, param := range []string{"temperature", "top_p", "frequency_penalty", "presence_penalty"} {
+		raw, ok := top[param]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		var f float64
+		if err := json.Unmarshal(raw, &f); err != nil || strings.Contains(string(raw), "\"") {
+			return fmt.Errorf("invalid type for '%s': expected a number", param)
+		}
+	}
+	// Bool-typed params.
+	for _, param := range []string{"parallel_tool_calls", "logprobs"} {
+		raw, ok := top[param]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		if string(raw) != "true" && string(raw) != "false" {
+			return fmt.Errorf("invalid type for '%s': expected a boolean", param)
+		}
+	}
+	// stop: string or array of strings. Nested arrays / null elements crash
+	// some upstreams outright (new-api: "Panic detected, interface conversion").
+	if raw, ok := top["stop"]; ok && string(raw) != "null" {
+		var s string
+		var arr []json.RawMessage
+		switch {
+		case json.Unmarshal(raw, &s) == nil:
+			// fine
+		case json.Unmarshal(raw, &arr) == nil:
+			for _, el := range arr {
+				var es string
+				if string(el) == "null" || json.Unmarshal(el, &es) != nil {
+					return fmt.Errorf("invalid type for 'stop': expected a string or array of strings")
+				}
+			}
+		default:
+			return fmt.Errorf("invalid type for 'stop': expected a string or array of strings")
+		}
+	}
+	return nil
+}
+
+// intTypeOK reports whether the top-level param, if present and non-null, is
+// JSON integer-typed. Absent/null params are fine.
+func intTypeOK(body []byte, param string) bool {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return true
+	}
+	raw, ok := top[param]
+	if !ok || string(raw) == "null" {
+		return true
+	}
+	var i int64
+	return json.Unmarshal(raw, &i) == nil
+}
+
+// validateResponsesParamTypes is the /v1/responses counterpart of
+// validateChatParamTypes: max_output_tokens must be a positive-integer-typed
+// JSON number (it becomes chat max_tokens downstream, where a string crashes
+// strict upstreams), temperature/top_p must be numbers.
+func validateResponsesParamTypes(body []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil // opaque body
+	}
+	for _, param := range []string{"max_output_tokens", "max_tokens"} {
+		raw, ok := top[param]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		var i int64
+		if err := json.Unmarshal(raw, &i); err != nil {
+			return fmt.Errorf("invalid type for '%s': expected an integer", param)
+		}
+	}
+	for _, param := range []string{"temperature", "top_p"} {
+		raw, ok := top[param]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		var f float64
+		if err := json.Unmarshal(raw, &f); err != nil || strings.Contains(string(raw), "\"") {
+			return fmt.Errorf("invalid type for '%s': expected a number", param)
+		}
+	}
+	return nil
+}
+
 // chatMessagesPresent reports whether the chat body carries a non-empty
 // messages array. Strict upstreams answer a missing/empty array with an
 // opaque 500 "field messages is required"; failing fast here gives clients a
@@ -219,6 +346,14 @@ func stringValue(raw json.RawMessage) (string, bool) {
 // observed to be tolerated upstream are left as-is to keep valid bodies
 // byte-identical.
 func normalizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
+	return normalizeContentPartsOpts(raw, sanitizeOpts{})
+}
+
+// normalizeContentPartsOpts is the capability-aware core of
+// normalizeContentParts. With keepAttachments set, audio and file parts are
+// passed through verbatim (the model is known to accept them) instead of
+// being replaced with "[audio/file attachment omitted]" placeholders.
+func normalizeContentPartsOpts(raw json.RawMessage, opts sanitizeOpts) (json.RawMessage, bool) {
 	var parts []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &parts); err != nil || parts == nil {
 		return raw, false
@@ -233,6 +368,10 @@ func normalizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 			p["type"] = json.RawMessage(`"text"`)
 			changed = true
 		case "input_image", "image":
+			if opts.keepAttachments {
+				// attachment-capable model: keep the part verbatim
+				continue
+			}
 			if norm, ok := normalizeImagePart(p); ok {
 				parts[j] = norm
 			} else {
@@ -240,9 +379,15 @@ func normalizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 			}
 			changed = true
 		case "input_audio", "audio":
+			if opts.keepAttachments {
+				continue
+			}
 			parts[j] = omittedPart("audio")
 			changed = true
 		case "file":
+			if opts.keepAttachments {
+				continue
+			}
 			parts[j] = omittedPart("file")
 			changed = true
 		default:

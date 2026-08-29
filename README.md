@@ -98,7 +98,8 @@ Everything is env-driven (`.env` next to the binary is loaded automatically — 
 | `CORS_ALLOWED_ORIGINS` | `*` (dev) | Comma-separated origins; wildcard rejected in production |
 | `DATABASE_URL` | `./data/gateway.db` | SQLite path, or `postgres://…` DSN (beta) |
 | `REDIS_URL` | "" | Shared cache + rate limiting across replicas |
-| `LOG_BODIES` | `false` | Store request/response bodies (privacy-sensitive) |
+| `LOG_BODIES` | `true` | Store request/response bodies in the usage log — assembled stream text included, truncated to `BODY_LOG_MAX_BYTES` and credential-scrubbed. Opt out (`LOG_BODIES=0`) for metadata-only logging (privacy-sensitive) |
+| `BODY_LOG_MAX_BYTES` | `8192` | Per-body capture cap in bytes for the usage log |
 | `LOG_RETENTION_DAYS` | `0` | Nightly purge of request logs older than N days |
 | `METRICS_PROTECT` | `false` | Require admin auth on `/metrics` |
 

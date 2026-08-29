@@ -18,6 +18,185 @@ function statusTone(s:number): 'good'|'warn'|'bad' {
   return s>=500 ? 'bad' : s>=400 ? 'warn' : 'good'
 }
 
+/* ---------------- Structured message parsing ---------------- */
+
+type ChatMessage = {
+  role: string
+  text: string
+  toolCalls: { id: string; name: string; args: string }[]
+  toolCallId?: string
+  images: string[]
+  thinking?: string
+}
+
+/** Extract readable text from chat content: string or typed-part array. */
+function contentToText(v:any): string {
+  if (typeof v === 'string') return v
+  if (Array.isArray(v)) {
+    return v.map((p:any)=>{
+      if (typeof p === 'string') return p
+      if (p?.type === 'text' || p?.type === 'input_text' || p?.type === 'output_text') return String(p.text ?? '')
+      return ''
+    }).join('')
+  }
+  return ''
+}
+
+/** Collect image references from content parts for placeholder chips. */
+function contentImages(v:any): string[] {
+  if (!Array.isArray(v)) return []
+  const out: string[] = []
+  for (const p of v) {
+    const src = p?.image_url?.url || p?.source?.data || (p?.type === 'image_url' ? p?.image_url : null)
+    if (typeof src === 'string') {
+      const mime = p?.source?.media_type || (src.startsWith('data:') ? src.slice(5, src.indexOf(';')) : 'image')
+      out.push(mime)
+    }
+  }
+  return out
+}
+
+/** Parse a request body (chat messages / anthropic system+messages) into structured messages. */
+function parseRequestMessages(raw:string|undefined|null): ChatMessage[] {
+  if (!raw) return []
+  let body:any
+  try { body = JSON.parse(raw) } catch { return [] }
+  const msgs:any[] = Array.isArray(body?.messages) ? body.messages : []
+  const out: ChatMessage[] = []
+  if (typeof body?.system === 'string' && body.system) {
+    out.push({ role: 'system', text: body.system, toolCalls: [], images: [] })
+  }
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue
+    out.push({
+      role: String(m.role ?? 'user'),
+      text: contentToText(m.content),
+      toolCalls: Array.isArray(m.tool_calls) ? m.tool_calls.map((tc:any)=>({
+        id: String(tc?.id ?? ''), name: String(tc?.function?.name ?? ''), args: String(tc?.function?.arguments ?? ''),
+      })) : [],
+      toolCallId: typeof m.tool_call_id === 'string' ? m.tool_call_id : undefined,
+      images: contentImages(m.content),
+    })
+  }
+  return out
+}
+
+/** Parse a response body (chat completion / anthropic message / assembled stream capture) into messages. */
+function parseResponseMessages(raw:string|undefined|null): ChatMessage[] {
+  if (!raw) return []
+  let body:any
+  try { body = JSON.parse(raw) } catch { return [] }
+  const out: ChatMessage[] = []
+  // chat.completion / assembled stream capture
+  const msg = body?.choices?.[0]?.message
+  if (msg) {
+    out.push({
+      role: String(msg.role ?? 'assistant'),
+      text: contentToText(msg.content),
+      toolCalls: Array.isArray(msg.tool_calls) ? msg.tool_calls.map((tc:any)=>({
+        id: String(tc?.id ?? ''), name: String(tc?.function?.name ?? ''), args: String(tc?.function?.arguments ?? ''),
+      })) : [],
+      images: [],
+    })
+    return out
+  }
+  // anthropic message
+  if (body?.type === 'message' || Array.isArray(body?.content)) {
+    let thinking = ''
+    let text = ''
+    const toolCalls: ChatMessage['toolCalls'] = []
+    for (const b of (Array.isArray(body.content) ? body.content : [])) {
+      if (b?.type === 'text') text += String(b.text ?? '')
+      else if (b?.type === 'thinking') thinking += String(b.thinking ?? '')
+      else if (b?.type === 'tool_use') toolCalls.push({ id: String(b.id ?? ''), name: String(b.name ?? ''), args: JSON.stringify(b.input ?? {}) })
+    }
+    out.push({ role: 'assistant', text, thinking: thinking || undefined, toolCalls, images: [] })
+    return out
+  }
+  // responses API output array
+  if (Array.isArray(body?.output)) {
+    for (const item of body.output) {
+      if (item?.type === 'message') {
+        out.push({ role: 'assistant', text: contentToText(item.content), toolCalls: [], images: [] })
+      } else if (item?.type === 'function_call') {
+        out.push({ role: 'assistant', text: '', toolCalls: [{ id: String(item.call_id ?? item.id ?? ''), name: String(item.name ?? ''), args: String(item.arguments ?? '') }], images: [] })
+      }
+    }
+    return out
+  }
+  return out
+}
+
+const ROLE_TONES: Record<string, 'good'|'warn'|'bad'|'neutral'> = {
+  system: 'neutral', user: 'warn', assistant: 'good', tool: 'bad',
+}
+
+/** One structured chat message: role badge, text, tool-call cards, image chips. */
+function MessageView({ m }: { m: ChatMessage }) {
+  const tone = ROLE_TONES[m.role] ?? 'neutral'
+  return (
+    <div className="rounded-lg border border-stone bg-app p-2.5">
+      <div className="flex items-center gap-2">
+        <Badge tone={tone}>{m.role}</Badge>
+        {m.toolCallId && <span className="font-mono text-[10px] text-muted">tool_call_id: {m.toolCallId}</span>}
+        {m.images.map((mime, i) => (
+          <span key={i} className="text-[10px] font-mono text-muted border border-stone rounded px-1.5 py-0.5">[image: {mime}]</span>
+        ))}
+      </div>
+      {m.thinking && (
+        <pre className="mt-2 font-mono text-[11px] text-muted whitespace-pre-wrap break-words border-l-2 border-stone pl-2">{m.thinking}</pre>
+      )}
+      {m.text && <pre className="mt-1.5 text-xs whitespace-pre-wrap break-words font-sans">{m.text.length > 4000 ? m.text.slice(0, 4000) + '…' : m.text}</pre>}
+      {m.toolCalls.map((tc, i)=>(
+        <div key={i} className="mt-2 rounded-md border border-teal/30 bg-teal/5 p-2">
+          <div className="flex items-center gap-2 text-[11px] font-mono text-teal">
+            <Icon name="route" size={12}/> {tc.name || 'tool_call'}
+            {tc.id && <span className="text-muted">{tc.id}</span>}
+          </div>
+          {tc.args && (
+            <pre className="mt-1 font-mono text-[11px] whitespace-pre-wrap break-all text-muted">
+              {(() => { try { return JSON.stringify(JSON.parse(tc.args), null, 2) } catch { return tc.args } })()}
+            </pre>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Structured request+response message panes for the detail modal. */
+function MessagePanes({ requestBody, responseBody }: { requestBody?: string; responseBody?: string }) {
+  const reqMsgs = parseRequestMessages(requestBody)
+  const respMsgs = parseResponseMessages(responseBody)
+  if (reqMsgs.length === 0 && respMsgs.length === 0) return <></>
+  return (
+    <div className="grid md:grid-cols-2 gap-3">
+      {reqMsgs.length > 0 && (
+        <div className="rounded-xl border border-stone bg-raised p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-muted">Request messages</div>
+            <CopyButton value={requestBody || ''} label="Copy raw"/>
+          </div>
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {reqMsgs.map((m, i)=><MessageView key={i} m={m}/>)}
+          </div>
+        </div>
+      )}
+      {respMsgs.length > 0 && (
+        <div className="rounded-xl border border-stone bg-raised p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs text-muted">Response messages</div>
+            <CopyButton value={responseBody || ''} label="Copy raw"/>
+          </div>
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {respMsgs.map((m, i)=><MessageView key={i} m={m}/>)}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** Detail body rendered inside the request modal. */
 function DetailBody({ detail, selected, keyMap }: {
   detail: any; selected: any; keyMap: Record<string,string>
@@ -85,6 +264,40 @@ function DetailBody({ detail, selected, keyMap }: {
           </div>
         </div>
       </div>
+
+      {/* Usage metadata: finish reason + cache/reasoning token split */}
+      {((detail.log?.finish_reason ?? (detail as any).finish_reason) || (detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) || (detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens) || (detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens)) && (
+        <div className="rounded-xl border border-stone bg-raised p-3">
+          <div className="text-xs text-muted mb-2">Usage metadata</div>
+          <div className="flex flex-wrap gap-2">
+            {(detail.log?.finish_reason ?? (detail as any).finish_reason) && (
+              <Badge tone="neutral">finish: {detail.log?.finish_reason ?? (detail as any).finish_reason}</Badge>
+            )}
+            {!!(detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) && (
+              <Badge tone="good">cache read: {(detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens).toLocaleString()}</Badge>
+            )}
+            {!!(detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens) && (
+              <Badge tone="warn">cache write: {(detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens).toLocaleString()}</Badge>
+            )}
+            {!!(detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens) && (
+              <Badge tone="neutral">reasoning: {(detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens).toLocaleString()}</Badge>
+            )}
+          </div>
+          {Array.isArray((detail as any).fallback_chain) && (detail as any).fallback_chain.length > 0 && (
+            <div className="mt-2 space-y-1">
+              <div className="text-xs text-muted">Fallback chain — attempted before success:</div>
+              {(detail as any).fallback_chain.map((a:any, i:number)=>(
+                <div key={i} className="font-mono text-[11px] text-muted flex items-center gap-2">
+                  <Icon name="alert" size={11}/>{a.name || a.provider_id} <Badge tone={statusTone(Number(a.status)||500)}>{String(a.status)}</Badge>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Structured message view — the actual conversation */}
+      <MessagePanes requestBody={detail.log?.request_body || (detail as any).request_body} responseBody={detail.log?.response_body || (detail as any).response_body}/>
 
       {(detail.log?.error || detail.error || selected.error) && (
         <div className="border border-red-500/30 bg-red-500/10 rounded-xl p-3">

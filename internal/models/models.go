@@ -78,6 +78,11 @@ type RequestLog struct {
 	Error            string    `json:"error,omitempty"`
 	RequestBody      string    `json:"request_body,omitempty"`
 	ResponseBody     string    `json:"response_body,omitempty"`
+	FinishReason     string    `json:"finish_reason,omitempty"`
+	FallbackChain    string    `json:"fallback_chain,omitempty"`
+	CacheReadTokens  int       `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int       `json:"cache_write_tokens,omitempty"`
+	ReasoningTokens  int       `json:"reasoning_tokens,omitempty"`
 }
 
 // CatalogModel is enriched from models.dev

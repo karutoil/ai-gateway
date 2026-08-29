@@ -765,7 +765,13 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// daily buckets GROUP BY day
+	// daily buckets GROUP BY day — hourly (strftime bucket) for 24h so the
+	// chart isn't a single bar, daily otherwise. Hour bucket keys carry a
+	// "T…Z" ISO fragment so clients can label them distinctly.
+	bucketExpr := "date(created_at)"
+	if rng == "24h" {
+		bucketExpr = `strftime('%Y-%m-%dT%H:00:00Z', created_at)`
+	}
 	type daily struct {
 		Day      string  `json:"day"`
 		Tokens   int64   `json:"tokens"`
@@ -773,7 +779,7 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		Requests int64   `json:"requests"`
 	}
 	var dailyRows []daily
-	rows, err := h.DB.Query(db.Q(`SELECT date(created_at) as day, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ?`+orgFilter+` GROUP BY date(created_at) ORDER BY day`), append([]any{start}, orgArgs...)...)
+	rows, err := h.DB.Query(db.Q(`SELECT `+bucketExpr+` as day, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ?`+orgFilter+` GROUP BY `+bucketExpr+` ORDER BY day`), append([]any{start}, orgArgs...)...)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
@@ -882,6 +888,41 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE status < 400`+orgFilter), orgArgs...).Scan(&totalSuccessful)
 	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE status >= 400`+orgFilter), orgArgs...).Scan(&totalFailed)
 
+	// error breakdown for the range: count per status code with a sample
+	// error message (most recent error text seen for that status).
+	type errRow struct {
+		Status int    `json:"status"`
+		Count  int64  `json:"count"`
+		Sample string `json:"sample,omitempty"`
+	}
+	var errorRows []errRow
+	rows5, err5 := h.DB.Query(db.Q(`SELECT status, COUNT(*), (SELECT rl2.error FROM request_logs rl2 WHERE rl2.status=rl.status AND rl2.error IS NOT NULL AND rl2.created_at>=?`+orgFilter+` ORDER BY rl2.created_at DESC LIMIT 1) FROM request_logs rl WHERE rl.created_at >= ? AND rl.status >= 400`+orgFilter+` GROUP BY rl.status ORDER BY COUNT(*) DESC LIMIT 10`), append([]any{start, start}, orgArgs...)...)
+	if err5 == nil {
+		defer rows5.Close()
+		for rows5.Next() {
+			var e errRow
+			var status sql.NullInt64
+			var sample sql.NullString
+			if err := rows5.Scan(&status, &e.Count, &sample); err == nil && status.Valid {
+				e.Status = int(status.Int64)
+				e.Sample = sample.String
+				errorRows = append(errorRows, e)
+			}
+		}
+	}
+	if errorRows == nil {
+		errorRows = []errRow{}
+	}
+
+	// cache hit rate over the range: share of billed prompt tokens served
+	// from the provider's prompt cache (0 when no cache data exists).
+	var cacheReadSum, promptSum sql.NullInt64
+	h.DB.QueryRow(db.Q(`SELECT COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(prompt_tokens),0) FROM request_logs WHERE created_at >= ?`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&cacheReadSum, &promptSum)
+	cacheRate := 0.0
+	if promptSum.Int64 > 0 {
+		cacheRate = float64(cacheReadSum.Int64) / float64(promptSum.Int64)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"providers":       providerCount,
@@ -908,15 +949,18 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		"tps": map[string]interface{}{
 			"avg": avgTPS.Float64,
 		},
-		"successful":       totalSuccessful,
-		"failed":           totalFailed,
-		"range_successful": successful,
-		"range_failed":     failed,
-		"range_ttft_avg":   avgTTFT.Float64,
-		"range_tps_avg":    avgTPS.Float64,
-		"range_tokens":     rangeTokens.Int64,
-		"range_cost":       rangeCost.Float64,
-		"range_requests":   rangeCount,
+		"successful":        totalSuccessful,
+		"failed":            totalFailed,
+		"range_successful":  successful,
+		"range_failed":      failed,
+		"range_ttft_avg":    avgTTFT.Float64,
+		"range_tps_avg":     avgTPS.Float64,
+		"range_tokens":      rangeTokens.Int64,
+		"range_cost":        rangeCost.Float64,
+		"range_requests":    rangeCount,
+		"errors":            errorRows,
+		"cache_hit_rate":    cacheRate,
+		"cache_read_tokens": cacheReadSum.Int64,
 	})
 }
 
@@ -1063,17 +1107,19 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 	var l models.RequestLog
 	var ttft sql.NullInt64
 	var errStr, reqBody, respBody sql.NullString
+	var finishReason, fallbackChain sql.NullString
+	var cacheRead, cacheWrite, reasoning sql.NullInt64
 	var q string
 	if orgID != "" {
-		q = db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.request_body,rl.response_body FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE rl.id=? AND p.org_id=?`)
+		q = db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.request_body,rl.response_body,rl.finish_reason,rl.fallback_chain,rl.cache_read_tokens,rl.cache_write_tokens,rl.reasoning_tokens FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE rl.id=? AND p.org_id=?`)
 	} else {
-		q = db.Q(`SELECT id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,error,request_body,response_body FROM request_logs WHERE id=?`)
+		q = db.Q(`SELECT id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,error,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens FROM request_logs WHERE id=?`)
 	}
 	args := []any{id}
 	if orgID != "" {
 		args = append(args, orgID)
 	}
-	err := h.DB.QueryRow(q, args...).Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &ttft, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream, &errStr, &reqBody, &respBody)
+	err := h.DB.QueryRow(q, args...).Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &ttft, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream, &errStr, &reqBody, &respBody, &finishReason, &fallbackChain, &cacheRead, &cacheWrite, &reasoning)
 	if err != nil {
 		// Fallback without ttft/error — still org-scoped.
 		var ferr error
@@ -1099,6 +1145,21 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 		if respBody.Valid {
 			l.ResponseBody = respBody.String
 		}
+		if finishReason.Valid {
+			l.FinishReason = finishReason.String
+		}
+		if fallbackChain.Valid {
+			l.FallbackChain = fallbackChain.String
+		}
+		if cacheRead.Valid {
+			l.CacheReadTokens = int(cacheRead.Int64)
+		}
+		if cacheWrite.Valid {
+			l.CacheWriteTokens = int(cacheWrite.Int64)
+		}
+		if reasoning.Valid {
+			l.ReasoningTokens = int(reasoning.Int64)
+		}
 	}
 	// Enrich with provider name and key name
 	var providerName sql.NullString
@@ -1114,6 +1175,20 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 		"error":         l.Error,
 		"request_body":  l.RequestBody,
 		"response_body": l.ResponseBody,
+		"finish_reason": l.FinishReason,
+		"fallback_chain": func() any {
+			if l.FallbackChain == "" {
+				return nil
+			}
+			var chain []map[string]any
+			if json.Unmarshal([]byte(l.FallbackChain), &chain) == nil {
+				return chain
+			}
+			return l.FallbackChain
+		}(),
+		"cache_read_tokens":  l.CacheReadTokens,
+		"cache_write_tokens": l.CacheWriteTokens,
+		"reasoning_tokens":   l.ReasoningTokens,
 	}
 	if l.LatencyMs > 0 && l.TotalTokens > 0 {
 		extra["tps"] = float64(l.TotalTokens) / (float64(l.LatencyMs) / 1000.0)
