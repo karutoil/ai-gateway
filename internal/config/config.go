@@ -69,6 +69,12 @@ type Config struct {
 	// some upstreams reject unknown params so it stays off by default).
 	StreamUsageInject bool
 
+	// RoutingLegacyFallback restores pre-strategy heuristic model resolution
+	// (provider_models ownership round-robin, name heuristics, default
+	// provider) for bare model names with no routing rule. Default off:
+	// unrouted bare models are rejected with 404 model_not_routed.
+	RoutingLegacyFallback bool
+
 	MetricsRequireAuth bool
 }
 
@@ -369,6 +375,10 @@ func Load() (*Config, error) {
 		// client asked for include_usage). Set STREAM_USAGE_INJECT=0 to restore
 		// byte-pure pass-through at the cost of zero usage on such streams.
 		StreamUsageInject: streamUsageInjectDefault(),
+
+		// ROUTING_LEGACY_FALLBACK=true restores heuristic resolution for
+		// bare model names with no routing rule (migration escape hatch).
+		RoutingLegacyFallback: getBool("ROUTING_LEGACY_FALLBACK"),
 
 		MetricsRequireAuth: getBool("METRICS_PROTECT"),
 	}

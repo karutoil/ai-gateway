@@ -75,11 +75,11 @@ SDKs only need a `baseURL` change plus your `sk-gw-*` key. OpenAI, Anthropic (`/
 - **Gateway keys** — `sk-gw-*`, per-key rate limits and token/cost quotas
 - **Auth** — dashboard JWT, passkeys + recovery codes, optional OIDC SSO, org/team RBAC
 - **Catalog** — 6k+ models with $/1M pricing; virtual aliases (`fast` → `openai/gpt-4o-mini`)
-- **Routing** — explicit curated provider groups per model, round-robin, down-member skipping, **no silent failover by design**
+- **Routing** — curated provider groups per model with selectable strategies: round-robin, random, weighted (per-member 1–100), or failover (priority order); per-member model overrides; down-member and open-circuit skipping; unrouted bare model names are rejected (`model_not_routed`) unless `ROUTING_LEGACY_FALLBACK=true`
 - **Resilience** — circuit breaker, bounded retries, exact-match response cache (in-memory or Redis)
 - **Ops** — Prometheus `/metrics`, OpenTelemetry scaffold, request logs with retention purge, audit trail + webhooks, production hardening that refuses weak configs
 
-Routing in one line: bare model names follow routing rules (Dashboard → *Routing*); `openai/gpt-4o-mini` **pins** the provider; `X-Provider:` header pins hardest; a failing member returns its own error — remove it from the group instead of hoping for failover.
+Routing in one line: bare model names follow routing rules (Dashboard → *Routing*, which fetches each provider's model list via its API); `openai/gpt-4o-mini` **pins** the provider; `X-Provider:` header pins hardest; non-failover strategies serve each request with one member — a failing member returns its own error (use the `failover` strategy to walk members in order).
 
 ---
 
@@ -102,6 +102,7 @@ Everything is env-driven (`.env` next to the binary is loaded automatically — 
 | `BODY_LOG_MAX_BYTES` | `8192` | Per-body capture cap in bytes for the usage log |
 | `LOG_RETENTION_DAYS` | `0` | Nightly purge of request logs older than N days |
 | `METRICS_PROTECT` | `false` | Require admin auth on `/metrics` |
+| `ROUTING_LEGACY_FALLBACK` | `false` | Restore pre-strategy heuristic resolution (provider-models ownership, name heuristics, default provider) for bare model names with no routing rule. Default off: unrouted bare models get `404 model_not_routed` |
 
 Full reference: `.env.example` (covers timeouts, retries, breaker tuning, webhooks, OIDC).
 

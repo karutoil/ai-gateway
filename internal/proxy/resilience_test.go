@@ -38,7 +38,7 @@ func setupResilienceServer(t *testing.T, upstream http.HandlerFunc) (*httptest.S
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	h.Cache = cache.NewMemoryCache(32)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 2, BaseDelay: time.Millisecond}
 	h.Breaker = resilience.NewMemoryCircuitBreaker(5, time.Minute, 30*time.Second)
@@ -349,7 +349,7 @@ func TestFallbackProviderOn503(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 0, BaseDelay: time.Millisecond}
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))

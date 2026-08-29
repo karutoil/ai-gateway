@@ -43,7 +43,7 @@ func TestCompletionCacheScopedPerKey(t *testing.T) {
 	keyA, _ := ks.Create("key-a")
 	keyB, _ := ks.Create("key-b")
 
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	h.Cache = cache.NewMemoryCache(16)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 0}
 	r := chi.NewRouter()

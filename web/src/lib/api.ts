@@ -96,19 +96,30 @@ export type LogsQuery = {
   since?: string
 }
 
-// Load-balancer routing rules: per-model ordered provider groups.
-// Rotation happens across requests; a failing member returns its own error
-// (no automatic failover) until an admin removes/reorders it. Qualified
-// model ids ("openai/gpt-4o") and X-Provider headers bypass these rules.
+// Load-balancer routing rules: per-model provider groups with a strategy.
+// Non-failover strategies serve each request with ONE member; failover walks
+// members in position order on retriable failures. Qualified model ids
+// ("openai/gpt-4o") and X-Provider headers bypass these rules.
+export type RoutingStrategy = 'round_robin' | 'random' | 'weighted' | 'failover'
 export type LBMember = {
   provider_id: string
   name: string
   type: string
+  weight?: number // weighted strategy: relative traffic share (1-100)
+  model_override?: string // optional model id sent upstream for this member
   health_status?: string | null // "up" | "down" | null/absent = unknown
 }
 export type LBRule = {
   model: string
-  providers: LBMember[] // array order = round-robin walk order
+  strategy: RoutingStrategy
+  providers: LBMember[] // array order = member position / failover order
+}
+
+// Write-path member shape for saveRule.
+export type LBMemberInput = {
+  provider_id: string
+  model_override?: string
+  weight?: number
 }
 
 export const api = {
@@ -123,9 +134,9 @@ export const api = {
   },
   lb: {
     listRules: (): Promise<LBRule[]> => req('/api/lb/rules'),
-    // PUT is an upsert: replaces the ordered member set for the model.
-    saveRule: (model: string, providers: string[]): Promise<LBRule> =>
-      req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'PUT', body: JSON.stringify({ providers })}),
+    // PUT is an upsert: replaces the member set and strategy for the model.
+    saveRule: (model: string, opts: { strategy?: RoutingStrategy; members: LBMemberInput[] }): Promise<LBRule> =>
+      req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'PUT', body: JSON.stringify({ strategy: opts.strategy, members: opts.members })}),
     deleteRule: (model: string): Promise<null> =>
       req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'DELETE'}),
   },

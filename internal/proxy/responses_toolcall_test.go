@@ -154,7 +154,7 @@ func TestResponsesToolCallSurvivesAnthropicStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hh := New(ps, database)
+	hh := newLegacyHandler(ps, database)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post("/v1/responses", hh.Responses)

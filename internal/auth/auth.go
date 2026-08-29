@@ -368,6 +368,13 @@ func GetRole(r *http.Request) string {
 	return ""
 }
 
+// WithRole returns a context carrying the given dashboard role, as
+// auth.AdminMiddleware would set it. Intended for tests and internal
+// middleware composition; never accept a client-supplied role header here.
+func WithRole(ctx context.Context, role string) context.Context {
+	return context.WithValue(ctx, contextKeyRole, role)
+}
+
 func GetSubject(r *http.Request) string {
 	if v := r.Context().Value(contextKeySubject); v != nil {
 		if s, ok := v.(string); ok {

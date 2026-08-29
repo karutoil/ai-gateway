@@ -35,7 +35,7 @@ func newHygieneEnv(t *testing.T, up http.HandlerFunc, mountFor func(hh *Handler)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hh := New(ps, database)
+	hh := newLegacyHandler(ps, database)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post(path, mountFor(hh))
@@ -135,7 +135,7 @@ func TestRefusedRedirectWithoutLocationFallsThrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	k, _ := ks.Create("f2-key")
-	hh := New(ps, database)
+	hh := newLegacyHandler(ps, database)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post("/v1/responses", hh.Responses)

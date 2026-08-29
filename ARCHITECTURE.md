@@ -46,7 +46,7 @@ ai-gateway/
   internal/
     config/     # env loading (.env), production hardening, MASTER_KEY/JWT_SECRET derivation + persistent key files
     db/         # sqlite/postgres open, versioned migrations via schema_migrations (dirty-flag abort)
-    db/migrations/  # 001_initial … 009_lb_rules (embedded, run at boot)
+    db/migrations/  # 001_initial … 011_routing_strategies (embedded, run at boot)
     models/     # shared domain types (Provider, GatewayKey, RequestLog, CatalogModel, …)
     provider/   # Store CRUD + AES-GCM Encrypt/Decrypt + Resolve() + health.StartHealthChecker
     apikey/     # Generate (sk-gw- + 32B hex), Hash (SHA256), Verify, Prefix
@@ -101,7 +101,7 @@ RequestID -> Recovery -> Logger -> audit.Middleware -> forwardedHeaders -> secur
 
 ## Data Model
 
-Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 009_lb_rules.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). Highlights:
+Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 011_routing_strategies.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). Highlights:
 
 - `providers` (AES-GCM `api_key_enc`, `base_url`, `health_status`, optional `org_id`)
 - `gateway_keys` (prefix + SHA256 hash, RPM/RPH/RPD/TPM, daily/monthly token & cost limits, `allowed_models`, optional `org_id`)
@@ -109,7 +109,7 @@ Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 009_lb_ru
 - `models_catalog`, `provider_models`, `model_aliases`, `system_config`
 - `audit_logs` (actor, action, target, meta)
 - `organizations`, `memberships` (org scaffold; org scope resolved from memberships)
-- `lb_rules` (ordered provider groups per model)
+- `lb_rules` (per-model provider groups: ordered members with `strategy`, `model_override`, `weight`)
 
 SQLite (WAL, single-conn writes) is the default dialect; `postgres://` DSNs switch to lib/pq — functional but **beta** (not yet soak-tested).
 
@@ -129,7 +129,7 @@ Reasoning mapping: OpenAI `reasoning_effort` (low/medium/high/max) <-> Anthropic
 
 ## Routing, Resilience & Metering (all wired)
 
-- **Routing rules** (`lb`): explicit ordered provider group per model; round-robin across requests; down members skipped; **no silent failover** — a failing member returns its own error after same-provider retries. Qualified `provider/model` IDs and `X-Provider:` pin requests; aliases resolve first.
+- **Routing rules** (`lb`): per-model provider group with a **strategy** — `round_robin` (default; rotate evenly across requests), `random`, `weighted` (per-member weight 1–100, proportional pick), or `failover` (first healthy member in position order; later members only on retriable failure — the only strategy with cross-provider failover). Down members and open circuits are skipped where a healthy sibling exists; non-failover strategies serve each request with ONE member (a failing member returns its own error after same-provider retries). Members may carry a `model_override` — the model id rewritten onto the outbound request for that member. Unrouted bare model names are rejected with **404 `model_not_routed`**; `ROUTING_LEGACY_FALLBACK=true` restores the old heuristic resolution (provider-models ownership, name heuristics, default provider) as a migration escape hatch. Qualified `provider/model` IDs and `X-Provider:` pin requests bypass rules; aliases resolve first. Model lists for rules come from per-provider discovery (`POST /api/providers/{id}/discover` fetches the provider's `/models` API).
 - **Retries**: `RETRY_MAX_RETRIES` (default 2) with exponential backoff on 5xx/429 — only while **nothing is committed**; streaming requests retry until the first byte is committed, then fail honestly.
 - **Circuit breaker**: per provider, `BREAKER_*` env; open circuits short-circuit with `circuit_open` (surfaced via `/api/providers`).
 - **Cache**: exact-match response cache (`X-Cache: HIT|MISS`), in-memory or Redis; `CACHE_TTL_SECONDS`.

@@ -96,7 +96,7 @@ func setupTestServer(t *testing.T) (*httptest.Server, string) {
 		t.Fatal(err)
 	}
 
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))

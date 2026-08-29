@@ -32,7 +32,7 @@ func TestValidateReasoningQualifiedModelID(t *testing.T) {
 		"m1", p.ID, "glm-5.3-flash", true, "effort", `["low","high","max"]`, "manual", now, now); err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 
 	const qualified = "opencodego/glm-5.3-flash"
 

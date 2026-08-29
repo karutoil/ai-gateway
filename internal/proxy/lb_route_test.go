@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -32,6 +34,9 @@ type lbHarness struct {
 	bodyB     string // returns 200 "from-b"
 	failA     bool
 	lbStore   *lb.Store
+	paID      string
+	pbID      string
+	ppID      string
 }
 
 func newLBHarness(t *testing.T, ruleProviders []string, failA bool) *lbHarness {
@@ -105,6 +110,7 @@ func newLBHarness(t *testing.T, ruleProviders []string, failA bool) *lbHarness {
 	h.LB = lb.NewStore(database)
 	hh.h = h
 	hh.lbStore = h.LB
+	hh.paID, hh.pbID, hh.ppID = pa.ID, pb.ID, pp.ID
 
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
@@ -115,15 +121,15 @@ func newLBHarness(t *testing.T, ruleProviders []string, failA bool) *lbHarness {
 	if ruleProviders != nil {
 		// Translate provider names → ids, mirroring what the dashboard does.
 		nameToID := map[string]string{pa.Name: pa.ID, pb.Name: pb.ID, pp.Name: pp.ID}
-		ids := make([]string, 0, len(ruleProviders))
+		members := make([]lb.RuleMemberInput, 0, len(ruleProviders))
 		for _, n := range ruleProviders {
 			id, ok := nameToID[n]
 			if !ok {
 				t.Fatalf("unknown test provider %q", n)
 			}
-			ids = append(ids, id)
+			members = append(members, lb.RuleMemberInput{ProviderID: id})
 		}
-		if err := h.LB.ReplaceRule("gpt-4o-mini", ids); err != nil {
+		if err := h.LB.ReplaceRule("gpt-4o-mini", "", members); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -242,4 +248,148 @@ func TestLBFailingMemberErrorsHonest(t *testing.T) {
 	if gotErr != 3 || gotOK != 3 {
 		t.Fatalf("strict per-request rotation expected 3 fails / 3 oks, got %d/%d", gotErr, gotOK)
 	}
+}
+
+// Bare model names with no routing rule are rejected with 404 model_not_routed
+// (legacy heuristics are off by default) — no upstream is contacted.
+func TestBareModelWithoutRuleRejected(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	code, body := hh.do(t, "unrouted-model", "")
+	if code != 404 {
+		t.Fatalf("expected 404 for unrouted bare model, got %d: %s", code, body)
+	}
+	if !strings.Contains(body, "model_not_routed") {
+		t.Fatalf("expected model_not_routed code in body: %s", body)
+	}
+	if hh.hitsA.Load()+hh.hitsB.Load()+hh.hitsPinme.Load() != 0 {
+		t.Fatal("unrouted model must not touch any upstream")
+	}
+}
+
+// The strict default does not silently send unrouted models to the default
+// provider even when providers exist that could theoretically serve them.
+func TestUnroutedModelIgnoresDefaultProvider(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	code, body := hh.do(t, "gpt-4o-mini", "")
+	if code != 404 || !strings.Contains(body, "model_not_routed") {
+		t.Fatalf("provider_models ownership must not serve unrouted bare models: %d %s", code, body)
+	}
+}
+
+// ROUTING_LEGACY_FALLBACK restores the pre-strategy heuristic resolution.
+func TestLegacyFallbackFlagRestoresHeuristics(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	hh.h.LegacyFallback = true
+	code, body := hh.do(t, "gpt-4o-mini", "")
+	if code != 200 {
+		t.Fatalf("legacy fallback should resolve via provider_models ownership, got %d: %s", code, body)
+	}
+	if !strings.Contains(body, "from-") {
+		t.Fatalf("expected a member response: %s", body)
+	}
+}
+
+// failover strategy: primary down → next member serves, X-Fallback-Used set.
+func TestFailoverStrategyFailsOver(t *testing.T) {
+	hh := newLBHarness(t, []string{"prov-a", "prov-b"}, false)
+	hh.failA = true
+	if err := hh.lbStore.ReplaceRule("gpt-4o-mini", lb.StrategyFailover, []lb.RuleMemberInput{
+		{ProviderID: hh.paID},
+		{ProviderID: hh.pbID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code, body := hh.do(t, "gpt-4o-mini", "")
+	if code != 200 || !strings.Contains(body, "from-b") {
+		t.Fatalf("failover rule should serve from prov-b, got %d: %s", code, body)
+	}
+	if n := hh.hitsA.Load(); n == 0 {
+		t.Fatal("primary should have been attempted first")
+	}
+}
+
+// failover strategy: healthy primary → later members never contacted.
+func TestFailoverStrategyNoFailoverWhenHealthy(t *testing.T) {
+	hh := newLBHarness(t, []string{"prov-a", "prov-b"}, false)
+	if err := hh.lbStore.ReplaceRule("gpt-4o-mini", lb.StrategyFailover, []lb.RuleMemberInput{
+		{ProviderID: hh.paID},
+		{ProviderID: hh.pbID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		code, body := hh.do(t, "gpt-4o-mini", "")
+		if code != 200 || !strings.Contains(body, "from-a") {
+			t.Fatalf("healthy primary must keep serving: req %d got %d %s", i, code, body)
+		}
+	}
+	if n := hh.hitsB.Load(); n != 0 {
+		t.Fatalf("failover must not touch secondaries while primary is healthy: %d", n)
+	}
+}
+
+// weighted strategy distributes the primary pick proportionally to weight.
+func TestWeightedRuleDistribution(t *testing.T) {
+	hh := newLBHarness(t, []string{"prov-a", "prov-b"}, false)
+	if err := hh.lbStore.ReplaceRule("gpt-4o-mini", lb.StrategyWeighted, []lb.RuleMemberInput{
+		{ProviderID: hh.paID, Weight: 90},
+		{ProviderID: hh.pbID, Weight: 10},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const n = 200
+	for i := 0; i < n; i++ {
+		if code, _ := hh.do(t, "gpt-4o-mini", ""); code != 200 {
+			t.Fatalf("req %d failed", i)
+		}
+	}
+	a, b := hh.hitsA.Load(), hh.hitsB.Load()
+	// 90/10 expectation with generous binomial bounds.
+	if a < 150 || a > n {
+		t.Fatalf("weighted 90/10: prov-a got %d/%d", a, n)
+	}
+	if b < 1 || b > 50 {
+		t.Fatalf("weighted 90/10: prov-b got %d/%d", b, n)
+	}
+}
+
+// model_override rewrites the outbound model for that member's upstream.
+func TestRuleMemberModelOverride(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	// prov-a serves the rule; override asks upstream for a different model id.
+	if err := hh.lbStore.ReplaceRule("gpt-4o-mini", lb.StrategyFailover, []lb.RuleMemberInput{
+		{ProviderID: hh.paID, ModelOverride: "gpt-4o-mini-2024-07-18"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenModel string
+	hh.h.Client.Transport = captureModelTransport{fn: func(m string) { seenModel = m }}
+
+	code, body := hh.do(t, "gpt-4o-mini", "")
+	if code != 200 || !strings.Contains(body, "from-a") {
+		t.Fatalf("override rule should serve: %d %s", code, body)
+	}
+	if seenModel != "gpt-4o-mini-2024-07-18" {
+		t.Fatalf("upstream should receive overridden model, got %q", seenModel)
+	}
+}
+
+// captureModelTransport observes the outbound "model" field of the JSON body.
+type captureModelTransport struct {
+	fn func(model string)
+}
+
+func (c captureModelTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		var m struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(b, &m) == nil {
+			c.fn(m.Model)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(b))
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }

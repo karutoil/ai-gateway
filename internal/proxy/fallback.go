@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 
@@ -92,18 +95,22 @@ func (b *bufWriter) flushTo(w http.ResponseWriter) {
 
 // candidateProviders selects the provider(s) eligible to serve this request.
 //
-// Routing contract (product decision):
+// Routing contract:
 //   - Pin always wins: an X-Provider hint, or a qualified model whose first
 //     segment names an existing provider/type ("openai/gpt-4o"), routes there
 //     exclusively — LB rules are bypassed.
 //   - Otherwise a curated lb_rules group (if configured for this model or its
-//     alias name) governs: ONE member is selected per request using a rotating
-//     offset (round-robin across requests). Members never chain as failovers.
-//   - Otherwise the legacy resolution picks one provider (health-aware,
-//     round-robin among discovered owners, deterministic otherwise).
-//   - Cross-provider fallback is DISABLED by design: the returned slice always
-//     holds at most one provider. Same-provider retries inside
-//     proxyWithMetrics remain active per the retry policy.
+//     alias name) governs: the rule's strategy orders the healthy members
+//     (round-robin / random / weighted pick a single serving member;
+//     failover returns the whole position-ordered list so proxyCandidates
+//     walks it on retriable failures).
+//   - Otherwise: LegacyFallback=false (default) rejects the request — the
+//     caller surfaces model_not_routed; LegacyFallback=true restores the
+//     legacy resolution (health-aware ownership round-robin, name/type
+//     heuristics, default provider).
+//
+// Same-provider retries inside proxyWithMetrics remain active per the retry
+// policy regardless of strategy.
 //
 // requestKeyOrg extracts the authenticated gateway key's org scope ("" for
 // global keys / dashboard sessions without an org).
@@ -126,6 +133,15 @@ func orgAllows(keyOrg string, p *models.Provider) bool {
 }
 
 func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) []*models.Provider {
+	cands, _ := h.candidateProvidersWithRule(rawModel, model, hint, keyOrg, pred)
+	return cands
+}
+
+// candidateProvidersWithRule is candidateProviders plus the curated rule that
+// governed selection (nil for pins, legacy resolution, or no-route). Callers
+// pass it to proxyCandidates so per-member model overrides apply only to
+// rule-routed traffic — never to pinned requests.
+func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) ([]*models.Provider, *lb.Rule) {
 	out := make([]*models.Provider, 0, 1)
 	consider := func(p *models.Provider) bool {
 		if p == nil || p.ID == "" || (pred != nil && !pred(p)) {
@@ -139,11 +155,11 @@ func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred 
 	if hint != "" {
 		if p, err := h.ProviderStore.GetByName(hint); err == nil && orgAllows(keyOrg, p) {
 			consider(p)
-			return out
+			return out, nil
 		}
 		if p, err := h.ProviderStore.GetByID(hint); err == nil && orgAllows(keyOrg, p) {
 			consider(p)
-			return out
+			return out, nil
 		}
 	}
 
@@ -154,18 +170,18 @@ func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred 
 		prefix := strings.ToLower(strings.TrimSpace(model[:idx]))
 		if prefix != "" {
 			if p, err := h.ProviderStore.GetByName(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
-				return out
+				return out, nil
 			}
 			if p, err := h.ProviderStore.GetByType(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
-				return out
+				return out, nil
 			}
 		}
 	}
 
 	// 3. Curated LB rule (checked on post-alias model name first, then the
-	// raw/alias spelling). One member per request, rotating start. If the
-	// rotated pick's breaker is OPEN, prefer the next member with a closed
-	// circuit instead of 503-ing while healthy group members exist.
+	// raw/alias spelling). The rule's strategy orders healthy members; the
+	// first member with a closed circuit serves. failover rules hand the
+	// full ordering to proxyCandidates as ordered fallback candidates.
 	if h.LB != nil {
 		for _, key := range []string{model, rawModel} {
 			key = strings.ToLower(strings.TrimSpace(key))
@@ -173,35 +189,52 @@ func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred 
 				continue
 			}
 			if rule := h.LB.RuleForModel(key); rule != nil {
-				if rotated := h.LB.RotateProviders(rule); len(rotated) > 0 {
-					// Org-scoped keys may only route to providers their org
-					// owns (or global ones).
-					eligible := make([]*models.Provider, 0, len(rotated))
-					for _, cand := range rotated {
-						if orgAllows(keyOrg, cand) {
-							eligible = append(eligible, cand)
-						}
-					}
-					if len(eligible) == 0 {
-						continue
-					}
-					picked := eligible[0]
-					if h.Breaker != nil {
-						for _, cand := range eligible {
-							if h.Breaker.State(cand.ID) != "open" {
-								picked = cand
-								break
-							}
-						}
-					}
-					consider(picked)
-					return out
+				ordered := h.LB.Select(rule)
+				if len(ordered) == 0 {
+					continue
 				}
+				// Org-scoped keys may only route to providers their org
+				// owns (or global ones).
+				eligible := make([]*models.Provider, 0, len(ordered))
+				for _, cand := range ordered {
+					if orgAllows(keyOrg, cand) {
+						eligible = append(eligible, cand)
+					}
+				}
+				if len(eligible) == 0 {
+					continue
+				}
+				picked := eligible[:1]
+				if rule.Strategy == lb.StrategyFailover {
+					// Explicit opt-in: walk members in position order on
+					// retriable failures.
+					picked = eligible
+				} else if h.Breaker != nil {
+					// Prefer the first member whose circuit is closed over
+					// 503-ing while healthy group members exist.
+					for i, cand := range eligible {
+						if h.Breaker.State(cand.ID) != "open" {
+							if i != 0 {
+								eligible[0], eligible[i] = eligible[i], eligible[0]
+							}
+							break
+						}
+					}
+				}
+				for _, p := range picked {
+					consider(p)
+				}
+				return out, rule
 			}
 		}
 	}
 
-	// 4. Legacy single pick: health-aware round-robin over discovered owners,
+	// 4. No rule and no pin: reject by default, or resolve via legacy
+	// heuristics when the operator opted back in.
+	if !h.LegacyFallback {
+		return nil, nil
+	}
+	// Legacy single pick: health-aware round-robin over discovered owners,
 	// heuristic ownership by name/type, else default provider. Org-scoped keys
 	// resolve through the org-aware resolver (global providers still shared).
 	if h.ProviderStore != nil {
@@ -216,7 +249,7 @@ func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred 
 			consider(p)
 		}
 	}
-	return out
+	return out, nil
 }
 
 type prepareFn func(p *models.Provider, body []byte) (target, apiKey string, outBody []byte, isAnth bool, err error)
@@ -234,7 +267,7 @@ func shouldFailoverFrom(status int) bool {
 	return status >= 500
 }
 
-func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []*models.Provider, prepare prepareFn) {
+func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []*models.Provider, rule *lb.Rule, prepare prepareFn) {
 	if len(candidates) == 0 {
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
@@ -261,7 +294,16 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		if !h.breakerOrNoop().Allow(p.ID) {
 			continue
 		}
-		target, apiKey, outBody, isAnth, err := prepare(p, body)
+		// Per-member model override: rule members may send a different model
+		// id upstream (e.g. a pinned date version). Only rule-routed traffic
+		// gets rewrites — pins and legacy routes have no rule, hence no
+		// override. The override also feeds usage logging via candModel below.
+		candBody, candModel := body, model
+		if override, ok := rule.ModelOverrideFor(p.ID); ok && override != model {
+			candBody = replaceModelInBody(body, override)
+			candModel = override
+		}
+		target, apiKey, outBody, isAnth, err := prepare(p, candBody)
 		if err != nil {
 			continue
 		}
@@ -271,10 +313,10 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		if p.ID != primaryID && idx > 0 && candidates[0] != nil {
 			fallbackName = p.Name
 		}
-		opts := proxyOpts{fallbackFrom: fallbackName, attempts: chain}
+		callOpts := proxyOpts{fallbackFrom: fallbackName, attempts: chain, rule: rule}
 
 		if isStream {
-			outcome := h.proxyWithMetricsOpts(w, r, target, apiKey, outBody, true, model, p.ID, keyPrefix, endpoint, start, isAnth, opts)
+			outcome := h.proxyWithMetricsOpts(w, r, target, apiKey, outBody, true, candModel, p.ID, keyPrefix, endpoint, start, isAnth, callOpts)
 			lastProviderID, lastProviderName = p.ID, p.Name
 			lastDetail = outcome.errSnippet
 			if outcome.errSnippet == "" {
@@ -300,7 +342,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		}
 
 		bw := newBufWriter()
-		outcome := h.proxyWithMetricsOpts(bw, r, target, apiKey, outBody, false, model, p.ID, keyPrefix, endpoint, start, isAnth, opts)
+		outcome := h.proxyWithMetricsOpts(bw, r, target, apiKey, outBody, false, candModel, p.ID, keyPrefix, endpoint, start, isAnth, callOpts)
 		if !outcome.committed && bw.code == 0 {
 			// Terminal pre-commit failure: nothing usable was produced.
 			lastProviderID, lastProviderName = p.ID, p.Name
@@ -385,4 +427,28 @@ func outboundStatus(s int) int {
 		return s
 	}
 	return http.StatusBadGateway
+}
+
+// noRouteFor writes the model_not_routed error: a bare model name matched no
+// routing rule, no pin matched, and legacy heuristic fallback is disabled.
+// The message is actionable — qualified IDs always work without a rule.
+func noRouteFor(w http.ResponseWriter, model string) {
+	msg := fmt.Sprintf("model %q is not routed: create a routing rule for it, or use provider-qualified IDs like provider/%s (or an X-Provider header)", model, shortModelID(model))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": msg,
+			"type":    "invalid_request_error",
+			"code":    "model_not_routed",
+		},
+	})
+}
+
+// unroutedModel reports whether an empty candidate list means "no routing
+// rule for this model" (legacy fallback disabled) as opposed to the legacy
+// resolver simply failing (no providers at all). In the former case callers
+// surface model_not_routed; in the latter the pre-existing no-provider 503s.
+func (h *Handler) unroutedModel() bool {
+	return h.LB != nil && !h.LegacyFallback
 }

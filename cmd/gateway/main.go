@@ -131,6 +131,10 @@ func main() {
 	proxyHandler.LogBodies = cfg.LogBodies
 	proxyHandler.BodyLogMaxBytes = cfg.BodyLogMaxBytes
 	proxyHandler.StreamUsageInject = cfg.StreamUsageInject
+	proxyHandler.LegacyFallback = cfg.RoutingLegacyFallback
+	if cfg.RoutingLegacyFallback {
+		log.Info().Msg("ROUTING_LEGACY_FALLBACK=true: heuristic resolution enabled for bare model names without routing rules")
+	}
 	// Phase 2 wiring: cache selection via REDIS_URL, fallback to MemoryCache gracefully
 	if cfg.RedisURL != "" {
 		if rc, err := cache.NewRedisCache(cfg.RedisURL); err == nil {

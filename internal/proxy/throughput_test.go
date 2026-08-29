@@ -144,7 +144,7 @@ func newThroughputHarness(tb testing.TB) *throughputHarness {
 	}
 
 	// --- Production wiring (mirrors cmd/gateway/main.go) ---
-	h := NewWithCatalog(ps, catalog.NewStore(database), database)
+	h := newLegacyHandlerWithCatalog(ps, catalog.NewStore(database), database)
 	h.Timeouts = DefaultTimeouts()
 	h.CacheTTLSeconds = 10
 	h.StreamUsageInject = true

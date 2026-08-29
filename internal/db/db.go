@@ -46,6 +46,9 @@ var migration009SQL string
 //go:embed migrations/010_usage_logging.sql
 var migration010SQL string
 
+//go:embed migrations/011_routing_strategies.sql
+var migration011SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -218,6 +221,7 @@ func Migrate(db *sql.DB) error {
 		{8, migration008SQL},
 		{9, migration009SQL},
 		{10, migration010SQL},
+		{11, migration011SQL},
 	}
 
 	for _, m := range migrations {
@@ -389,7 +393,21 @@ func Migrate(db *sql.DB) error {
 	applyGatewayKeyLimitsAlters(db)
 	applyHardeningV2Alters(db)
 	applyUsageLoggingAlters(db)
+	applyRoutingAlters(db)
 	return nil
+}
+
+// applyRoutingAlters adds the lb_rules strategy columns idempotently for DBs
+// created before migration 011 (legacy unversioned databases).
+func applyRoutingAlters(db *sql.DB) {
+	cols := []string{
+		"ALTER TABLE lb_rules ADD COLUMN strategy TEXT NOT NULL DEFAULT 'round_robin'",
+		"ALTER TABLE lb_rules ADD COLUMN model_override TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE lb_rules ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
+	}
+	for _, stmt := range cols {
+		execAlterIdempotent(db, stmt)
+	}
 }
 
 // applyHardeningV2Alters adds production-hardening columns idempotently.

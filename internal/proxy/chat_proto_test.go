@@ -109,7 +109,7 @@ func protoNewEnv(t *testing.T, up http.HandlerFunc, provType models.ProviderType
 	}
 	env.Key = k.Key
 
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 0} // deterministic single attempt
 	h.Timeouts.StreamIdle = 30 * time.Second                // watchdog safety net, never hit in these tests
 	env.H = h

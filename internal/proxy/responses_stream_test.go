@@ -52,7 +52,7 @@ func rsNewGateway(t *testing.T, providerType models.ProviderType, baseURL string
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 0}
 	h.Timeouts.StreamIdle = 2 * time.Second // small-but-comfortable watchdog
 	if tune != nil {

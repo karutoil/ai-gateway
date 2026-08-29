@@ -53,8 +53,13 @@ type Handler struct {
 
 	Timeouts TimeoutsConfig
 	// LB, when set, routes bare model names through operator-curated
-	// round-robin groups (see internal/lb). Nil = no curated routing.
+	// strategy groups (see internal/lb). Nil = no curated routing.
 	LB *lb.Store
+	// LegacyFallback, when true, restores the pre-strategy heuristic model
+	// resolution (provider_models ownership round-robin, name heuristics,
+	// default provider) for bare model names with no routing rule. Default
+	// off: unrouted bare models are rejected with model_not_routed.
+	LegacyFallback bool
 	// CacheTTLSeconds bounds non-stream completion caching (default 10).
 	CacheTTLSeconds int
 	// Usage, when set, records actual per-request token/cost outcomes.
@@ -678,6 +683,10 @@ type proxyOpts struct {
 	// attempts records every provider tried before the one that ultimately
 	// served the request, for the request_logs fallback_chain column.
 	attempts []providerAttempt
+	// rule, when non-nil, is the curated lb rule that produced the candidate
+	// list — enabling per-member model overrides. Nil for pinned/legacy
+	// routes, where overrides never apply.
+	rule *lb.Rule
 }
 
 // providerAttempt is one tried-and-failed-over provider in a fallback chain.
@@ -2471,10 +2480,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
+	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type != models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
+		if h.unroutedModel() {
+			noRouteFor(w, model)
+			return
+		}
 		if p, err := h.ProviderStore.Resolve(model, providerHint); err == nil && p != nil && p.Type == models.ProviderAnthropic {
 			httperr.Invalid(w, "model '"+model+"' is an anthropic model; use POST /v1/messages instead of /v1/chat/completions")
 			return
@@ -2488,14 +2501,17 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
-	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
+	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
 			return "", "", nil, false, err
 		}
-		upstream := stripProviderPrefix(model, p)
+		// The body may already carry a rule member's model override; derive
+		// the upstream id from it so the override survives prefix stripping.
+		bodyModel := translate.ExtractModel(body)
+		upstream := stripProviderPrefix(bodyModel, p)
 		out := body
-		if upstream != translate.ExtractModel(body) {
+		if upstream != bodyModel {
 			out = replaceModelInBody(body, upstream)
 		}
 		// Strict OpenAI-compatible upstreams reject legal-but-sloppy shapes
@@ -2537,12 +2553,21 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
+		if h.unroutedModel() {
+			noRouteFor(w, model)
+			return
+		}
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
 	p := candidates[0]
+	// Per-member model override from a curated rule (rule-routed traffic only).
+	if override, ok := rule.ModelOverrideFor(p.ID); ok && override != model {
+		body = replaceModelInBody(body, override)
+		model = override
+	}
 	if err := h.validateReasoning(p.ID, model, body); err != nil {
 		httperr.Invalid(w, err.Error())
 		return
@@ -2699,22 +2724,29 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
+	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type != models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
+		if h.unroutedModel() {
+			noRouteFor(w, model)
+			return
+		}
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
 	start := time.Now()
-	h.proxyCandidates(w, r, body, false, model, "embeddings", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
+	h.proxyCandidates(w, r, body, false, model, "embeddings", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
 			return "", "", nil, false, err
 		}
-		upstream := stripProviderPrefix(model, p)
+		// The body may already carry a rule member's model override; derive
+		// the upstream id from it so the override survives prefix stripping.
+		bodyModel := translate.ExtractModel(body)
+		upstream := stripProviderPrefix(bodyModel, p)
 		out := body
-		if upstream != translate.ExtractModel(body) {
+		if upstream != bodyModel {
 			out = replaceModelInBody(body, upstream)
 		}
 		target := upstreamTarget(p.BaseURL, "/embeddings", model, p.Type == models.ProviderAzure)
@@ -3078,10 +3110,14 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
+	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type == models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
+		if h.unroutedModel() {
+			noRouteFor(w, model)
+			return
+		}
 		if p, err := h.ProviderStore.Resolve(model, providerHint); err == nil && p != nil && p.Type != models.ProviderAnthropic {
 			httperr.Invalid(w, "model '"+model+"' is not an anthropic model; use POST /v1/chat/completions, /v1/completions or /v1/responses")
 			return
@@ -3096,14 +3132,17 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
+	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
 			return "", "", nil, false, err
 		}
-		upstream := stripProviderPrefix(model, p)
+		// The body may already carry a rule member's model override; derive
+		// the upstream id from it so the override survives prefix stripping.
+		bodyModel := translate.ExtractModel(body)
+		upstream := stripProviderPrefix(bodyModel, p)
 		out := body
-		if upstream != translate.ExtractModel(body) {
+		if upstream != bodyModel {
 			out = replaceModelInBody(body, upstream)
 		}
 		target := strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
@@ -3155,12 +3194,21 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates := h.candidateProviders(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
+		if h.unroutedModel() {
+			noRouteFor(w, model)
+			return
+		}
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
 	p := candidates[0]
+	// Per-member model override from a curated rule (rule-routed traffic only).
+	if override, ok := rule.ModelOverrideFor(p.ID); ok && override != model {
+		body = replaceModelInBody(body, override)
+		model = override
+	}
 	if err := h.validateReasoning(p.ID, model, body); err != nil {
 		httperr.Invalid(w, err.Error())
 		return

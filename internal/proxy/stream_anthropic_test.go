@@ -42,7 +42,7 @@ func TestAnthropicMessagesStreamViaOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post("/v1/messages", h.AnthropicMessages)
@@ -116,7 +116,7 @@ data: {"type":"message_stop"}`,
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post("/v1/messages", h.AnthropicMessages)
@@ -190,7 +190,7 @@ func TestResponsesStreamViaChat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(ps, database)
+	h := newLegacyHandler(ps, database)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post("/v1/responses", h.Responses)
