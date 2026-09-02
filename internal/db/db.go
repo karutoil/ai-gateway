@@ -240,8 +240,8 @@ func Migrate(db *sql.DB) error {
 		{12, migration012SQL},
 		{13, migration013SQL},
 		{14, migration014SQL},
-			{15, migration015SQL},
-			{16, migration016SQL},
+		{15, migration015SQL},
+		{16, migration016SQL},
 	}
 
 	for _, m := range migrations {
@@ -432,7 +432,7 @@ func applyKeyFeaturesAlters(database *sql.DB) {
 	// non-default choices are never touched. Runs every boot (idempotent).
 	database.Exec("UPDATE webhooks SET format='discord' WHERE format='json' AND (url LIKE '%discord.com/api/webhooks%' OR url LIKE '%discordapp.com/api/webhooks%')")
 	database.Exec("UPDATE webhooks SET format='slack' WHERE format='json' AND url LIKE '%hooks.slack.com%'")
-	stmts := []string {
+	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS personal_access_tokens (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,

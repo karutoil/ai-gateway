@@ -100,7 +100,7 @@ func (h *WebhookHandler) List(w http.ResponseWriter, r *http.Request) {
 		Name         string     `json:"name"`
 		URL          string     `json:"url"`
 		Events       string     `json:"events"`
-		Format   string     `json:"format"`
+		Format       string     `json:"format"`
 		Enabled      bool       `json:"enabled"`
 		CreatedAt    time.Time  `json:"created_at"`
 		UpdatedAt    time.Time  `json:"updated_at"`
