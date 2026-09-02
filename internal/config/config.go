@@ -50,6 +50,7 @@ type Config struct {
 	WriteHeaderGraceSecs      int // non-streaming responses write deadline
 	ShutdownGraceSecs         int // graceful drain window for in-flight streams
 	TTFBTimeoutSecs           int // client-facing first-byte budget; -1 = default, 0 = disabled
+	MaxProxyBodyMB            int // proxy request-body cap in MiB (0 = unlimited)
 
 	CacheTTLSeconds int
 
@@ -358,6 +359,10 @@ func Load() (*Config, error) {
 		// commits — both before a Cloudflare edge can synthesize a 524.
 		// 0 disables; -1 uses the built-in default.
 		TTFBTimeoutSecs: getInt("TTFB_TIMEOUT_SECONDS", -1),
+
+		// Proxy request-body cap in MiB (413 beyond). Large agentic CLI
+		// sessions legitimately exceed the old fixed 64 MiB; 0 disables.
+		MaxProxyBodyMB: getInt("MAX_PROXY_BODY_MB", 64),
 
 		CacheTTLSeconds: getInt("CACHE_TTL_SECONDS", 10),
 

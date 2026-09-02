@@ -72,6 +72,10 @@ type Handler struct {
 	// streams when missing (billing accuracy over maximum compatibility).
 	StreamUsageInject bool
 
+	// MaxBodyBytes bounds how much of a client request body the gateway
+	// buffers (413 beyond). Zero/negative = DefaultMaxProxyRequestBodyBytes.
+	MaxBodyBytes int64
+
 	// keyIDCache maps gateway-key prefix → gateway_keys.id for per-key
 	// analytics attribution on request_logs. Warmed on demand; entries are
 	// immutable in practice (a prefix maps to one key), so the empty-string
@@ -89,6 +93,7 @@ func New(ps *provider.Store, db *sql.DB) *Handler {
 		Timeouts:        tc,
 		CacheTTLSeconds: 10,
 		BodyLogMaxBytes: 8192,
+		MaxBodyBytes:    DefaultMaxProxyRequestBodyBytes,
 	}
 }
 
@@ -134,15 +139,20 @@ func (h *Handler) enforceModelAllowlist(w http.ResponseWriter, r *http.Request, 
 	return false
 }
 
-// readProxyBody reads a proxied request body capped at
-// maxProxyRequestBodyBytes. Oversized bodies are rejected with a clean 413 —
-// previously the ReadAll error was discarded and the truncated JSON was
-// relayed upstream, surfacing to the client as a misleading upstream 400.
+// readProxyBody reads a proxied request body capped at the configured proxy
+// body limit (maxProxyRequestBodyBytes; see Handler.MaxBodyBytes). Oversized
+// bodies are rejected with a clean 413 — previously the ReadAll error was
+// discarded and the truncated JSON was relayed upstream, surfacing to the
+// client as a misleading upstream 400.
 func (h *Handler) readProxyBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxProxyRequestBodyBytes))
+	limit := h.MaxBodyBytes
+	if limit <= 0 {
+		limit = DefaultMaxProxyRequestBodyBytes
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
 		httperr.Write(w, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("request body exceeds %d byte limit", maxProxyRequestBodyBytes), httperr.TypeInvalid)
+			fmt.Sprintf("request body exceeds %d byte limit (MAX_PROXY_BODY_MB)", limit), httperr.TypeInvalid)
 		return nil, false
 	}
 	return body, true
@@ -460,11 +470,13 @@ func toInt(v interface{}) int {
 	return 0
 }
 
-// maxProxyRequestBodyBytes bounds how much of a client request body the
-// gateway will buffer. Upstream LLM payloads can legitimately reach tens of
-// MB (large multimodal contexts), but an unbounded read let a single
+// DefaultMaxProxyRequestBodyBytes bounds how much of a client request body
+// the gateway will buffer by default. Upstream LLM payloads can legitimately
+// reach tens of MB (large multimodal contexts, agentic sessions carrying
+// whole codebases in context), but an unbounded read let a single
 // authenticated request exhaust gateway memory (DoS for every tenant).
-const maxProxyRequestBodyBytes = 64 << 20 // 64 MiB
+// Operator-configurable via MAX_PROXY_BODY_MB (0 disables the cap).
+const DefaultMaxProxyRequestBodyBytes = 64 << 20 // 64 MiB
 
 func cacheKeyFor(endpoint, model string, body []byte, scope string) string {
 	sum := sha256.Sum256(append([]byte(endpoint+"\n"+scope+"\n"+model+"\n"), body...))

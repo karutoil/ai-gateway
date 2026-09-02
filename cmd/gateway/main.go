@@ -150,6 +150,15 @@ func main() {
 	default:
 		proxyHandler.Timeouts.TTFB = proxy.DefaultTimeouts().TTFB
 	}
+	// Proxy request-body cap: MiB → bytes. 0 disables the cap entirely
+	// (memory-DoS tradeoff is the operator's call); negatives fall to default.
+	switch {
+	case cfg.MaxProxyBodyMB == 0:
+		proxyHandler.MaxBodyBytes = 0 // unlimited
+		log.Warn().Msg("MAX_PROXY_BODY_MB=0: proxy request-body cap disabled (unbounded memory per request)")
+	case cfg.MaxProxyBodyMB > 0:
+		proxyHandler.MaxBodyBytes = int64(cfg.MaxProxyBodyMB) << 20
+	}
 	proxyHandler.CacheTTLSeconds = cfg.CacheTTLSeconds
 	proxyHandler.LogBodies = cfg.LogBodies
 	proxyHandler.BodyLogMaxBytes = cfg.BodyLogMaxBytes
