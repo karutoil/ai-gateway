@@ -158,6 +158,27 @@ func adminMiddleware(secret []byte, checker SessionChecker) func(http.Handler) h
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
+
+			// Personal access tokens (gwp_...) authenticate as a dashboard
+			// user with narrowed permissions. Optional: wired via
+			// WithPATStore on the router; nil store skips this path.
+			if strings.HasPrefix(tokenStr, "gwp_") && patAuth != nil {
+				userID, scopes, ok := patAuth(tokenStr)
+				if !ok {
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+				username, role, err := patIdentity(userID)
+				if err != nil {
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+				r = r.WithContext(WithRole(r.Context(), role))
+				r = r.WithContext(WithSubject(r.Context(), username))
+				r = r.WithContext(WithPATScopes(r.Context(), scopes))
+				next.ServeHTTP(w, r)
+				return
+			}
 			claims, err := VerifyToken(secret, tokenStr)
 			if err != nil {
 				if oidcIssuer := os.Getenv("OIDC_ISSUER"); oidcIssuer != "" {
@@ -375,8 +396,68 @@ func WithRole(ctx context.Context, role string) context.Context {
 	return context.WithValue(ctx, contextKeyRole, role)
 }
 
+// WithSubject returns a context carrying the dashboard subject (username),
+// as AdminMiddleware would set it. For tests and middleware composition.
+func WithSubject(ctx context.Context, subject string) context.Context {
+	return context.WithValue(ctx, contextKeySubject, subject)
+}
+
 func GetSubject(r *http.Request) string {
 	if v := r.Context().Value(contextKeySubject); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// contextKeyPerms carries the caller's effective permission set, populated by
+// middleware.RequirePerm (readable by handlers via GetPerms).
+type contextKeyPerms struct{}
+
+// WithPerms attaches an effective permission set to a context.
+func WithPerms(ctx context.Context, perms map[string]bool) context.Context {
+	return context.WithValue(ctx, contextKeyPerms{}, perms)
+}
+
+// GetPerms returns the caller's effective permission set. nil = the request
+// never passed RequirePerm — callers must treat nil as "no permissions".
+func GetPerms(r *http.Request) map[string]bool {
+	if v := r.Context().Value(contextKeyPerms{}); v != nil {
+		if m, ok := v.(map[string]bool); ok {
+			return m
+		}
+	}
+	return nil
+}
+
+// --- Personal access token (PAT) support ---
+
+// PATAuthFunc validates a raw gwp_... token, returning (userID, scopes, ok).
+// Wired at startup via SetPATAuthenticator; nil disables PAT authentication.
+var patAuth func(rawToken string) (userID string, scopes string, ok bool)
+
+// PATIdentity resolves a PAT's user id to (username, role) for context
+// population; disabled users must fail here (fail-closed).
+var patIdentity func(userID string) (username, role string, err error)
+
+// SetPATAuthenticator wires PAT support into the dashboard auth middleware.
+func SetPATAuthenticator(validate func(rawToken string) (string, string, bool), identity func(string) (string, string, error)) {
+	patAuth = validate
+	patIdentity = identity
+}
+
+type patScopesKey struct{}
+
+// WithPATScopes attaches the token's scope list (comma-separated permission
+// names; empty = inherit user's effective set).
+func WithPATScopes(ctx context.Context, scopes string) context.Context {
+	return context.WithValue(ctx, patScopesKey{}, scopes)
+}
+
+// PATScopes returns the comma-separated scope list carried by a PAT, or "".
+func PATScopes(r *http.Request) string {
+	if v := r.Context().Value(patScopesKey{}); v != nil {
 		if s, ok := v.(string); ok {
 			return s
 		}

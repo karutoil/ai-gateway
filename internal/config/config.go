@@ -49,15 +49,12 @@ type Config struct {
 	StreamIdleTimeoutSecs     int // max gap between stream chunks (0 = none)
 	WriteHeaderGraceSecs      int // non-streaming responses write deadline
 	ShutdownGraceSecs         int // graceful drain window for in-flight streams
+	TTFBTimeoutSecs           int // client-facing first-byte budget; -1 = default, 0 = disabled
 
 	CacheTTLSeconds int
 
 	RetryMaxRetries  int
 	RetryBaseDelayMs int
-
-	BreakerAllowedFails      int
-	BreakerCooldownSeconds   int
-	BreakerHalfOpenSuccesses int
 
 	// Request-body logging & retention (opt-in).
 	LogBodies        bool
@@ -356,15 +353,16 @@ func Load() (*Config, error) {
 		StreamIdleTimeoutSecs:     getInt("STREAM_IDLE_TIMEOUT_SECONDS", 300),
 		WriteHeaderGraceSecs:      getInt("WRITE_HEADER_GRACE_SECONDS", 60),
 		ShutdownGraceSecs:         getInt("SHUTDOWN_GRACE_SECONDS", 90),
+		// Time-to-first-byte budget surfaced to clients (see proxy.TTFB):
+		// buffered requests get an honest 504, streams get SSE keepalive
+		// commits — both before a Cloudflare edge can synthesize a 524.
+		// 0 disables; -1 uses the built-in default.
+		TTFBTimeoutSecs: getInt("TTFB_TIMEOUT_SECONDS", -1),
 
 		CacheTTLSeconds: getInt("CACHE_TTL_SECONDS", 10),
 
 		RetryMaxRetries:  getInt("RETRY_MAX_RETRIES", 2),
 		RetryBaseDelayMs: getInt("RETRY_BASE_DELAY_MS", 200),
-
-		BreakerAllowedFails:      getInt("BREAKER_ALLOWED_FAILS", 5),
-		BreakerCooldownSeconds:   getInt("BREAKER_COOLDOWN_SECONDS", 30),
-		BreakerHalfOpenSuccesses: getInt("BREAKER_HALF_OPEN_SUCCESSES", 2),
 
 		LogBodies:        logBodiesDefault(),
 		BodyLogMaxBytes:  getInt("BODY_LOG_MAX_BYTES", 8192),

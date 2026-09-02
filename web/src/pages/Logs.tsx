@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api } from '../lib/api'
+import { api, logsParamsToSearch } from '../lib/api'
+import { useFiltersState } from '../lib/useQueryState'
+import { loadSavedViews, saveView, removeSavedView, describeViewParams, type SavedView } from '../lib/savedViews'
 import {
   Card, Button, Badge, Icon, Input, PageHeader, SegmentedControl,
-  TableShell, Th, Td, TableSkeleton, EmptyState, Modal, CopyButton,
+  TableShell, Th, Td, TableSkeleton, EmptyState, Modal, CopyButton, Field,
 } from '../components/ui'
 
 function tpsFor(l:any){
@@ -343,34 +345,113 @@ const SINCE_OPTIONS = [
   { value: '30d', label: '30d' },
 ] as const
 
+/** Filter state shape — each field maps 1:1 to a URL query param. */
+type LogFilters = {
+  q: string
+  status: '' | 'failed' | string
+  since: '1h' | '24h' | '7d' | '30d' | string
+  key_id: string
+  provider_id: string
+  model: string
+  stream: '' | 'true' | 'false'
+  min_latency_ms: string
+  max_latency_ms: string
+  has_error: '' | 'true'
+  search_bodies: '' | 'true'
+}
+
+const FILTER_DEFAULTS: LogFilters = {
+  q: '', status: '', since: '24h', key_id: '', provider_id: '', model: '',
+  stream: '', min_latency_ms: '', max_latency_ms: '', has_error: '', search_bodies: '',
+}
+
+/** Which filter fields are "advanced" (hidden behind More filters). */
+const ADVANCED_FIELDS: (keyof LogFilters)[] = ['min_latency_ms', 'max_latency_ms', 'search_bodies', 'model']
+
+/** True when a field differs from its default (drives chips + active count). */
+function filterActive(f: LogFilters, k: keyof LogFilters): boolean {
+  return f[k] !== FILTER_DEFAULTS[k]
+}
+
+type GroupRowT = {
+  group: string
+  name?: string
+  requests: number
+  tokens: number
+  cost: number
+  failed: number
+  avg_latency_ms: number
+  p50_latency_ms: number
+  p95_latency_ms: number
+}
+
+const GROUP_DIMS = [
+  { value: 'model', label: 'Model' },
+  { value: 'key', label: 'Key' },
+  { value: 'provider', label: 'Provider' },
+  { value: 'endpoint', label: 'Endpoint' },
+  { value: 'status', label: 'Status' },
+  { value: 'error', label: 'Errors' },
+] as const
+
 export default function Logs(){
   const navigate = useNavigate()
+  const [filters, setFilters] = useFiltersState<LogFilters>(FILTER_DEFAULTS)
   const [logs, setLogs] = useState<any[]>([])
   const [total, setTotal] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
-  const [query, setQuery] = useState('')
-  const [statusFilter, setStatusFilter] = useState<'all'|'failed'>('all')
-  const [since, setSince] = useState<'1h'|'24h'|'7d'|'30d'>('24h')
   const [limit, setLimit] = useState(100)
   const [offset, setOffset] = useState(0)
   const [keyMap, setKeyMap] = useState<Record<string,string>>({})
+  const [keyIdMap, setKeyIdMap] = useState<Record<string,string>>({})
+  const [providers, setProviders] = useState<{id:string;name:string}[]>([])
   const [selected, setSelected] = useState<any|null>(null)
   const [detail, setDetail] = useState<any|null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [showReports, setShowReports] = useState(false)
+  const [showSaveView, setShowSaveView] = useState(false)
+  const [savedViews, setSavedViews] = useState<SavedView[]>(() => loadSavedViews())
+  const [viewName, setViewName] = useState('')
+  const [exportNote, setExportNote] = useState('')
 
-  // Server-side pagination + filters (GET /api/logs supports limit/offset/
-  // status/since and returns X-Total-Count).
+  // Reports panel state
+  const [groupBy, setGroupBy] = useState<string>('model')
+  const [groupRows, setGroupRows] = useState<GroupRowT[]>([])
+  const [groupLoading, setGroupLoading] = useState(false)
+
+  // Debounced search: q updates the URL 300ms after typing stops.
+  const [qInput, setQInput] = useState(filters.q)
+  useEffect(() => {
+    const t = setTimeout(() => { if (qInput !== filters.q) setFilters({ q: qInput }) }, 300)
+    return () => clearTimeout(t)
+  }, [qInput]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setQInput(filters.q) }, [filters.q])
+
+  // Server-side query from URL-synced filters.
+  const apiParams = () => {
+    const p: Record<string, unknown> = {
+      limit, since: filters.since,
+    }
+    if (filters.q) p.q = filters.q
+    if (filters.status) p.status = filters.status
+    if (filters.key_id) p.key_id = filters.key_id
+    if (filters.provider_id) p.provider_id = filters.provider_id
+    if (filters.model) p.model = filters.model
+    if (filters.stream) p.stream = filters.stream
+    if (filters.has_error) p.has_error = filters.has_error
+    if (filters.search_bodies) p.search_bodies = filters.search_bodies
+    if (filters.min_latency_ms) p.min_latency_ms = Number(filters.min_latency_ms)
+    if (filters.max_latency_ms) p.max_latency_ms = Number(filters.max_latency_ms)
+    return p
+  }
+
   const loadLogs = (opts?: { resetOffset?: boolean })=>{
     const nextOffset = opts?.resetOffset ? 0 : offset
     setLoading(true)
     setLoadError('')
-    api.logsQuery({
-      limit,
-      offset: nextOffset,
-      status: statusFilter === 'failed' ? 'failed' : undefined,
-      since,
-    })
+    api.logsQuery({ ...apiParams(), offset: nextOffset } as any)
       .then(({ rows, total })=>{
         setLogs(rows)
         setTotal(total)
@@ -380,17 +461,40 @@ export default function Logs(){
       .finally(()=> setLoading(false))
   }
 
-  useEffect(()=>{ loadLogs({ resetOffset: true }) }, [limit, statusFilter, since])
+  useEffect(()=>{ loadLogs({ resetOffset: true }) }, [limit, JSON.stringify(filters)])
 
   useEffect(()=>{
     api.keys.list().then(keys=>{
-      const m:Record<string,string>={}
-      for(const k of keys) m[k.prefix]=k.name
-      setKeyMap(m)
+      const byPrefix:Record<string,string> = {}
+      const byId:Record<string,string> = {}
+      for(const k of keys){ byPrefix[k.prefix]=k.name; byId[k.id]=k.name }
+      setKeyMap(byPrefix); setKeyIdMap(byId)
+    }).catch(()=>{})
+    api.providers.list().then((list:any)=>{
+      const arr = Array.isArray(list) ? list : list?.data ?? []
+      setProviders(arr.map((p:any)=>({ id: p.id, name: p.name })))
     }).catch(()=>{})
   },[])
 
-  // Also support direct fetch via api if not yet added
+  const loadGroup = () => {
+    setGroupLoading(true)
+    const { limit: _l, offset: _o, ...rest } = apiParams() as any
+    api.logsGroup({ ...rest, group_by: groupBy as any, range: filters.since, limit: 20 })
+      .then(r => setGroupRows(r.rows || []))
+      .catch(() => setGroupRows([]))
+      .finally(() => setGroupLoading(false))
+  }
+  useEffect(() => { if (showReports) loadGroup() }, [showReports, groupBy, JSON.stringify(filters)]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doExport = async () => {
+    setExportNote('')
+    try {
+      const { filename, truncated } = await api.logsExport(apiParams() as any)
+      setExportNote(truncated ? `Exported ${filename} (truncated at server cap)` : `Exported ${filename}`)
+      setTimeout(() => setExportNote(''), 5000)
+    } catch (e:any) { setExportNote(e?.message || 'export failed') }
+  }
+
   const fetchDetail = async (id:string)=>{
     try{
       const res = await fetch(`/api/logs/${id}`, { credentials: 'same-origin' })
@@ -408,24 +512,28 @@ export default function Logs(){
     setLoadingDetail(false)
   }
 
-  // Client-side search across the currently loaded page only — the text box
-  // narrows what you see; server filters (status/since) govern what is loaded.
-  const q = query.trim().toLowerCase()
-  const visible = logs.filter(l=>{
-    if(!q) return true
-    return [l.model, l.endpoint, keyMap[l.key_prefix], String(l.status??'')]
-      .some(v => typeof v==='string' && v.toLowerCase().includes(q))
-  })
+  // Click-through helpers: navigate to this view filtered on a dimension value.
+  const applyFilter = (patch: Partial<LogFilters>) => { setFilters(patch); setOffset(0) }
 
-  // Aggregates cover the loaded page only — labeled as such below.
-  const totalCost = logs.reduce((acc,l)=> acc + (l.cost_usd||0), 0)
-  const totalTokens = logs.reduce((acc,l)=> acc + (l.total_tokens||0), 0)
-  const avgTTFT = logs.length ? Math.round(logs.reduce((a,l)=>a+(l.ttft_ms||0),0)/logs.length) : 0
-  const avgTPS = logs.length ? (logs.reduce((a,l)=>a + tpsFor(l),0)/logs.length).toFixed(1) : '0'
+  const activeFilters = (Object.keys(FILTER_DEFAULTS) as (keyof LogFilters)[])
+    .filter(k => filterActive(filters, k))
 
-  const page = Math.floor(offset / limit) + 1
-  const hasPrev = offset > 0
-  const hasNext = total != null ? offset + logs.length < total : logs.length === limit
+  const saveCurrentView = () => {
+    const params = new URLSearchParams(window.location.search)
+    params.delete('limit'); params.delete('offset')
+    setSavedViews(saveView(viewName || 'Untitled view', params.toString()))
+    setViewName(''); setShowSaveView(false)
+  }
+
+  const applySavedView = (v: SavedView) => {
+    const params = new URLSearchParams(v.params)
+    const patch: Partial<LogFilters> = {}
+    for (const k of Object.keys(FILTER_DEFAULTS) as (keyof LogFilters)[]) {
+      (patch as any)[k] = params.get(k) ?? FILTER_DEFAULTS[k]
+    }
+    // since/range aliases: saved views store the range under `since`
+    setFilters(patch)
+  }
 
   const rawJson = detail ? JSON.stringify(detail || selected, null, 2) : ''
 
@@ -435,47 +543,187 @@ export default function Logs(){
         title="Request Logs"
         description="Every proxied call with status, latency, tokens and cost."
         actions={
-          <Button variant="primary" onClick={()=>loadLogs()} disabled={loading}>
-            <Icon name="refresh" size={15}/>Refresh
-          </Button>
+          <>
+            <Button variant="secondary" onClick={doExport}>
+              <Icon name="download" size={15}/>Export CSV
+            </Button>
+            <Button variant="primary" onClick={()=>loadLogs()} disabled={loading}>
+              <Icon name="refresh" size={15}/>Refresh
+            </Button>
+          </>
         }
       />
+
+      {exportNote && <div className="text-xs text-teal">{exportNote}</div>}
+
+      {/* Saved views chips */}
+      {savedViews.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 -mt-1">
+          <span className="text-xs text-muted uppercase tracking-wide mr-1">Saved views</span>
+          {savedViews.map(v => (
+            <span key={v.id} className="inline-flex items-center gap-1 rounded-full border border-stone bg-raised px-2.5 py-1 text-xs group hover:border-teal/50 transition-colors">
+              <button onClick={()=>applySavedView(v)} title={describeViewParams(v.params)} className="focus:outline-none">
+                <span className="font-medium">{v.name}</span>
+                <span className="text-muted ml-1.5">{describeViewParams(v.params)}</span>
+              </button>
+              <button onClick={()=>setSavedViews(removeSavedView(v.id))} className="text-muted hover:text-red-400 focus:outline-none" title="Delete view">
+                <Icon name="x" size={11}/>
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* Totals strip — aggregates cover the currently loaded rows only */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted font-mono tabular-nums -mt-2">
         <span>{logs.length} loaded{total != null ? ` of ${total.toLocaleString()} matching` : ''}</span>
-        <span title="Sum over the currently loaded rows">{totalTokens.toLocaleString()} tokens (loaded)</span>
-        <span title="Sum over the currently loaded rows">${totalCost.toFixed(4)} (loaded)</span>
-        <span>avg TTFT {avgTTFT}ms</span>
-        <span>avg TPS {avgTPS}</span>
+        <span title="Sum over the currently loaded rows">{logs.reduce((a,l)=>a+(l.total_tokens||0),0).toLocaleString()} tokens (loaded)</span>
+        <span title="Sum over the currently loaded rows">${logs.reduce((a,l)=>a+(l.cost_usd||0),0).toFixed(4)} (loaded)</span>
+        <span>avg TTFT {logs.length ? Math.round(logs.reduce((a,l)=>a+(l.ttft_ms||0),0)/logs.length) : 0}ms</span>
       </div>
 
-      {/* Filter bar — status + time range + page size hit the server; search is within the loaded page */}
-      <Card className="!p-3 flex flex-col sm:flex-row sm:items-center gap-2">
-        <div className="relative flex-1 min-w-[180px]">
-          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
-          <Input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filter loaded rows by model, endpoint, key…" className="pl-9"/>
-        </div>
-        <SegmentedControl<'all'|'failed'>
-          options={[{value:'all',label:'All'},{value:'failed',label:'Failed'}]}
-          value={statusFilter}
-          onChange={setStatusFilter}
-        />
-        <SegmentedControl<'1h'|'24h'|'7d'|'30d'>
-          options={SINCE_OPTIONS.map(o=>({ value:o.value, label:o.label }))}
-          value={since}
-          onChange={setSince}
-        />
-        <label className="flex items-center gap-2 text-xs text-muted shrink-0">
-          Rows
-          <select
-            value={limit}
-            onChange={e=>setLimit(Number(e.target.value))}
-            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60"
-          >
-            {LIMIT_OPTIONS.map(n=> <option key={n} value={n}>{n}</option>)}
+      {/* Filter bar — every control is server-side and URL-synced */}
+      <Card className="!p-3 space-y-2.5">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+          <div className="relative flex-1 min-w-[180px]">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
+            <Input value={qInput} onChange={e=>setQInput(e.target.value)} placeholder="Search model, endpoint, error text…" className="pl-9"/>
+          </div>
+          <select value={filters.status} onChange={e=>applyFilter({ status: e.target.value })}
+            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60">
+            <option value="">Any status</option>
+            <option value="failed">Failed only</option>
           </select>
-        </label>
+          <select value={filters.key_id} onChange={e=>applyFilter({ key_id: e.target.value })}
+            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm max-w-[150px] focus:outline-none focus:border-teal/60">
+            <option value="">Any key</option>
+            {Object.entries(keyIdMap).map(([id,name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+          <select value={filters.provider_id} onChange={e=>applyFilter({ provider_id: e.target.value })}
+            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm max-w-[150px] focus:outline-none focus:border-teal/60">
+            <option value="">Any provider</option>
+            {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <select value={filters.since} onChange={e=>applyFilter({ since: e.target.value })}
+            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60">
+            {SINCE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <SegmentedControl<''|'true'|'false'>
+            options={[{value:'',label:'Any'},{value:'true',label:'Stream'},{value:'false',label:'Non-stream'}]}
+            value={filters.stream} onChange={v=>applyFilter({ stream: v })}
+          />
+          <label className="flex items-center gap-1.5 text-xs text-muted cursor-pointer select-none">
+            <input type="checkbox" checked={filters.has_error==='true'} onChange={e=>applyFilter({ has_error: e.target.checked ? 'true' : '' })}
+              className="w-3.5 h-3.5 accent-teal rounded"/>
+            Has error
+          </label>
+          <label className="flex items-center gap-1.5 text-xs text-muted cursor-pointer select-none">
+            <input type="checkbox" checked={filters.search_bodies==='true'} onChange={e=>applyFilter({ search_bodies: e.target.checked ? 'true' : '' })}
+              className="w-3.5 h-3.5 accent-teal rounded"/>
+            Search bodies
+          </label>
+          <button onClick={()=>setShowAdvanced(s=>!s)} className="text-xs text-muted hover:text-paper transition-colors flex items-center gap-1 focus:outline-none">
+            <Icon name="chevronDown" size={13} className={`transition-transform ${showAdvanced?'rotate-180':''}`}/>
+            More filters {activeFilters.some(k=>ADVANCED_FIELDS.includes(k)) ? '•' : ''}
+          </button>
+          <div className="flex-1"/>
+          <Button variant="secondary" size="sm" onClick={()=>setShowSaveView(true)}><Icon name="plus" size={13}/>Save view</Button>
+          <Button variant="secondary" size="sm" onClick={()=>{
+            navigator.clipboard?.writeText(window.location.href).then(()=>setExportNote('View link copied'), ()=>{})
+          }}><Icon name="key" size={13}/>Share</Button>
+        </div>
+        {showAdvanced && (
+          <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-stone">
+            <Input value={filters.model} onChange={e=>applyFilter({ model: e.target.value })} placeholder="Model (substring)" className="max-w-[180px] h-8 text-xs"/>
+            <Input value={filters.min_latency_ms} onChange={e=>applyFilter({ min_latency_ms: e.target.value.replace(/\D/g,'') })} placeholder="Min latency ms" className="max-w-[120px] h-8 text-xs" inputMode="numeric"/>
+            <Input value={filters.max_latency_ms} onChange={e=>applyFilter({ max_latency_ms: e.target.value.replace(/\D/g,'') })} placeholder="Max latency ms" className="max-w-[120px] h-8 text-xs" inputMode="numeric"/>
+          </div>
+        )}
+      </Card>
+
+      {/* Active filter chips */}
+      {activeFilters.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 -mt-1">
+          <span className="text-xs text-muted">Filtered by</span>
+          {activeFilters.map(k => (
+            <Badge key={k} tone="info">
+              {k === 'key_id' ? (keyIdMap[filters.key_id] ? `key: ${keyIdMap[filters.key_id]}` : 'key') :
+               k === 'provider_id' ? (providers.find(p=>p.id===filters.provider_id)?.name || 'provider') :
+               k === 'q' ? `search: ${filters.q}` :
+               `${k.replace(/_/g,' ')}: ${filters[k]}`}
+              <button onClick={()=>applyFilter({ [k]: FILTER_DEFAULTS[k] } as any)} className="ml-1 hover:text-red-300 focus:outline-none"><Icon name="x" size={10}/></button>
+            </Badge>
+          ))}
+          <button onClick={()=>setFilters({...FILTER_DEFAULTS})} className="text-xs text-muted hover:text-paper focus:outline-none">Clear all</button>
+        </div>
+      )}
+
+      {/* Reports (group-by) panel */}
+      <Card className="!p-3">
+        <button onClick={()=>setShowReports(s=>!s)} className="w-full flex items-center justify-between text-sm font-medium focus:outline-none">
+          <span className="flex items-center gap-2"><Icon name="chart" size={15} className="text-teal"/>Reports</span>
+          <Icon name="chevronDown" size={15} className={`text-muted transition-transform ${showReports?'rotate-180':''}`}/>
+        </button>
+        {showReports && (
+          <div className="mt-3 space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-muted">Group by</span>
+              <SegmentedControl<string>
+                options={GROUP_DIMS.map(d=>({ value: d.value, label: d.label }))}
+                value={groupBy} onChange={setGroupBy}
+              />
+              <span className="text-xs text-muted ml-auto">window {filters.since} · respects filters above</span>
+            </div>
+            {groupLoading ? (
+              <div className="py-6 text-center text-sm text-muted">Aggregating…</div>
+            ) : groupRows.length === 0 ? (
+              <div className="py-6 text-center text-sm text-muted">No rows match the current filters.</div>
+            ) : (
+              <div className="overflow-x-auto rounded-lg border border-stone">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr>
+                      <Th className="text-left">{GROUP_DIMS.find(d=>d.value===groupBy)?.label || groupBy}</Th>
+                      <Th className="text-right">Requests</Th>
+                      <Th className="text-right">Failed</Th>
+                      <Th className="text-right">Tokens</Th>
+                      <Th className="text-right">Cost</Th>
+                      <Th className="text-right">Avg</Th>
+                      <Th className="text-right">p50</Th>
+                      <Th className="text-right">p95</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {groupRows.map(g => (
+                      <tr key={g.group}
+                        onClick={()=>{
+                          // Click-through: filter the log list on this group's dimension.
+                          if (groupBy === 'model') applyFilter({ model: g.group })
+                          else if (groupBy === 'key') { const k = Object.entries(keyMap).find(([,n])=>n===g.name||true); applyFilter({ key_id: g.name ? (Object.entries(keyIdMap).find(([,n])=>n===g.name)?.[0] ?? '') : '' }) }
+                          else if (groupBy === 'provider') applyFilter({ provider_id: g.group === '(none)' ? '' : g.group })
+                          else if (groupBy === 'status') applyFilter({ status: g.group === '(none)' ? '' : g.group })
+                          else if (groupBy === 'error') applyFilter({ has_error: g.group === 'error' ? 'true' : '' })
+                          else applyFilter({ model: g.group })
+                        }}
+                        className="hover:bg-raised/50 cursor-pointer transition-colors">
+                        <Td className="font-mono">{g.name || g.group}</Td>
+                        <Td className="text-right tabular-nums">{g.requests.toLocaleString()}</Td>
+                        <Td className={`text-right tabular-nums ${g.failed>0?'text-red-400':'text-muted'}`}>{g.failed||'—'}</Td>
+                        <Td className="text-right tabular-nums">{g.tokens ? g.tokens.toLocaleString() : '—'}</Td>
+                        <Td className="text-right tabular-nums">{g.cost ? `$${g.cost.toFixed(4)}` : '—'}</Td>
+                        <Td className="text-right tabular-nums">{g.avg_latency_ms ? `${Math.round(g.avg_latency_ms)}ms` : '—'}</Td>
+                        <Td className="text-right tabular-nums">{g.p50_latency_ms ? `${g.p50_latency_ms}ms` : '—'}</Td>
+                        <Td className="text-right tabular-nums">{g.p95_latency_ms ? `${g.p95_latency_ms}ms` : '—'}</Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
       </Card>
 
       {loadError && (
@@ -504,28 +752,24 @@ export default function Logs(){
           </thead>
           {loading ? (
             <TableSkeleton rows={8} cols={7}/>
-          ) : visible.length===0 ? (
+          ) : logs.length===0 ? (
             <tbody>
               <tr><td colSpan={7}>
                 <EmptyState
                   icon="logs"
-                  title={logs.length===0
-                    ? (offset > 0 ? 'No requests on this page' : 'No requests match these filters')
-                    : 'No matching requests on this page'}
-                  hint={logs.length===0
-                    ? (offset > 0
-                        ? 'Go back a page, or widen the time range / clear the failed filter.'
-                        : 'Send your first call from the Playground and it will appear here instantly.')
-                    : 'Try a different search term.'}
+                  title={offset > 0 ? 'No requests on this page' : 'No requests match these filters'}
+                  hint={offset > 0
+                    ? 'Go back a page, or widen the time range / clear filters.'
+                    : 'Adjust the filters, or send your first call from the Playground.'}
                   action={logs.length===0 && offset === 0
-                    ? <Button variant="secondary" onClick={()=>navigate('/playground')}><Icon name="play" size={15}/>Open Playground</Button>
+                    ? <Button variant="secondary" onClick={()=>setFilters({...FILTER_DEFAULTS})}>Clear filters</Button>
                     : undefined}
                 />
               </td></tr>
             </tbody>
           ) : (
             <tbody>
-              {visible.map(l=>(
+              {logs.map(l=>(
                 <tr key={l.id} onClick={()=>handleRowClick(l)}
                     className="hover:bg-raised/50 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/50">
                   <Td className="whitespace-nowrap text-xs text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
@@ -550,15 +794,15 @@ export default function Logs(){
       {!loadError && (
         <div className="flex items-center justify-between gap-2 -mt-2">
           <span className="text-xs text-muted tabular-nums">
-            Page {page}{total != null ? ` · ${total.toLocaleString()} request(s) matching` : ''}
+            {total != null ? `${total.toLocaleString()} request(s) matching` : ''}
             {' '}· rows {offset + 1}–{offset + logs.length}
           </span>
           <div className="flex items-center gap-1.5">
-            <Button variant="secondary" size="sm" disabled={!hasPrev || loading}
+            <Button variant="secondary" size="sm" disabled={offset === 0 || loading}
               onClick={()=>setOffset(Math.max(0, offset - limit))}>
               <Icon name="chevronLeft" size={13}/>Prev
             </Button>
-            <Button variant="secondary" size="sm" disabled={!hasNext || loading}
+            <Button variant="secondary" size="sm" disabled={total != null ? offset + logs.length >= total : logs.length < limit}
               onClick={()=>setOffset(offset + limit)}>
               Next<Icon name="chevronRight" size={13}/>
             </Button>
@@ -595,6 +839,27 @@ export default function Logs(){
         <div className="flex justify-end gap-2 mt-5 pt-4 border-t border-stone">
           <CopyButton size="md" value={rawJson} label="Copy JSON"/>
           <Button variant="secondary" onClick={()=>{setSelected(null); setDetail(null)}}>Close</Button>
+        </div>
+      </Modal>
+
+      {/* Save current view modal */}
+      <Modal open={showSaveView} onClose={()=>setShowSaveView(false)} title="Save current view" width="max-w-sm">
+        <Field label="View name" hint="Shown as a one-click chip above the filter bar.">
+          <Input value={viewName} onChange={e=>setViewName(e.target.value)} autoFocus
+            placeholder="e.g. prod-key failures 24h"
+            onKeyDown={e=>{ if(e.key==='Enter' && viewName.trim()) saveCurrentView() }}/>
+        </Field>
+        {(() => {
+          const active = (Object.keys(FILTER_DEFAULTS) as (keyof LogFilters)[]).filter(k=>filterActive(filters,k))
+          return (
+            <div className="mt-3 text-xs text-muted">
+              Saves: {active.length ? active.map(k=>k.replace(/_/g,' ')).join(', ') + ` · ${filters.since}` : `nothing but the ${filters.since} window`}
+            </div>
+          )
+        })()}
+        <div className="flex justify-end gap-2 mt-5">
+          <Button variant="ghost" onClick={()=>setShowSaveView(false)}>Cancel</Button>
+          <Button variant="primary" onClick={saveCurrentView} disabled={!viewName.trim()}>Save</Button>
         </div>
       </Modal>
     </div>

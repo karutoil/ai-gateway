@@ -8,17 +8,22 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/pat"
+	"ai-gateway/internal/rbac"
 	"ai-gateway/internal/user"
 
 	"github.com/go-chi/chi/v5"
 )
 
 type ProfileHandler struct {
-	Store *user.Store
-	DB    *sql.DB
+	Recorder audit.Recorder
+	PATs     *pat.Store
+	Store    *user.Store
+	DB       *sql.DB
 }
 
 func (h *ProfileHandler) Routes(r chi.Router) {
@@ -27,6 +32,9 @@ func (h *ProfileHandler) Routes(r chi.Router) {
 	r.Post("/profile/password", h.ChangePassword)
 	r.Get("/profile/activity", h.GetActivity)
 	r.Get("/profile/logins", h.GetLogins)
+	r.Get("/profile/tokens", h.PATList)
+	r.Post("/profile/tokens", h.PATCreate)
+	r.Delete("/profile/tokens/{id}", h.PATRevoke)
 }
 
 func (h *ProfileHandler) GetProfile(w http.ResponseWriter, r *http.Request) {
@@ -231,4 +239,90 @@ func (h *ProfileHandler) GetLogins(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   u.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		Recent:      recentAny,
 	})
+}
+
+// --- Personal access tokens (PATs) ---
+
+// resolveUser maps the JWT subject to the dashboard user row.
+func (h *ProfileHandler) resolveUser(subject string) (*user.DashboardUser, error) {
+	u, _, err := h.Store.GetByUsername(strings.ToLower(subject))
+	return u, err
+}
+
+// PATList returns the caller's tokens (metadata only — secrets are shown
+// exactly once, at creation).
+func (h *ProfileHandler) PATList(w http.ResponseWriter, r *http.Request) {
+	u, err := h.resolveUser(auth.GetSubject(r))
+	if err != nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	tokens, err := h.PATs.List(u.ID)
+	if err != nil || tokens == nil {
+		tokens = []pat.Token{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tokens)
+}
+
+// PATCreate mints a token for the caller. Body: {name, expires_days?, scopes?}
+// — scopes are a comma-separated permission allowlist that narrows the
+// user's own effective permissions. The raw secret is returned once.
+func (h *ProfileHandler) PATCreate(w http.ResponseWriter, r *http.Request) {
+	u, err := h.resolveUser(auth.GetSubject(r))
+	if err != nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var body struct {
+		Name        string `json:"name"`
+		ExpiresDays int    `json:"expires_days"`
+		Scopes      string `json:"scopes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		http.Error(w, `{"error":"name required"}`, http.StatusBadRequest)
+		return
+	}
+	if sc := strings.TrimSpace(body.Scopes); sc != "" {
+		for _, p := range strings.Split(sc, ",") {
+			if !rbac.Valid(strings.TrimSpace(p)) {
+				http.Error(w, `{"error":"unknown permission in scopes: `+strings.TrimSpace(p)+`"}`, http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	var exp *time.Time
+	if body.ExpiresDays > 0 {
+		t := time.Now().UTC().AddDate(0, 0, body.ExpiresDays)
+		exp = &t
+	}
+	tok, raw, err := h.PATs.Create(u.ID, strings.TrimSpace(body.Name), exp, strings.TrimSpace(body.Scopes))
+	if err != nil {
+		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
+		return
+	}
+	if h.Recorder != nil {
+		h.Recorder.Log(u.Username, "create", "pat", tok.ID, "name="+tok.Name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"token": tok, "secret": raw})
+}
+
+// PATRevoke revokes one of the caller's own tokens.
+func (h *ProfileHandler) PATRevoke(w http.ResponseWriter, r *http.Request) {
+	u, err := h.resolveUser(auth.GetSubject(r))
+	if err != nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if err := h.PATs.Revoke(id, u.ID); err != nil {
+		http.Error(w, `{"error":"revoke failed"}`, http.StatusInternalServerError)
+		return
+	}
+	if h.Recorder != nil {
+		h.Recorder.Log(u.Username, "revoke", "pat", id, "")
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

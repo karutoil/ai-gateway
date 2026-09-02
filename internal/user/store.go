@@ -10,6 +10,7 @@ import (
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
+	"ai-gateway/internal/rbac"
 
 	"github.com/google/uuid"
 )
@@ -371,6 +372,92 @@ func (s *Store) PrimaryOrgID(userID string) string {
 		return ""
 	}
 	return orgID
+}
+
+// ---------------------------------------------------------------------------
+// Fine-grained permissions (internal/rbac)
+// ---------------------------------------------------------------------------
+
+// PermOverride is one user_permissions row: a permission and whether it is
+// explicitly granted (true) or revoked (false) for the user.
+type PermOverride struct {
+	Permission string
+	Granted    bool
+}
+
+// PermissionOverrides returns the user's stored override rows. Missing table
+// (pre-migration DB) → no overrides, role defaults apply.
+func (s *Store) PermissionOverrides(userID string) (map[string]bool, error) {
+	rows, err := s.db.Query(db.Q(`SELECT permission, granted FROM user_permissions WHERE user_id=?`), userID)
+	if err != nil {
+		if strings.Contains(err.Error(), "user_permissions") {
+			return map[string]bool{}, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var p string
+		var granted int
+		if err := rows.Scan(&p, &granted); err != nil {
+			continue
+		}
+		out[p] = granted != 0
+	}
+	return out, rows.Err()
+}
+
+// EffectivePermissions composes role defaults with the user's stored
+// overrides. Disabled/missing users get the empty set (fail closed); admins
+// short-circuit to everything inside rbac.Effective.
+func (s *Store) EffectivePermissions(userID, role string) (map[string]bool, error) {
+	var disabled int
+	if err := s.db.QueryRow(db.Q(`SELECT COALESCE(disabled,0) FROM dashboard_users WHERE id=?`), userID).Scan(&disabled); err != nil {
+		return map[string]bool{}, nil
+	}
+	if disabled == 1 {
+		return map[string]bool{}, nil
+	}
+	grants, err := s.PermissionOverrides(userID)
+	if err != nil {
+		return nil, err
+	}
+	return rbac.Effective(role, grants), nil
+}
+
+// EffectivePermissionsByUsername is the middleware-facing variant: it keys on
+// the JWT subject (username), matching RoleFor/TokenVersionFor. Disabled or
+// missing users get the empty set.
+func (s *Store) EffectivePermissionsByUsername(username, role string) (map[string]bool, error) {
+	u, _, err := s.GetByUsername(strings.ToLower(username))
+	if err != nil || u == nil || u.Disabled {
+		return map[string]bool{}, nil
+	}
+	return s.EffectivePermissions(u.ID, role)
+}
+
+// SetPermission upserts one override row. granted=true → allow, false → deny.
+// Unknown permission names are rejected so typos can't pollute the table.
+func (s *Store) SetPermission(userID, permission string, granted bool) error {
+	if !rbac.Valid(permission) {
+		return fmt.Errorf("unknown permission %q", permission)
+	}
+	g := 0
+	if granted {
+		g = 1
+	}
+	now := time.Now().UTC()
+	_, err := s.db.Exec(db.Q(`INSERT INTO user_permissions(user_id, permission, granted, created_at, updated_at) VALUES(?,?,?,?,?)`)+
+		db.UpsertEnd([]string{"user_id", "permission"}, []string{"granted", "updated_at"}),
+		userID, permission, g, now, now)
+	return err
+}
+
+// ClearPermission deletes an override row so the role default applies again.
+func (s *Store) ClearPermission(userID, permission string) error {
+	_, err := s.db.Exec(db.Q(`DELETE FROM user_permissions WHERE user_id=? AND permission=?`), userID, permission)
+	return err
 }
 
 func (s *Store) VerifyPassword(username, password string) (*DashboardUser, bool) {

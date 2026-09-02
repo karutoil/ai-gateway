@@ -13,11 +13,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// responsesMidStreamFailStatus mirrors pumpStream's synthetic breaker status:
-// transports dying mid-stream feed the breaker with 599 (classified as
-// failure); clean completions record the real header status.
-const responsesMidStreamFailStatus = 599
-
 // responsesNativeMaxSample bounds the debug-body sample captured from a
 // relayed native stream: at most this many bytes are ever retained while the
 // full body keeps flowing straight through to the client.
@@ -66,16 +61,13 @@ type nativeStreamResult struct {
 //
 // Termination conventions mirror pumpStream exactly:
 //   - clean upstream EOF → recordUsage + logRequestExtendedBodies(isStream)
-//   - breaker success record at the real status;
-//   - abnormal death → breaker.Record(providerID, 599), honest failure logs
-//     (502 / 499-client-gone), nothing further written to the wire (the
-//     upstream already controls the protocol);
+//   - abnormal death → honest failure logs (502 / 499-client-gone), nothing
+//     further written to the wire (the upstream already controls the protocol);
 //   - first-read EOF/error before ANY byte was committed → committed=false so
 //     the caller can fall through to the translated path instead of emitting
 //     garbage.
-func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, resp *http.Response, model, keyPrefix, providerID string, start time.Time) nativeStreamResult {
+func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, resp *http.Response, model, keyPrefix, providerID string, start time.Time, ttfb *ttfbController) nativeStreamResult {
 	res := nativeStreamResult{}
-	breaker := h.breakerOrNoop()
 	ctx := r.Context()
 	upstreamCtx := resp.Request.Context()
 
@@ -112,6 +104,11 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	}
 
 	commit := func() {
+		if ttfb.headersCommitted() {
+			// Keepalive umbra already on the wire; real frames take over.
+			ttfb.stop()
+			return
+		}
 		copyHeader(w.Header(), resp.Header)
 		w.Header().Set("X-Cache", "MISS")
 		w.WriteHeader(resp.StatusCode)
@@ -169,11 +166,6 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	fail := func(reason string, clientGone bool) nativeStreamResult {
 		resp.Body.Close()
 		drainChan(chunks)
-		// Client disconnects are not the provider's fault — only genuine
-		// upstream deaths feed the breaker the synthetic 599 failure.
-		if !clientGone {
-			breaker.Record(providerID, responsesMidStreamFailStatus)
-		}
 		logStatus := http.StatusBadGateway
 		if clientGone {
 			logStatus = 499 // nginx convention: client closed request
@@ -192,7 +184,6 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 			harvestFrame(pending)
 			pending = nil
 		}
-		breaker.Record(providerID, resp.StatusCode)
 		cost := h.costForModel(model, promptTok, completionTok)
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
 		h.logRequestStreamed(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture)
@@ -257,7 +248,7 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 				// True io.EOF = graceful upstream end-of-stream (the decoder
 				// emits io.EOF only for a properly terminated body). Anything
 				// else — including io.ErrUnexpectedEOF from a decapitated
-				// chunked response — is abnormal and feeds the breaker 599.
+				// chunked response — is abnormal.
 				if cm.err == io.EOF {
 					if first {
 						// Zero bytes AND clean EOF before any commit: the
@@ -450,24 +441,14 @@ type responsesPumpResult struct {
 // forced, then re-emits inbound deltas as the OpenAI Responses streaming
 // protocol via pumpResponsesFromStream.
 //
-// Retry/breaker semantics equal proxyWithMetrics pre-commit behavior:
-//   - transport errors or status>=500/429 → breaker.Record + sleepCtx/backoff +
-//     ShouldRetry up to MaxRetries, all BEFORE any byte reaches the client;
+// Retry semantics equal proxyWithMetrics pre-commit behavior:
+//   - transport errors or status>=500/429 → sleepCtx/backoff + ShouldRetry up
+//     to MaxRetries, all BEFORE any byte reaches the client;
 //   - every terminal pre-commit failure writes one clean
 //     `event: response.failed` frame instead of an HTTP-shaped JSON blob;
 //   - after commit there are no retries, ever.
-func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, upstreamBody []byte, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool) {
-	breaker := h.breakerOrNoop()
+func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, upstreamBody []byte, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool, ttfb *ttfbController) {
 	retry := h.retryOrDefault()
-
-	if !breaker.Allow(providerID) {
-		// Same refusal envelope proxyWithMetrics emits when open.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":{"message":"circuit open for provider","type":"proxy_error","code":"circuit_open"}}`))
-		h.logRequestExtended(keyPrefix, providerID, model, "responses", http.StatusServiceUnavailable, time.Since(start).Milliseconds(), 0, 0, 0, true)
-		return
-	}
 
 	ctx := r.Context()
 	var cancelFn context.CancelFunc
@@ -481,19 +462,41 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 	}
 
 	for attempt := 0; ; attempt++ {
+		// Budget spent by the native probe and still nothing committed: this
+		// stream commits keepalive headers, then either retries under the
+		// umbra or terminates with the protocol's response.failed event.
+		if ttfb.expired() && !ttfb.headersCommitted() {
+			ttfb.commitKeepalive(w, "")
+		}
 		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, upstreamBody, true, isAnthropicUpstream)
 		if err != nil {
+			if ttfb.headersCommitted() {
+				ttfb.stop()
+				h.emitTranslatedResponsesFailure(w, model, keyPrefix, providerID, "upstream_error", "failed to create upstream request: "+err.Error(), start)
+				return
+			}
 			h.emitTranslatedResponsesFailure(w, model, keyPrefix, providerID, "upstream_error", "failed to create upstream request: "+err.Error(), start)
 			return
 		}
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		defer attemptCancel()
+		req = req.WithContext(attemptCtx)
+		ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 		resp, err := h.Client.Do(req)
+		if ttfbTimer != nil {
+			ttfbTimer.Stop()
+		}
 		if err != nil {
-			breaker.Record(providerID, 0)
 			if ctx.Err() != nil {
 				// Client cancelled during the retry window: stop silently.
 				log.Warn().Str("model", model).Str("provider", providerID).Msg("client disconnected during translated responses retry window")
 				h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil)
 				return
+			}
+			if ttfb.expired() && !ttfb.headersCommitted() {
+				// Out of first-byte budget: commit keepalive so the client
+				// (and any edge) stays connected through remaining retries.
+				ttfb.commitKeepalive(w, "")
 			}
 			if retry.ShouldRetry(attempt, retryableCode(0)) {
 				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
@@ -509,7 +512,6 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
 			retryable := status == 429 || status >= 500
-			breaker.Record(providerID, status)
 			if retryable && retry.ShouldRetry(attempt, retryableCode(status)) {
 				sleepCtx(r.Context(), retryAfterDelay(resp.Header, retry.Backoff(attempt)))
 				continue
@@ -520,12 +522,7 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 		}
 
 		// Usable 200 + text/event-stream: hand over to the translation pump.
-		out := h.pumpResponsesFromStream(w, r, resp, model, keyPrefix, providerID, start, isAnthropicUpstream)
-		if out.midStreamFailure {
-			breaker.Record(providerID, responsesMidStreamFailStatus)
-		} else {
-			breaker.Record(providerID, status)
-		}
+		h.pumpResponsesFromStream(w, r, resp, model, keyPrefix, providerID, start, isAnthropicUpstream, ttfb)
 		return
 	}
 }
@@ -571,7 +568,7 @@ func (h *Handler) emitTranslatedResponsesFailure(w http.ResponseWriter, model, k
 // (error.code "upstream_error"/"timeout"); client disconnects stop silently.
 // Idle watchdog discipline matches pumpStream. There is no [DONE] sentinel:
 // the protocol terminates with response.completed (or response.failed).
-func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request, resp *http.Response, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool) responsesPumpResult {
+func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request, resp *http.Response, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool, ttfb *ttfbController) responsesPumpResult {
 	res := responsesPumpResult{}
 	ctx := r.Context()
 	upstreamCtx := resp.Request.Context()
@@ -659,6 +656,13 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 	}
 
 	commitAndStart := func() {
+		if ttfb.headersCommitted() {
+			// Keepalive umbra already on the wire: the status line is sent,
+			// but the protocol preamble below must still flow (the client
+			// needs response.created before any delta). Just end the
+			// heartbeat — real frames take over from here.
+			ttfb.stop()
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")

@@ -11,6 +11,15 @@ data/
 .env.local
 .env.*.local
 
+# Database backups (live snapshots; root backups/ and deploy/backups/)
+backups/
+
+# Compiled gateway binary at repo root (anchored: never ignore cmd/gateway/)
+/gateway
+
+# Test scratch output
+models_test_output.json
+
 # Dependencies
 node_modules/
 

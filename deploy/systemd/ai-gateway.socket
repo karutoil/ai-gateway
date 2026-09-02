@@ -1,0 +1,28 @@
+# ai-gateway socket — systemd socket activation.
+#
+# systemd owns the listening socket and holds it open across gateway
+# restarts. Connections arriving while the gateway restarts are queued in the
+# kernel backlog (backlog=4096) and served by the new process — restarts stop
+# dropping requests.
+#
+# Install (root):
+#   cp deploy/systemd/ai-gateway.socket /etc/systemd/system/
+#   cp deploy/systemd/ai-gateway.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now ai-gateway.socket
+#
+# The gateway binds to 127.0.0.1 by default (Cloudflare Tunnel / reverse
+# proxy in front). Change ListenStream for direct exposure.
+
+[Unit]
+Description=AI Gateway listening socket (socket activation)
+
+[Socket]
+ListenStream=127.0.0.1:8080
+Backlog=4096
+# ReusePort would allow multiple independent gateways; SQLite is
+# single-writer, so keep the default (one socket, one process).
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

@@ -9,6 +9,7 @@ import (
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
+	"ai-gateway/internal/rbac"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -26,9 +27,9 @@ type RoutingHandler struct {
 // Routes mounts admin-only endpoints under /lb.
 func (h *RoutingHandler) Routes(r chi.Router) {
 	r.Route("/lb", func(r chi.Router) {
-		r.With(middleware.RequireRole("admin")).Get("/rules", h.ListRules)
-		r.With(middleware.RequireRole("admin")).Put("/rules/{model}", h.PutRule)
-		r.With(middleware.RequireRole("admin")).Delete("/rules/{model}", h.DeleteRule)
+		r.With(middleware.RequirePerm(rbac.PermRoutingRead)).Get("/rules", h.ListRules)
+		r.With(middleware.RequirePerm(rbac.PermRoutingWrite)).Put("/rules/{model}", h.PutRule)
+		r.With(middleware.RequirePerm(rbac.PermRoutingWrite)).Delete("/rules/{model}", h.DeleteRule)
 	})
 }
 
@@ -57,8 +58,8 @@ func (h *RoutingHandler) ListRules(w http.ResponseWriter, r *http.Request) {
 //   - {"strategy":"weighted","members":[{"provider_id":"...","model_override":"...","weight":30}]}
 //   - {"providers":["id-a","id-b"]} (back-compat: round_robin, no overrides)
 type putRuleBody struct {
-	Providers []string          `json:"providers"`
-	Strategy  string            `json:"strategy"`
+	Providers []string             `json:"providers"`
+	Strategy  string               `json:"strategy"`
 	Members   []lb.RuleMemberInput `json:"members"`
 }
 

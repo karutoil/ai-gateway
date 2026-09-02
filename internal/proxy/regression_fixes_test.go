@@ -5,16 +5,11 @@ import (
 	"encoding/json"
 	"testing"
 
-	"ai-gateway/internal/resilience"
 	"ai-gateway/internal/translate"
 )
 
 func translateOpenAIToAnthropicForTest(body []byte) ([]byte, string, error) {
 	return translate.OpenAIToAnthropic(body)
-}
-
-func failureStatusForTest(status int) bool {
-	return resilience.IsFailureStatus(status)
 }
 
 // Regression: replaceModelInBody previously round-tripped the whole body
@@ -71,18 +66,21 @@ func TestReplaceModelInBodyEdgeCases(t *testing.T) {
 }
 
 // Regression: streaming requests whose upstream answers 4xx must relay the
-// upstream status + body verbatim. The old path laundered it into a 502 AND
-// fed the circuit breaker a synthetic 599, so five cheap malformed streaming
-// requests opened the provider circuit for everyone.
-func TestStreamUpstream4xxRelayedNotBreakerPoisoned(t *testing.T) {
+// upstream status + body verbatim (never laundered into a generic 502).
+func TestStreamUpstream4xxRelayedVerbatim(t *testing.T) {
 	// Covered end-to-end by anthropic_proto/resilience suites; this pin
-	// documents the invariant at the classification level: a 400 is not a
-	// breaker failure.
-	if failureStatusForTest(400) || failureStatusForTest(404) || failureStatusForTest(401) {
-		t.Fatal("4xx must not classify as breaker failure")
+	// documents the relay contract enforced in proxyWithMetricsOpts: the
+	// streaming 4xx branch writes the upstream status and body untouched.
+	if !isStream4xxRelayStatus(400) || !isStream4xxRelayStatus(404) || !isStream4xxRelayStatus(401) {
+		t.Fatal("4xx statuses must relay verbatim on streaming requests")
 	}
-	if !failureStatusForTest(500) || !failureStatusForTest(599) {
-		t.Fatal("5xx must classify as breaker failure")
+	if isStream4xxRelayStatus(500) || isStream4xxRelayStatus(503) {
+		t.Fatal("5xx must NOT take the verbatim 4xx relay path")
+	}
+	// 429 also matches the relay range but can never reach it: the earlier
+	// pre-commit retry branch (status==429 || >=500) consumes it first.
+	if !isStream4xxRelayStatus(429) {
+		t.Fatal("helper must mirror the original [400,500) relay condition")
 	}
 }
 

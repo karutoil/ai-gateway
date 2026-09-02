@@ -49,6 +49,21 @@ var migration010SQL string
 //go:embed migrations/011_routing_strategies.sql
 var migration011SQL string
 
+//go:embed migrations/012_key_analytics.sql
+var migration012SQL string
+
+//go:embed migrations/013_user_permissions.sql
+var migration013SQL string
+
+//go:embed migrations/014_key_rotation.sql
+var migration014SQL string
+
+//go:embed migrations/015_key_management.sql
+var migration015SQL string
+
+//go:embed migrations/016_webhook_format.sql
+var migration016SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -222,6 +237,11 @@ func Migrate(db *sql.DB) error {
 		{9, migration009SQL},
 		{10, migration010SQL},
 		{11, migration011SQL},
+		{12, migration012SQL},
+		{13, migration013SQL},
+		{14, migration014SQL},
+			{15, migration015SQL},
+			{16, migration016SQL},
 	}
 
 	for _, m := range migrations {
@@ -394,7 +414,121 @@ func Migrate(db *sql.DB) error {
 	applyHardeningV2Alters(db)
 	applyUsageLoggingAlters(db)
 	applyRoutingAlters(db)
+	applyKeyAnalyticsAlters(db)
+	applyUserPermissionsAlters(db)
+	applyKeyRotationAlters(db)
+	applyKeyFeaturesAlters(db)
 	return nil
+}
+
+// applyKeyFeaturesAlters adds key-management columns (IP allowlist, monthly
+// budget) and creates the PAT/webhook tables for pre-015 databases.
+func applyKeyFeaturesAlters(database *sql.DB) {
+	execAlterIdempotent(database, "ALTER TABLE gateway_keys ADD COLUMN ip_allowlist TEXT NOT NULL DEFAULT ''")
+	execAlterIdempotent(database, "ALTER TABLE gateway_keys ADD COLUMN monthly_budget_usd REAL NOT NULL DEFAULT 0")
+	execAlterIdempotent(database, "ALTER TABLE webhooks ADD COLUMN format TEXT NOT NULL DEFAULT 'json'")
+	// Normalize: rows pointing at Discord/Slack with the default format get
+	// upgraded, since those platforms 400 on raw JSON envelopes. Explicit
+	// non-default choices are never touched. Runs every boot (idempotent).
+	database.Exec("UPDATE webhooks SET format='discord' WHERE format='json' AND (url LIKE '%discord.com/api/webhooks%' OR url LIKE '%discordapp.com/api/webhooks%')")
+	database.Exec("UPDATE webhooks SET format='slack' WHERE format='json' AND url LIKE '%hooks.slack.com%'")
+	stmts := []string {
+		`CREATE TABLE IF NOT EXISTS personal_access_tokens (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			hash TEXT NOT NULL UNIQUE,
+			prefix TEXT NOT NULL,
+			scopes TEXT NOT NULL DEFAULT '',
+			last_used_at DATETIME,
+			expires_at DATETIME,
+			created_at DATETIME NOT NULL,
+			revoked_at DATETIME
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pats_user ON personal_access_tokens(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pats_hash ON personal_access_tokens(hash)`,
+		`CREATE TABLE IF NOT EXISTS webhooks (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			url TEXT NOT NULL,
+			events TEXT NOT NULL DEFAULT '',
+			secret TEXT NOT NULL DEFAULT '',
+			org_id TEXT,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			last_status TEXT,
+			last_delivery DATETIME
+		)`,
+	}
+	for _, s := range stmts {
+		if _, err := database.Exec(s); err != nil {
+			log.Error().Err(err).Msg("key-features alter")
+		}
+	}
+}
+
+// applyKeyRotationAlters adds the key-rotation columns idempotently for
+// pre-migration-014 databases, mirroring migrations/014_key_rotation.sql.
+func applyKeyRotationAlters(db *sql.DB) {
+	execAlterIdempotent(db, "ALTER TABLE gateway_keys ADD COLUMN previous_hash TEXT NOT NULL DEFAULT ''")
+	execAlterIdempotent(db, "ALTER TABLE gateway_keys ADD COLUMN rotated_at DATETIME")
+	execCreateIndexIdempotent(db, "idx_gateway_keys_previous_hash", "CREATE INDEX IF NOT EXISTS idx_gateway_keys_previous_hash ON gateway_keys(previous_hash)")
+}
+
+// execCreateIndexIdempotent creates an index if it does not already exist
+// (CREATE INDEX IF NOT EXISTS is itself idempotent; wrapper for symmetry).
+func execCreateIndexIdempotent(db *sql.DB, name, stmt string) {
+	if _, err := db.Exec(stmt); err != nil {
+		log.Error().Err(err).Msg("failed to create index " + name)
+	}
+}
+
+// applyUserPermissionsAlters adds the fine-grained RBAC schema idempotently
+// for DBs created before migration 013 (legacy unversioned databases),
+// mirroring migrations/013_user_permissions.sql.
+func applyUserPermissionsAlters(db *sql.DB) {
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS user_permissions (
+		user_id    TEXT NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
+		permission TEXT NOT NULL,
+		granted    INTEGER NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		PRIMARY KEY (user_id, permission)
+	)`)
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_user_permissions_user ON user_permissions(user_id)`); err != nil {
+		log.Error().Err(err).Msg("failed to create idx_user_permissions_user")
+	}
+	execAlterIdempotent(db, "ALTER TABLE gateway_keys ADD COLUMN created_by TEXT")
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_gateway_keys_created_by ON gateway_keys(created_by)`); err != nil {
+		log.Error().Err(err).Msg("failed to create idx_gateway_keys_created_by")
+	}
+}
+
+// applyKeyAnalyticsAlters adds request_logs.key_id idempotently for DBs
+// created before migration 012 (legacy unversioned databases), mirroring
+// migrations/012_key_analytics.sql.
+func applyKeyAnalyticsAlters(db *sql.DB) {
+	execAlterIdempotent(db, "ALTER TABLE request_logs ADD COLUMN key_id TEXT")
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_request_logs_key_id ON request_logs(key_id)`); err != nil {
+		log.Error().Err(err).Msg("failed to create idx_request_logs_key_id")
+	}
+}
+
+// BackfillKeyIDs populates request_logs.key_id from gateway_keys.prefix for
+// legacy rows written before per-key attribution existed. Best-effort: rows
+// whose prefix matches multiple keys (legacy DBs refused the UNIQUE index on
+// prefix) or no key at all are left NULL. Called once at boot after Migrate.
+func BackfillKeyIDs(database *sql.DB) (int64, error) {
+	if database == nil {
+		return 0, nil
+	}
+	res, err := database.Exec(`UPDATE request_logs SET key_id = (SELECT k.id FROM gateway_keys k WHERE k.prefix = request_logs.key_prefix) WHERE key_id IS NULL AND key_prefix IN (SELECT prefix FROM gateway_keys)`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // applyRoutingAlters adds the lb_rules strategy columns idempotently for DBs

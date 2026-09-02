@@ -40,6 +40,21 @@ type GatewayKey struct {
 	AllowedModels    []string   `json:"allowed_models,omitempty"`
 	AllowedModelsRaw string     `json:"-"`                // raw JSON string from DB, not exposed
 	OrgID            *string    `json:"org_id,omitempty"` // nullable, Phase 2.5 scaffold — global when NULL
+	// CreatedBy is the dashboard user that created the key (keys:read_own
+	// ownership anchor). NULL for legacy/unowned keys.
+	CreatedBy *string `json:"created_by,omitempty"`
+
+	// ExpiresAt gates authentication: Verify rejects keys past this time.
+	// NULL = never expires.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// RotatedAt tracks the last secret rotation (drives the grace window;
+	// shown as "rotated X ago" in the UI).
+	RotatedAt *time.Time `json:"rotated_at,omitempty"`
+	// IPAllowlist restricts gateway auth to matching client IPs (comma or
+	// space separated IPs/CIDRs; empty = any IP).
+	IPAllowlist string `json:"ip_allowlist,omitempty"`
+	// MonthlyBudgetUSD caps calendar-month spend; 0 = unlimited.
+	MonthlyBudgetUSD float64 `json:"monthly_usd_budget,omitempty"`
 }
 
 // Organization is Phase 2.5 pre-enterprise scaffold — nullable org_id on providers/keys.

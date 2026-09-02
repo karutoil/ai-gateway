@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/models"
@@ -21,6 +22,15 @@ import (
 )
 
 // newTestAdminHandler wires a minimal AdminHandler on :memory: sqlite.
+
+// adminReq wraps a request with admin auth context (RBAC read guards now
+// resolve permissions from the request context).
+func adminReq(path string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, path, nil)
+	r = r.WithContext(auth.WithRole(r.Context(), "admin"))
+	return r.WithContext(auth.WithSubject(r.Context(), "admin"))
+}
+
 func newTestAdminHandler(t *testing.T) (*AdminHandler, func()) {
 	t.Helper()
 	database, err := db.Open(":memory:")
@@ -78,7 +88,7 @@ func TestGetLogReturnsUsageMetadata(t *testing.T) {
 	// chi router (a bare httptest request has no route context).
 	r := chi.NewRouter()
 	r.Get("/api/logs/{id}", h.GetLog)
-	req := httptest.NewRequest(http.MethodGet, "/api/logs/"+id, nil)
+	req := adminReq("/api/logs/" + id)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -112,7 +122,7 @@ func TestStatsHourlyBucketsAndErrors(t *testing.T) {
 	seedLog(t, h, 502, "gpt-a", "", "", "upstream connect failed again", 0, now.Add(-2*time.Hour))
 	seedLog(t, h, 502, "gpt-a", "", "", "upstream connect failed", 0, now.Add(-3*time.Hour))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/stats?range=24h", nil)
+	req := adminReq("/api/stats?range=24h")
 	w := httptest.NewRecorder()
 	h.Stats(w, req)
 	if w.Code != 200 {
@@ -162,7 +172,7 @@ func TestStatsHourlyBucketsAndErrors(t *testing.T) {
 	}
 
 	// 7d range must keep daily (date-only) buckets.
-	req7 := httptest.NewRequest(http.MethodGet, "/api/stats?range=7d", nil)
+	req7 := adminReq("/api/stats?range=7d")
 	w7 := httptest.NewRecorder()
 	h.Stats(w7, req7)
 	var out7 map[string]any
@@ -181,7 +191,7 @@ func TestStatsCacheHitRate(t *testing.T) {
 	seedLog(t, h, 200, "gpt-cache", "stop", "", "", 80, now.Add(-1*time.Hour))
 	seedLog(t, h, 200, "gpt-cache", "stop", "", "", 0, now.Add(-2*time.Hour))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/stats?range=24h", nil)
+	req := adminReq("/api/stats?range=24h")
 	w := httptest.NewRecorder()
 	h.Stats(w, req)
 	var out map[string]any

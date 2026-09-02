@@ -15,17 +15,33 @@
   --c-stone: 44 53 48;       /* borders/dividers#2C3530 */
   --c-muted: 137 152 144;    /* secondary text  #899890 */
   --c-danger: 239 107 107;
+  --c-teal: 44 217 163;      /* brand accent    #2CD9A3 */
+  --c-amber: 255 184 77;     /* warn accent     #FFB84D */
 }
 
 html.light {
   color-scheme: light;
-  --c-graphite: 246 247 245; /* app background  #F6F7F5 */
+  /* Warm grey-green canvas instead of near-white; softens glare while     */
+  /* keeping white cards clearly elevated above the background.            */
+  --c-graphite: 240 242 239; /* app background  #F0F2EF */
   --c-surface: 255 255 255;  /* cards           #FFFFFF */
-  --c-raised: 240 242 239;
+  --c-raised: 229 233 229;
   --c-paper: 23 33 29;       /* ink text        #17211D */
-  --c-stone: 226 231 227;    /* borders         #E2E7E3 */
+  --c-stone: 223 228 223;    /* borders         #DFE4DF */
   --c-muted: 96 109 102;     /* #606D66 */
-  --c-danger: 214 69 69;
+  --c-danger: 202 62 62;
+  /* Softened accents for light mode: the dark-mode neons read as glare   */
+  /* on white. Deeper, desaturated values keep sufficient contrast.       */
+  --c-teal: 9 154 111;       /* #099A6F */
+  --c-amber: 176 116 22;     /* #B07416 */
+}
+
+/* Light mode: shadows tuned for dark surfaces read as harsh grey halos   */
+/* on a light canvas — swap to soft, low-opacity ambient shadows.         */
+html.light {
+  --shadow-card: 0 1px 2px rgb(23 33 29 / 0.06), 0 1px 3px rgb(23 33 29 / 0.04);
+  --shadow-pop: 0 10px 30px rgb(23 33 29 / 0.12), 0 2px 8px rgb(23 33 29 / 0.08);
+  --shadow-glow: 0 0 6px rgb(9 154 111 / 0.35);
 }
 
 html { font-size: 15px; }
@@ -39,7 +55,7 @@ body {
 
 *:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(44 217 163 / 0.45);
+  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(var(--c-teal) / 0.45);
   border-radius: 8px;
 }
 

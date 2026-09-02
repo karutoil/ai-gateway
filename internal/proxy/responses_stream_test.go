@@ -417,9 +417,9 @@ func TestResponsesStreamAnthropicGoldenSkipsThinking(t *testing.T) {
 	}
 }
 
-// --------------------------------------- 3. mid-stream truncation → breaker
+// --------------------------------------- 3. mid-stream truncation → honest failure
 
-func TestResponsesStreamMidStreamTruncationMarksBreaker(t *testing.T) {
+func TestResponsesStreamMidStreamTruncationFailsHonestly(t *testing.T) {
 	up := rsNewUpstream(t, map[string]http.HandlerFunc{
 		"/v1/responses": func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) },
 		"/v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
@@ -439,10 +439,7 @@ func TestResponsesStreamMidStreamTruncationMarksBreaker(t *testing.T) {
 		},
 	})
 
-	breaker := resilience.NewMemoryCircuitBreaker(1, time.Minute, time.Minute)
-	gw := rsNewGateway(t, models.ProviderOpenAI, up.srv.URL+"/v1", func(h *Handler) {
-		h.Breaker = breaker
-	})
+	gw := rsNewGateway(t, models.ProviderOpenAI, up.srv.URL+"/v1", func(h *Handler) {})
 
 	resp := rsPostStreaming(t, gw, `{"model":"gpt-rs-test","input":"hi","stream":true}`)
 	raw, _ := io.ReadAll(resp.Body) // truncated body: read anomalies tolerated
@@ -469,16 +466,6 @@ func TestResponsesStreamMidStreamTruncationMarksBreaker(t *testing.T) {
 	// post-commit retry must never re-fire against the provider.
 	if n := up.hitsFor("/v1/chat/completions"); n != 1 {
 		t.Fatalf("post-commit retry detected: %d upstream hits, want 1", n)
-	}
-
-	// threshold=1 breaker + one 599 record ⇒ open. The Record happens right
-	// after the terminator flushes; poll briefly to absorb scheduling races.
-	deadline := time.Now().Add(3 * time.Second)
-	for breaker.State(gw.provID) != "open" {
-		if time.Now().After(deadline) {
-			t.Fatalf("breaker state = %q, want open", breaker.State(gw.provID))
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 

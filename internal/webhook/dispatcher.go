@@ -188,8 +188,18 @@ func (h *HTTPDispatcher) deliver(event string, body []byte) bool {
 	return true
 }
 
-// Global dispatcher used by audit recorder; swapped in tests.
+// Global dispatcher used by audit recorders and any emitter. Replaced at
+// startup (SetGlobal) when DB-backed webhooks are configured; defaults to
+// a no-op so hot paths never need nil checks.
 var Global Dispatcher = &EmptyDispatcher{}
+
+// SetGlobal swaps the process-wide dispatcher (boot installs the
+// DB-backed multi-webhook dispatcher at startup).
+func SetGlobal(d Dispatcher) {
+	if d != nil {
+		Global = d
+	}
+}
 
 func init() {
 	ReinitFromEnv()

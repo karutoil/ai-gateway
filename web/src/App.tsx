@@ -11,16 +11,18 @@ import Analytics from './pages/Analytics'
 import Settings from './pages/Settings'
 import Teams from './pages/Teams'
 import Users from './pages/Users'
+import WebhooksPage from './pages/Webhooks'
 import Audit from './pages/Audit'
 import Profile from './pages/Profile'
 import { authenticatePasskey } from './lib/webauthn'
 import { extractApiError } from './lib/api'
+import { setCurrentPermissions, can, type Perm } from './lib/permissions'
 import {
   Icon, Button, Input, Card, ErrorNote, SegmentedControl,
   useClickOutside, useToastStore, Toaster, type IconName,
 } from './components/ui'
 
-type SessionUser = { username: string; role: string }
+type SessionUser = { username: string; role: string; permissions?: string[] }
 
 function useAuth() {
   // Identity lives in React state only. Authentication rides on the HttpOnly
@@ -39,7 +41,9 @@ function useAuth() {
         const res = await fetch('/api/admin/users/me', { credentials: 'same-origin' })
         if (res.ok && !cancelled) {
           const me = await res.json()
-          setUser({ username: me.username || '', role: me.role || '' })
+          setUser({ username: me.username || '', role: me.role || '', permissions: me.permissions })
+          // Feed the permission module (can()/canSeeKeys() helpers).
+          setCurrentPermissions((me.permissions as Perm[] | undefined) ?? null, me.role || '')
         }
       } catch {}
       finally { if (!cancelled) setChecking(false) }
@@ -52,13 +56,17 @@ function useAuth() {
   // renders — previously this event had no listener and pages kept failing
   // silently behind a stale "signed-in" shell.
   useEffect(() => {
-    const onUnauthorized = () => setUser(null)
+    const onUnauthorized = () => {
+      setUser(null)
+      setCurrentPermissions(null, '')
+    }
     window.addEventListener('gw:unauthorized', onUnauthorized)
     return () => window.removeEventListener('gw:unauthorized', onUnauthorized)
   }, [])
 
   const applyIdentity = (u: Partial<SessionUser>|undefined) => {
-    setUser({ username: u?.username || '', role: u?.role || '' })
+    setUser({ username: u?.username || '', role: u?.role || '', permissions: u?.permissions })
+    setCurrentPermissions((u?.permissions as Perm[] | undefined) ?? null, u?.role || '')
   }
 
   const login = async (username: string, pw: string) => {
@@ -119,37 +127,41 @@ function useTheme() {
 /* Navigation model                                                    */
 /* ------------------------------------------------------------------ */
 
-type NavItem = { to: string; label: string; icon: IconName; adminOnly?: boolean }
+type NavItem = { to: string; label: string; icon: IconName; adminOnly?: boolean; perm?: Perm; permAny?: Perm[] }
 const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
   {
     title: 'Overview',
     items: [
-      { to: '/', label: 'Dashboard', icon: 'pulse' },
-      { to: '/analytics', label: 'Analytics', icon: 'chart' },
+      // Dashboard/Analytics show SCOPED stats for keys:read_own-only users
+      // (the backend narrows /api/stats to their keys' traffic), so any of
+      // these perms grants access.
+      { to: '/', label: 'Dashboard', icon: 'pulse', permAny: ['logs:read', 'keys:read_own'] },
+      { to: '/analytics', label: 'Analytics', icon: 'chart', permAny: ['analytics:read', 'keys:read_own'] },
     ],
   },
   {
     title: 'Control',
     items: [
-      { to: '/providers', label: 'Providers', icon: 'server' },
-      { to: '/models', label: 'Models', icon: 'box' },
-      { to: '/routing', label: 'Routing', icon: 'route' },
+      { to: '/providers', label: 'Providers', icon: 'server', perm: 'providers:read' },
+      { to: '/models', label: 'Models', icon: 'box', perm: 'catalog:read' },
+      { to: '/routing', label: 'Routing', icon: 'route', perm: 'routing:read' },
     ],
   },
   {
     title: 'Access',
     items: [
-      { to: '/keys', label: 'API Keys', icon: 'key' },
-      { to: '/teams', label: 'Teams', icon: 'users', adminOnly: true },
-      { to: '/users', label: 'Users', icon: 'userCog', adminOnly: true },
-      { to: '/audit', label: 'Audit', icon: 'shield', adminOnly: true },
+      { to: '/keys', label: 'API Keys', icon: 'key', perm: 'keys:read_own' },
+      { to: '/teams', label: 'Teams', icon: 'users', permAny: ['orgs:read', 'orgs:write'] as Perm[] },
+      { to: '/users', label: 'Users', icon: 'userCog', perm: 'users:read' },
+      { to: '/webhooks', label: 'Webhooks', icon: 'zap', perm: 'settings:write' },
+			{ to: '/audit', label: 'Audit', icon: 'shield', perm: 'audit:read' },
     ],
   },
   {
     title: 'System',
     items: [
       { to: '/playground', label: 'Playground', icon: 'play' },
-      { to: '/logs', label: 'Request Logs', icon: 'logs' },
+      { to: '/logs', label: 'Request Logs', icon: 'logs', permAny: ['logs:read', 'keys:read_own'] },
       { to: '/settings', label: 'Settings', icon: 'cog' },
     ],
   },
@@ -157,7 +169,18 @@ const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
 
 function visibleGroups(role: string) {
   return NAV_GROUPS
-    .map((g) => ({ ...g, items: g.items.filter((i) => !i.adminOnly || role === 'admin') }))
+    .map((g) => ({
+      ...g,
+      items: g.items.filter((i) => {
+        if (i.adminOnly && role !== 'admin') return false
+        // Permission-gated entries: hide when the perm is absent. permAny =
+        // visible when ANY listed perm holds (e.g. Dashboard for org-wide
+        // readers and for keys:read_own users alike).
+        if (i.permAny && !i.permAny.some((p) => can(p as Perm))) return false
+        if (i.perm && !can(i.perm)) return false
+        return true
+      }),
+    }))
     .filter((g) => g.items.length > 0)
 }
 
@@ -377,7 +400,8 @@ export default function App() {
             <Route path="/analytics" element={<Analytics />} />
             <Route path="/settings" element={<Settings role={role} />} />
             <Route path="/teams" element={<Teams role={role} />} />
-            <Route path="/users" element={role==='admin' ? <Users /> : <Navigate to="/" replace />} />
+            <Route path="/webhooks" element={<WebhooksPage />} />
+			<Route path="/users" element={role==='admin' ? <Users /> : <Navigate to="/" replace />} />
             <Route path="/audit" element={role==='admin' ? <Audit /> : <Navigate to="/" replace />} />
             <Route path="/profile" element={<Profile onSessionRevoked={() => logout('Password changed — please sign in again')} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
@@ -562,9 +586,6 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
           )}
 
           <div className="mt-5 space-y-4">
-            {mode !== 'recovery' && (
-              <Input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} autoComplete="username" />
-            )}
             {mode==='password' && (
               <>
                 <Input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} autoComplete="username" />
@@ -574,11 +595,6 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
                 <Button variant="primary" disabled={busy} onClick={doLogin} className="w-full">
                   {busy ? 'Signing in…' : 'Sign in'}
                 </Button>
-                <p className="text-[11px] text-muted leading-relaxed text-center">
-                  Default sign-in: username <code className="font-mono text-muted">admin</code> with the{' '}
-                  <code className="font-mono text-muted">ADMIN_PASSWORD</code> you configured (default{' '}
-                  <code className="font-mono text-muted">admin123</code>). Change it after first login.
-                </p>
               </>
             )}
             {mode==='passkey' && (
@@ -597,6 +613,7 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
             )}
             {mode==='recovery' && (
               <>
+                <Input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} autoComplete="username" />
                 <Input placeholder="Recovery code (XXXX-XXXX-XXXX-XXXX)" value={recoveryCode}
                   onChange={e=>setRecoveryCode(e.target.value)} className="font-mono" />
                 <ErrorNote message={err} />
@@ -610,8 +627,7 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
             )}
           </div>
 
-          <div className="mt-6 pt-4 border-t border-stone flex items-center justify-between">
-            <span className="text-xs text-muted">Admins create accounts under Users.</span>
+          <div className="mt-6 pt-4 border-t border-stone flex items-center justify-end">
             <button onClick={toggle} aria-label="Toggle theme"
               className="w-8 h-8 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-stone/40">
               <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={15} />

@@ -75,8 +75,8 @@ SDKs only need a `baseURL` change plus your `sk-gw-*` key. OpenAI, Anthropic (`/
 - **Gateway keys** — `sk-gw-*`, per-key rate limits and token/cost quotas
 - **Auth** — dashboard JWT, passkeys + recovery codes, optional OIDC SSO, org/team RBAC
 - **Catalog** — 6k+ models with $/1M pricing; virtual aliases (`fast` → `openai/gpt-4o-mini`)
-- **Routing** — curated provider groups per model with selectable strategies: round-robin, random, weighted (per-member 1–100), or failover (priority order); per-member model overrides; down-member and open-circuit skipping; unrouted bare model names are rejected (`model_not_routed`) unless `ROUTING_LEGACY_FALLBACK=true`
-- **Resilience** — circuit breaker, bounded retries, exact-match response cache (in-memory or Redis)
+- **Routing** — curated provider groups per model with selectable strategies: round-robin, random, weighted (per-member 1–100), or failover (priority order); per-member model overrides; down-member skipping; unrouted bare model names are rejected (`model_not_routed`) unless `ROUTING_LEGACY_FALLBACK=true`
+- **Resilience** — bounded retries with exponential backoff, cross-provider failover, exact-match response cache (in-memory or Redis)
 - **Ops** — Prometheus `/metrics`, OpenTelemetry scaffold, request logs with retention purge, audit trail + webhooks, production hardening that refuses weak configs
 
 Routing in one line: bare model names follow routing rules (Dashboard → *Routing*, which fetches each provider's model list via its API); `openai/gpt-4o-mini` **pins** the provider; `X-Provider:` header pins hardest; non-failover strategies serve each request with one member — a failing member returns its own error (use the `failover` strategy to walk members in order).
@@ -104,7 +104,7 @@ Everything is env-driven (`.env` next to the binary is loaded automatically — 
 | `METRICS_PROTECT` | `false` | Require admin auth on `/metrics` |
 | `ROUTING_LEGACY_FALLBACK` | `false` | Restore pre-strategy heuristic resolution (provider-models ownership, name heuristics, default provider) for bare model names with no routing rule. Default off: unrouted bare models get `404 model_not_routed` |
 
-Full reference: `.env.example` (covers timeouts, retries, breaker tuning, webhooks, OIDC).
+Full reference: `.env.example` (covers timeouts, retries, webhooks, OIDC).
 
 **Production checklist** (`ENV=production` refuses to boot otherwise): strong `ADMIN_PASSWORD`, explicit `MASTER_KEY` + `JWT_SECRET` (`openssl rand -hex 32`), non-wildcard CORS via `PUBLIC_URL`/`CORS_ALLOWED_ORIGINS`, persistent `DATABASE_URL`. Recommended: `METRICS_PROTECT=true`, `TRUSTED_PROXIES` set to your proxy CIDRs (loopback default suits a same-host tunnel), `LOG_RETENTION_DAYS=30`, Redis when running multiple replicas.
 
@@ -151,7 +151,7 @@ Client (OpenAI/Anthropic SDK, curl)
   │           orgs, routing rules, catalog, stats, logs, audit, UI
   └─ /v1/*    gateway API (sk-gw-*): rate limits + budgets →
               translate? → resolve route → decrypt key → proxy
-              (SSE-aware, retry, breaker, cache) → log usage/cost
+              (SSE-aware, retry, cache) → log usage/cost
 ```
 
 See `ARCHITECTURE.md` for design details, `openapi.yaml` for the API surface, and `docs/muse-harness.md` for the live tool-calling harness.

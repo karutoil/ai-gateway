@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import { registerPasskey } from '../lib/webauthn'
+import ProfileTokens from './ProfileTokens'
 import {
   PageHeader, Card, Button, Input, Field, Badge, Icon, CopyButton,
   Skeleton, EmptyState, ErrorNote, Confirm, useToast,
@@ -338,6 +339,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         confirmLabel="Disable all"
         body="This removes ALL your passkeys on this account — every credential enrolled from any device stops working, and you will need your password (or recovery code) to sign in."
       />
+		<ProfileTokens />
     </div>
   )
 }

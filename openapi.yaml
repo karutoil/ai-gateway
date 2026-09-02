@@ -237,6 +237,23 @@ paths:
                 name: { type: string, example: my-key }
       responses:
         '200': { description: updated }
+  /api/keys/{id}/analytics:
+    get:
+      summary: Per-key usage analytics (range rollups, org-scoped)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: range
+          in: query
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+      responses:
+        '200':
+          description: usage rollups for one gateway key (all-time + windowed totals, time buckets, top models, endpoints, latency percentiles, error breakdown)
+        '404': { description: unknown key (or other org's key) }
   /api/keys/{id}/rate-limit:
     put:
       summary: Update per-key RPM (audited, legacy)
@@ -978,6 +995,35 @@ paths:
           in: query
           schema: { type: string }
           description: RFC3339 timestamp or Go duration (e.g. "24h")
+        - name: key_id
+          in: query
+          schema: { type: string }
+          description: exact gateway key id (the per-key analytics attribution column)
+        - name: provider_id
+          in: query
+          schema: { type: string }
+          description: exact provider id
+        - name: stream
+          in: query
+          schema: { type: string, enum: ['true', 'false'] }
+          description: filter to streaming or non-streaming requests
+        - name: min_latency_ms
+          in: query
+          schema: { type: integer }
+        - name: max_latency_ms
+          in: query
+          schema: { type: integer }
+        - name: has_error
+          in: query
+          schema: { type: string, enum: ['true'] }
+        - name: q
+          in: query
+          schema: { type: string }
+          description: server-side search over model, endpoint and error text (case-insensitive)
+        - name: search_bodies
+          in: query
+          schema: { type: string, enum: ['true'] }
+          description: opt-in — extend q search to stored request/response bodies (expensive)
       responses:
         '200':
           description: log rows (array) — total matching count in X-Total-Count
@@ -998,6 +1044,88 @@ paths:
       responses:
         '200': { description: log detail }
         '404': { description: not found }
+  /api/logs/group:
+    get:
+      summary: Group-by reporting rollup over the /api/logs filter set
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: group_by
+          in: query
+          schema: { type: string, enum: [key, model, provider, endpoint, finish_reason, status, error], default: model }
+        - name: range
+          in: query
+          schema: { type: string, enum: [24h, 7d, 30d], default: 7d }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+        - name: order
+          in: query
+          schema: { type: string, enum: [requests, cost, tokens], default: requests }
+        - name: filters
+          in: query
+          description: all /api/logs filter params are honored (model, key_id, provider_id, status, stream, has_error, q, …)
+          schema: { type: object }
+      responses:
+        '200':
+          description: one row per group with requests, tokens, cost, failed, avg/p50/p95 latency_ms
+        '400': { description: unknown group_by }
+  /api/logs/export:
+    get:
+      summary: Download the filtered log set as CSV
+      description: Streams text/csv with the same filters as /api/logs; capped at 50,000 rows (X-Truncated: true when hit).
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: filters
+          in: query
+          description: all /api/logs filter params are honored
+          schema: { type: object }
+      responses:
+        '200':
+          description: text/csv attachment with columns id, key_prefix, key_id, provider_id, model, endpoint, status, latency_ms, ttft_ms, created_at, prompt_tokens, completion_tokens, total_tokens, cost_usd, is_stream, finish_reason, error
+  /api/admin/users/{id}/permissions:
+    get:
+      summary: Effective permissions + overrides for a user (users:read)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: effective (sorted permission list), overrides (permission → granted bool), catalog (all known permissions)
+        '404': { description: unknown user }
+    put:
+      summary: Upsert permission overrides (users:write)
+      description: |
+        Body maps permission names to true (grant), false (revoke) or null
+        (clear the override; role default applies). Unknown permissions are
+        rejected with 400. Changes apply live — no re-login required.
+        Admin users are fixed (400): admins always allow everything.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                type: boolean
+                nullable: true
+              example: { "keys:read_own": true, "keys:create": false, "audit:read": null }
+      responses:
+        '200': { description: updated — returns the recomputed effective set }
+        '400': { description: unknown permission or admin target }
+        '403': { description: missing users:write }
   /api/audit:
     get:
       summary: Audit trail (admin only)

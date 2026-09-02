@@ -41,7 +41,6 @@ func setupResilienceServer(t *testing.T, upstream http.HandlerFunc) (*httptest.S
 	h := newLegacyHandler(ps, database)
 	h.Cache = cache.NewMemoryCache(32)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 2, BaseDelay: time.Millisecond}
-	h.Breaker = resilience.NewMemoryCircuitBreaker(5, time.Minute, 30*time.Second)
 	r := chi.NewRouter()
 	r.Use(middleware.GatewayAuth(ks))
 	r.Post("/v1/chat/completions", h.ChatCompletions)
@@ -139,14 +138,14 @@ func TestCacheHitOnRepeatPost(t *testing.T) {
 	}
 }
 
-func TestCircuitOpenSkipsUpstream(t *testing.T) {
+func TestUpstream500AlwaysReachesUpstream(t *testing.T) {
 	var hits atomic.Int32
 	srv, h, key, _ := setupResilienceServer(t, func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		w.WriteHeader(500)
 		w.Write([]byte(`{"error":{"message":"down"}}`))
 	})
-	h.Breaker = resilience.NewMemoryCircuitBreaker(1, time.Minute, 30*time.Second)
+	_ = h
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 0, BaseDelay: time.Millisecond}
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}`
@@ -169,17 +168,20 @@ func TestCircuitOpenSkipsUpstream(t *testing.T) {
 	if r1.StatusCode != 500 && r1.StatusCode != http.StatusBadGateway {
 		t.Fatalf("first expected 500/502 got %d", r1.StatusCode)
 	}
+	// There is no circuit breaker: the second request must reach the upstream
+	// again (hits=2) and fail with the same honest status — never a
+	// short-circuit 503 circuit_open.
 	r2 := do()
 	b, _ := io.ReadAll(r2.Body)
 	r2.Body.Close()
-	if r2.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 circuit_open got %d %s", r2.StatusCode, string(b))
+	if r2.StatusCode != 500 && r2.StatusCode != http.StatusBadGateway {
+		t.Fatalf("second expected 500/502 got %d %s", r2.StatusCode, string(b))
 	}
-	if !strings.Contains(string(b), "circuit_open") {
-		t.Fatalf("expected circuit_open body %s", string(b))
+	if strings.Contains(string(b), "circuit_open") {
+		t.Fatalf("circuit breaker should be gone, body %s", string(b))
 	}
-	if hits.Load() != 1 {
-		t.Fatalf("second request must not hit upstream, hits=%d", hits.Load())
+	if hits.Load() != 2 {
+		t.Fatalf("every request must reach the upstream, hits=%d", hits.Load())
 	}
 }
 

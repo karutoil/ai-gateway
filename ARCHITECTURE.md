@@ -14,7 +14,7 @@ Single gateway (`https://ai.yourdomain.com`) that speaks **OpenAI**, **OpenAI Re
                                │  ├─ provider registry            ├─> [ Provider: Azure OpenAI ]
                                │  ├─ translation layer            └─> [ Provider: OpenAI-compatible (Groq, Ollama, etc.) ]
                                │  ├─ streaming proxy (SSE)
-                               │  ├─ cache / retry / breaker / budgets (done)
+                               │  ├─ cache / retry / budgets (done)
                                │  ├─ metrics, audit, webhooks, RBAC (done)
                                │  └─ admin API + UI (embedded)
                                └─ SQLite (+AES-GCM at rest) or Postgres (beta)
@@ -29,7 +29,7 @@ Single gateway (`https://ai.yourdomain.com`) that speaks **OpenAI**, **OpenAI Re
 | **Phase 1 — Foundation** | ✅ DONE | proxy + translate httptest suites, provider/keys CRUD, embedded UI |
 | **Phase 1.5 — Model Intelligence** | ✅ DONE | models.dev catalog sync, aliases, enriched /v1/models, token/cost logging, health checker |
 | **Phase 1.6 — Hardening** | ✅ DONE | versioned migrations (`db/migrations/001–009`), unified `httperr` envelope, audit_logs, config fail-closed in prod, openapi.yaml |
-| **Phase 2 — Resilience & Control** | ✅ DONE | response cache (memory + Redis), retry/failover pre-commit, circuit breaker, budgets + ledger enforcement, `/metrics`, `/ready` |
+| **Phase 2 — Resilience & Control** | ✅ DONE | response cache (memory + Redis), retry/failover pre-commit, budgets + ledger enforcement, `/metrics`, `/ready` |
 | **Phase 2.5 — Pre-Enterprise** | ✅ DONE | orgs + memberships, `RequireRole` enforcement, webhook dispatcher (HMAC-signed), passkeys + recovery, dashboard users/RBAC |
 | **Future — Phase 3** | ⏳ PLANNED | OTel trace/OTLP export, Stripe billing, semantics-aware cache, Postgres soak-testing (dialect works today, labeled beta) |
 
@@ -55,7 +55,7 @@ ai-gateway/
     passkey/    # WebAuthn registration/login + recovery codes (handler/store/webauthn)
     budget/     # per-key quota limiter + middleware + UsageSink ledger
     cache/      # Cache interface: MemoryCache + RedisCache (REDIS_URL)
-    resilience/ # RetryPolicy (5xx/429, pre-commit only) + MemoryCircuitBreaker
+    resilience/ # RetryPolicy (5xx/429, pre-commit only)
     lb/         # load-balancer routing rules store (ordered provider groups)
     audit/      # audit_logs Recorder + request-auditing Middleware
     webhook/    # async HTTP dispatcher, optional HMAC signing (WEBHOOK_URL/WEBHOOK_SECRET)
@@ -64,7 +64,7 @@ ai-gateway/
     middleware/ # RequestID, Recovery, Logger, CSRF, GatewayAuth, rate limiters, RequireRole
     handler/    # admin.go (providers/keys/stats/logs/billing), catalog.go, discovery.go,
                 # routing.go (lb rules), org.go, users.go, profile.go, session.go (cookies)
-    proxy/      # reverse proxy, SSE, caching, retries, breakers, LB routing, stream usage inject
+    proxy/      # reverse proxy, SSE, caching, retries, LB routing, stream usage inject
     translate/  # anthropic <-> openai <-> responses protocol translation
     discovery/  # provider model discovery (OpenAI/Anthropic /models, models.dev enrich)
     e2e/        # live E2E (build tag: live; GATEWAY_URL/GATEWAY_KEY/MODEL/ADMIN_PASSWORD)
@@ -131,7 +131,6 @@ Reasoning mapping: OpenAI `reasoning_effort` (low/medium/high/max) <-> Anthropic
 
 - **Routing rules** (`lb`): per-model provider group with a **strategy** — `round_robin` (default; rotate evenly across requests), `random`, `weighted` (per-member weight 1–100, proportional pick), or `failover` (first healthy member in position order; later members only on retriable failure — the only strategy with cross-provider failover). Down members and open circuits are skipped where a healthy sibling exists; non-failover strategies serve each request with ONE member (a failing member returns its own error after same-provider retries). Members may carry a `model_override` — the model id rewritten onto the outbound request for that member. Unrouted bare model names are rejected with **404 `model_not_routed`**; `ROUTING_LEGACY_FALLBACK=true` restores the old heuristic resolution (provider-models ownership, name heuristics, default provider) as a migration escape hatch. Qualified `provider/model` IDs and `X-Provider:` pin requests bypass rules; aliases resolve first. Model lists for rules come from per-provider discovery (`POST /api/providers/{id}/discover` fetches the provider's `/models` API).
 - **Retries**: `RETRY_MAX_RETRIES` (default 2) with exponential backoff on 5xx/429 — only while **nothing is committed**; streaming requests retry until the first byte is committed, then fail honestly.
-- **Circuit breaker**: per provider, `BREAKER_*` env; open circuits short-circuit with `circuit_open` (surfaced via `/api/providers`).
 - **Cache**: exact-match response cache (`X-Cache: HIT|MISS`), in-memory or Redis; `CACHE_TTL_SECONDS`.
 - **Budgets**: per-key daily/monthly token + cost quotas enforced in `budget.Middleware` with a ledger (`429 over_quota_error`).
 - **Usage metering**: `STREAM_USAGE_INJECT` (default **true**) injects `include_usage` so OpenAI-compatible streams are metered; opt out with `STREAM_USAGE_INJECT=0`.
@@ -163,7 +162,7 @@ models.dev ingestion + sync API, catalog search, virtual aliases, enriched `/v1/
 Versioned embedded migrations (`schema_migrations`, dirty-flag abort), unified `httperr` error envelope (4xx never retried), audit_logs + read API, config fail-closed for `ENV=production` (strong ADMIN_PASSWORD, explicit MASTER_KEY/JWT_SECRET, no wildcard CORS), request validation caps, `/ready` split from `/health`, openapi.yaml served at `/openapi.yaml`.
 
 ### Phase 2 — Resilience & Control — ✅ DONE
-Response cache (memory + Redis adapter), retry with exponential backoff (pre-commit only), circuit breaker, budget quotas + ledger, Prometheus `/metrics`, `/ready`, analytics rollups (`/api/stats?range=`), billing CSV export.
+Response cache (memory + Redis adapter), retry with exponential backoff (pre-commit only), budget quotas + ledger, Prometheus `/metrics`, `/ready`, analytics rollups (`/api/stats?range=`), billing CSV export.
 
 ### Phase 2.5 — Pre-Enterprise — ✅ DONE
 Organizations + memberships, dashboard users with roles + token_version revocation, `RequireRole` enforcement, passkeys (WebAuthn) + single-use recovery codes, HMAC-signed webhook dispatcher, `/api/admin/users` management API, profile activity/logins feeds.
@@ -205,5 +204,5 @@ Organizations + memberships, dashboard users with roles + token_version revocati
 ## Operational Runbook (pointers)
 - `GET /health` (liveness + db + config_ok) vs `GET /ready` (503 when DB down); openapi at `/openapi.yaml`.
 - Migrations run automatically at boot; a dirty flag aborts startup until resolved manually (see README → Operations).
-- `REDIS_URL` shares cache + rate-limit state across replicas; breaker state and the budget ledger remain per-instance/SQLite (single writer).
+- `REDIS_URL` shares cache + rate-limit state across replicas; the budget ledger remains per-instance/SQLite (single writer).
 - `WEBHOOK_URL` (+ `WEBHOOK_SECRET`) fans out audit/billing/over-quota events; `OIDC_*` enables SSO; `LOG_RETENTION_DAYS` purges request logs nightly.

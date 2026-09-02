@@ -1,0 +1,35 @@
+# AI Gateway — production Podman stack.
+#
+# The local dev gateway (./bin/gateway, port 8787) stays untouched; this stack
+# is the production instance and binds host port 8090 (8080 is taken on this
+# host by another service).
+#
+# Start:   cd deploy/production && podman compose -f podman-compose.prod.yml up -d --build
+# Stop:    podman compose -f podman-compose.prod.yml down
+# Logs:    podman logs -f ai-gateway-prod
+#
+# Point your Cloudflare Tunnel at http://localhost:8090.
+
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ai-gateway:prod
+    container_name: ai-gateway-prod
+    ports:
+      - "8090:8090"
+    env_file:
+      - .env
+    environment:
+      PORT: 8090
+      DATABASE_URL: /data/gateway.db
+    volumes:
+      # Migrated copy of the dev database + auto-generated key files live here.
+      - ./data:/data
+    # No built-in healthcheck: the image ships without curl/wget. Probe
+    # GET /health or /ready from your orchestrator/monitoring instead.
+    restart: unless-stopped
+
+# Single-replica prod: SQLite is the single writer. Add Redis (REDIS_URL) or
+# move to Postgres before running more than one replica.

@@ -342,6 +342,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 			return WebAuthnUser{DashboardUser: u, Creds: creds}, nil
 		}, entry.Data, r)
 		if err != nil {
+			log.Error().Err(err).Str("session_id", sessionID).Msg("webauthn finish discoverable login failed")
 			http.Error(w, `{"error":"auth failed: "}`+err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -413,6 +414,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 	// Otherwise r.Body is original credential
 	cred, err := h.WebAuthn.FinishLogin(waUser, entry.Data, r)
 	if err != nil {
+		log.Error().Err(err).Str("user_id", waUser.ID).Msg("webauthn finish login failed")
 		http.Error(w, `{"error":"auth failed"}`, http.StatusUnauthorized)
 		return
 	}

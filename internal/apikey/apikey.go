@@ -52,13 +52,23 @@ func (s *Store) Create(name string) (*models.GatewayKey, error) {
 	return s.CreateWithOrg(name, "")
 }
 
-func (s *Store) CreateWithOrg(name, orgID string) (*models.GatewayKey, error) {
+// CreateWithOrg creates a key. createdBy optionally records the dashboard
+// user that created it (the keys:read_own ownership anchor); empty means
+// unowned (visible only to keys:read holders and admins).
+func (s *Store) CreateWithOrg(name, orgID string, createdBy ...string) (*models.GatewayKey, error) {
 	raw := Generate()
 	hash := Hash(raw)
 	pfx := Prefix(raw)
 	id := uuid.NewString()
 	now := time.Now().UTC()
-	_, err := s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm,org_id) VALUES(?,?,?,?,?,?,?)`), id, name, pfx, hash, now, 60, sql.NullString{String: orgID, Valid: orgID != ""})
+	var owner string
+	if len(createdBy) > 0 {
+		owner = createdBy[0]
+	}
+	_, err := s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm,org_id,created_by) VALUES(?,?,?,?,?,?,?,?)`), id, name, pfx, hash, now, 60, sql.NullString{String: orgID, Valid: orgID != ""}, sql.NullString{String: owner, Valid: owner != ""})
+	if err != nil && (strings.Contains(err.Error(), "created_by") || strings.Contains(err.Error(), "org_id")) {
+		_, err = s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm,org_id) VALUES(?,?,?,?,?,?,?)`), id, name, pfx, hash, now, 60, sql.NullString{String: orgID, Valid: orgID != ""})
+	}
 	if err != nil && strings.Contains(err.Error(), "org_id") {
 		_, err = s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm) VALUES(?,?,?,?,?,60)`), id, name, pfx, hash, now)
 	}
@@ -70,6 +80,9 @@ func (s *Store) CreateWithOrg(name, orgID string) (*models.GatewayKey, error) {
 	}
 	if orgID != "" {
 		k.OrgID = &orgID
+	}
+	if owner != "" {
+		k.CreatedBy = &owner
 	}
 	return k, nil
 }
@@ -119,7 +132,7 @@ func (s *Store) ListForOrg(orgID string) ([]models.GatewayKey, error) {
 	if orgID == "" {
 		return s.List()
 	}
-	rows, err := s.db.Query(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id FROM gateway_keys ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id,COALESCE(created_by,''),expires_at,rotated_at,COALESCE(ip_allowlist,''),COALESCE(monthly_budget_usd,0) FROM gateway_keys ORDER BY created_at DESC`)
 	if err != nil {
 		if strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph") || strings.Contains(err.Error(), "rate_limit_rpd") || strings.Contains(err.Error(), "rate_limit_tpm") {
 			return s.List()
@@ -134,14 +147,31 @@ func (s *Store) ListForOrg(orgID string) ([]models.GatewayKey, error) {
 	for rows.Next() {
 		var k models.GatewayKey
 		var rpm, rph, rpd, tpm sql.NullInt64
-		var org sql.NullString
-		var allowed sql.NullString
-		if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org); err != nil {
+		var org, allowed, createdBy sql.NullString
+		var expiresAt, rotatedAt sql.NullTime
+		var ipAllow sql.NullString
+		var monthlyBudget sql.NullFloat64
+		if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org, &createdBy, &expiresAt, &rotatedAt, &ipAllow, &monthlyBudget); err != nil {
 			return nil, err
 		}
 		scanGatewayKey(&k, rpm, rph, rpd, tpm, allowed)
+		if expiresAt.Valid {
+			k.ExpiresAt = &expiresAt.Time
+		}
+		if rotatedAt.Valid {
+			k.RotatedAt = &rotatedAt.Time
+		}
+		if ipAllow.Valid {
+			k.IPAllowlist = ipAllow.String
+		}
+		if monthlyBudget.Valid {
+			k.MonthlyBudgetUSD = monthlyBudget.Float64
+		}
 		if org.Valid {
 			k.OrgID = &org.String
+		}
+		if createdBy.Valid && createdBy.String != "" {
+			k.CreatedBy = &createdBy.String
 		}
 		if k.OrgID != nil && *k.OrgID != orgID {
 			continue
@@ -151,10 +181,56 @@ func (s *Store) ListForOrg(orgID string) ([]models.GatewayKey, error) {
 	return out, nil
 }
 
+// ListCreatedBy returns keys created by one dashboard user (the
+// keys:read_own scoped view). Legacy keys have created_by NULL and are
+// intentionally excluded — they belong to no one.
+func (s *Store) ListCreatedBy(userID string) ([]models.GatewayKey, error) {
+	rows, err := s.db.Query(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id,COALESCE(created_by,''),expires_at,rotated_at,COALESCE(ip_allowlist,''),COALESCE(monthly_budget_usd,0) FROM gateway_keys WHERE created_by = ? ORDER BY created_at DESC`, userID)
+	if err != nil {
+		// Legacy DB without created_by: an owner-scoped view is empty rather
+		// than leaking everything (fail closed).
+		return []models.GatewayKey{}, nil
+	}
+	defer rows.Close()
+	var out []models.GatewayKey
+	for rows.Next() {
+		var k models.GatewayKey
+		var rpm, rph, rpd, tpm sql.NullInt64
+		var org, allowed, createdBy sql.NullString
+		var expiresAt, rotatedAt sql.NullTime
+		var ipAllow sql.NullString
+		var monthlyBudget sql.NullFloat64
+		if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org, &createdBy, &expiresAt, &rotatedAt, &ipAllow, &monthlyBudget); err != nil {
+			return nil, err
+		}
+		scanGatewayKey(&k, rpm, rph, rpd, tpm, allowed)
+		if expiresAt.Valid {
+			k.ExpiresAt = &expiresAt.Time
+		}
+		if rotatedAt.Valid {
+			k.RotatedAt = &rotatedAt.Time
+		}
+		if ipAllow.Valid {
+			k.IPAllowlist = ipAllow.String
+		}
+		if monthlyBudget.Valid {
+			k.MonthlyBudgetUSD = monthlyBudget.Float64
+		}
+		if org.Valid {
+			k.OrgID = &org.String
+		}
+		if createdBy.Valid && createdBy.String != "" {
+			k.CreatedBy = &createdBy.String
+		}
+		out = append(out, k)
+	}
+	return out, nil
+}
+
 func (s *Store) List() ([]models.GatewayKey, error) {
-	rows, err := s.db.Query(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id FROM gateway_keys ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id,COALESCE(created_by,''),expires_at,rotated_at,COALESCE(ip_allowlist,''),COALESCE(monthly_budget_usd,0) FROM gateway_keys ORDER BY created_at DESC`)
 	fallback := ""
-	if err != nil && (strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph") || strings.Contains(err.Error(), "rate_limit_rpd") || strings.Contains(err.Error(), "rate_limit_tpm") || strings.Contains(err.Error(), "org_id")) {
+	if err != nil && (strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph") || strings.Contains(err.Error(), "rate_limit_rpd") || strings.Contains(err.Error(), "rate_limit_tpm") || strings.Contains(err.Error(), "org_id") || strings.Contains(err.Error(), "created_by")) {
 		rows, err = s.db.Query(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys ORDER BY created_at DESC`)
 		fallback = "minimal"
 		if err != nil {
@@ -197,6 +273,14 @@ func (s *Store) List() ([]models.GatewayKey, error) {
 			var k models.GatewayKey
 			var rpm sql.NullInt64
 			var allowed sql.NullString
+			var expiresAt sql.NullTime
+			var rotatedAt sql.NullTime
+			var ipAllow sql.NullString
+			var monthlyBudget sql.NullFloat64
+			_ = expiresAt
+			_ = rotatedAt
+			_ = ipAllow
+			_ = monthlyBudget
 			if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &allowed); err != nil {
 				return nil, err
 			}
@@ -208,14 +292,33 @@ func (s *Store) List() ([]models.GatewayKey, error) {
 	for rows.Next() {
 		var k models.GatewayKey
 		var rpm, rph, rpd, tpm sql.NullInt64
-		var org sql.NullString
+		var org, createdBy sql.NullString
 		var allowed sql.NullString
-		if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org); err != nil {
+		var expiresAt sql.NullTime
+		var rotatedAt sql.NullTime
+		var ipAllow sql.NullString
+		var monthlyBudget sql.NullFloat64
+		if err := rows.Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org, &createdBy, &expiresAt, &rotatedAt, &ipAllow, &monthlyBudget); err != nil {
 			return nil, err
 		}
 		scanGatewayKey(&k, rpm, rph, rpd, tpm, allowed)
+		if expiresAt.Valid {
+			k.ExpiresAt = &expiresAt.Time
+		}
+		if rotatedAt.Valid {
+			k.RotatedAt = &rotatedAt.Time
+		}
+		if ipAllow.Valid {
+			k.IPAllowlist = ipAllow.String
+		}
+		if monthlyBudget.Valid {
+			k.MonthlyBudgetUSD = monthlyBudget.Float64
+		}
 		if org.Valid {
 			k.OrgID = &org.String
+		}
+		if createdBy.Valid && createdBy.String != "" {
+			k.CreatedBy = &createdBy.String
 		}
 		out = append(out, k)
 	}
@@ -228,7 +331,15 @@ func (s *Store) Verify(raw string) (*models.GatewayKey, bool) {
 	var rpm, rph, rpd, tpm sql.NullInt64
 	var org sql.NullString
 	var allowed sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org)
+	var expiresAt sql.NullTime
+	var rotatedAt sql.NullTime
+	var ipAllow sql.NullString
+	var monthlyBudget sql.NullFloat64
+	_ = expiresAt
+	_ = rotatedAt
+	_ = ipAllow
+	_ = monthlyBudget
+	err := s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id,expires_at,rotated_at,COALESCE(ip_allowlist,''),COALESCE(monthly_budget_usd,0) FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org, &expiresAt, &rotatedAt, &ipAllow, &monthlyBudget)
 	if err != nil && (strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph") || strings.Contains(err.Error(), "rate_limit_tpm")) {
 		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,org_id FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &org)
 		if err != nil && strings.Contains(err.Error(), "org_id") {
@@ -238,11 +349,29 @@ func (s *Store) Verify(raw string) (*models.GatewayKey, bool) {
 	if err != nil && strings.Contains(err.Error(), "org_id") {
 		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys WHERE hash=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm)
 	}
+	// Grace window: if the primary hash miss was actually a recent
+	// rotation's previous secret, honor it (zero-downtime rotation).
 	if err != nil {
+		k2, ok2 := s.verifyPreviousHash(raw)
+		if ok2 {
+			return k2, true
+		}
 		return nil, false
 	}
 	if allowed.Valid || rph.Valid || rpd.Valid || tpm.Valid {
 		scanGatewayKey(&k, rpm, rph, rpd, tpm, allowed)
+		if expiresAt.Valid {
+			k.ExpiresAt = &expiresAt.Time
+		}
+		if rotatedAt.Valid {
+			k.RotatedAt = &rotatedAt.Time
+		}
+		if ipAllow.Valid {
+			k.IPAllowlist = ipAllow.String
+		}
+		if monthlyBudget.Valid {
+			k.MonthlyBudgetUSD = monthlyBudget.Float64
+		}
 	} else {
 		if rpm.Valid && rpm.Int64 > 0 {
 			k.RateLimitRPM = int(rpm.Int64)
@@ -255,6 +384,74 @@ func (s *Store) Verify(raw string) (*models.GatewayKey, bool) {
 	}
 	s.db.Exec(db.Q(`UPDATE gateway_keys SET last_used_at=? WHERE id=?`), time.Now().UTC(), k.ID)
 	return &k, true
+}
+
+// verifyPreviousHash authenticates a secret against previous_hash during
+// the post-rotation grace window. Used by Verify when the current hash
+// misses, giving apps a zero-downtime window to swap in the new secret.
+func (s *Store) verifyPreviousHash(raw string) (*models.GatewayKey, bool) {
+	hash := Hash(raw)
+	var id string
+	var rotatedAt sql.NullTime
+	err := s.db.QueryRow(db.Q(`SELECT id, rotated_at FROM gateway_keys WHERE previous_hash = ? AND revoked_at IS NULL`), hash).Scan(&id, &rotatedAt)
+	if err != nil {
+		return nil, false
+	}
+	if !rotatedAt.Valid || time.Since(rotatedAt.Time) > RotationGraceWindow {
+		return nil, false
+	}
+	k, err := s.GetByID(id)
+	if err != nil {
+		return nil, false
+	}
+	s.db.Exec(db.Q(`UPDATE gateway_keys SET last_used_at = ? WHERE id = ?`), time.Now().UTC(), id)
+	return k, true
+}
+
+// RotationGraceWindow is how long the previous secret keeps authenticating
+// after a rotation — long enough to update an app's env vars without an
+// outage, short enough to limit a compromised secret's exposure.
+const RotationGraceWindow = 24 * time.Hour
+
+// Rotate regenerates a key's secret in place: same id, name, owner, org,
+// limits, and analytics history. The current hash moves to previous_hash
+// (still authenticating during the grace window); the fresh secret is
+// returned raw, exactly once — only hashes are ever stored.
+func (s *Store) Rotate(id string) (*models.GatewayKey, string, error) {
+	raw := Generate()
+	newHash := Hash(raw)
+	now := time.Now().UTC()
+
+	// The outgoing hash only becomes previous_hash if any prior grace window
+	// has lapsed; repeated rotations inside the window keep the OLDEST
+	// still-graceful secret so an app mid-update never breaks.
+	res, err := s.db.Exec(
+		db.Q(`UPDATE gateway_keys SET
+			previous_hash = CASE WHEN rotated_at IS NULL OR rotated_at < ? THEN hash ELSE previous_hash END,
+			hash = ?,
+			rotated_at = ?
+			WHERE id = ? AND revoked_at IS NULL`),
+		now.Add(-RotationGraceWindow), newHash, now, id,
+	)
+	if err != nil && (strings.Contains(err.Error(), "no such column") || strings.Contains(err.Error(), "previous_hash") || strings.Contains(err.Error(), "rotated_at")) {
+		// Legacy DB without rotation columns: rotate without grace.
+		if _, err2 := s.db.Exec(db.Q(`UPDATE gateway_keys SET hash = ? WHERE id = ? AND revoked_at IS NULL`), newHash, id); err2 != nil {
+			return nil, "", err2
+		}
+		k, gerr := s.GetByID(id)
+		return k, raw, gerr
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, "", fmt.Errorf("key not found or revoked")
+	}
+	k, gerr := s.GetByID(id)
+	if gerr != nil {
+		return nil, "", gerr
+	}
+	return k, raw, gerr
 }
 
 func (s *Store) Revoke(id string) error {
@@ -278,10 +475,14 @@ func (s *Store) Delete(id string) error {
 func (s *Store) GetByID(id string) (*models.GatewayKey, error) {
 	var k models.GatewayKey
 	var rpm, rph, rpd, tpm sql.NullInt64
-	var org sql.NullString
+	var org, createdBy sql.NullString
 	var allowed sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id FROM gateway_keys WHERE id=?`), id).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org)
-	if err != nil && (strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph")) {
+	var expiresAt sql.NullTime
+	var rotatedAt sql.NullTime
+	var ipAllow sql.NullString
+	var monthlyBudget sql.NullFloat64
+	err := s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,rate_limit_rph,rate_limit_rpd,rate_limit_tpm,allowed_models,org_id,COALESCE(created_by,''),expires_at,rotated_at,COALESCE(ip_allowlist,''),COALESCE(monthly_budget_usd,0) FROM gateway_keys WHERE id=?`), id).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &rph, &rpd, &tpm, &allowed, &org, &createdBy, &expiresAt, &rotatedAt, &ipAllow, &monthlyBudget)
+	if err != nil && (strings.Contains(err.Error(), "allowed_models") || strings.Contains(err.Error(), "rate_limit_rph") || strings.Contains(err.Error(), "created_by")) {
 		err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm,org_id FROM gateway_keys WHERE id=?`), id).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm, &org)
 		if err != nil && strings.Contains(err.Error(), "org_id") {
 			err = s.db.QueryRow(db.Q(`SELECT id,name,prefix,hash,last_used_at,created_at,revoked_at,rate_limit_rpm FROM gateway_keys WHERE id=?`), id).Scan(&k.ID, &k.Name, &k.Prefix, &k.Hash, &k.LastUsedAt, &k.CreatedAt, &k.RevokedAt, &rpm)
@@ -291,8 +492,23 @@ func (s *Store) GetByID(id string) (*models.GatewayKey, error) {
 		return nil, err
 	}
 	scanGatewayKey(&k, rpm, rph, rpd, tpm, allowed)
-	if err == nil && org.Valid {
+	if expiresAt.Valid {
+		k.ExpiresAt = &expiresAt.Time
+	}
+	if rotatedAt.Valid {
+		k.RotatedAt = &rotatedAt.Time
+	}
+	if ipAllow.Valid {
+		k.IPAllowlist = ipAllow.String
+	}
+	if monthlyBudget.Valid {
+		k.MonthlyBudgetUSD = monthlyBudget.Float64
+	}
+	if org.Valid {
 		k.OrgID = &org.String
+	}
+	if createdBy.Valid && createdBy.String != "" {
+		k.CreatedBy = &createdBy.String
 	}
 	return &k, nil
 }
@@ -418,4 +634,70 @@ func IsModelAllowed(allowed []string, model string) bool {
 		}
 	}
 	return false
+}
+
+// SetKeyOwner reassigns a key's created_by. Empty userID clears ownership
+// (the key becomes unowned — visible only to keys:read holders).
+func (s *Store) SetKeyOwner(keyID, userID string) error {
+	_, err := s.db.Exec(db.Q(`UPDATE gateway_keys SET created_by=? WHERE id=?`), sql.NullString{String: userID, Valid: userID != ""}, keyID)
+	return err
+}
+
+// CountByOwner returns how many (non-revoked) keys each user id created —
+// feeds the Users page "keys" column. Legacy DBs without the column yield
+// an empty map rather than an error.
+func (s *Store) CountByOwner() (map[string]int, error) {
+	rows, err := s.db.Query(`SELECT created_by, COUNT(*) FROM gateway_keys WHERE created_by IS NOT NULL AND created_by != '' AND revoked_at IS NULL GROUP BY created_by`)
+	if err != nil {
+		return map[string]int{}, nil
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var uid string
+		var n int
+		if err := rows.Scan(&uid, &n); err == nil {
+			out[uid] = n
+		}
+	}
+	return out, nil
+}
+
+// SetExpiresAt sets (or clears, with nil/zero time) the key's expiry.
+func (s *Store) SetExpiresAt(id string, t *time.Time) error {
+	var v any
+	if t != nil && !t.IsZero() {
+		v = t.UTC()
+	}
+	_, err := s.db.Exec(db.Q(`UPDATE gateway_keys SET expires_at = ? WHERE id = ?`), v, id)
+	return err
+}
+
+// SetIPAllowlist replaces the key's IP allowlist (empty = any IP).
+func (s *Store) SetIPAllowlist(id, allowlist string) error {
+	_, err := s.db.Exec(db.Q(`UPDATE gateway_keys SET ip_allowlist = ? WHERE id = ?`), strings.TrimSpace(allowlist), id)
+	return err
+}
+
+// SetMonthlyBudget sets the calendar-month spend cap in USD (0 = unlimited).
+func (s *Store) SetMonthlyBudget(id string, usd float64) error {
+	if usd < 0 {
+		usd = 0
+	}
+	_, err := s.db.Exec(db.Q(`UPDATE gateway_keys SET monthly_budget_usd = ? WHERE id = ?`), usd, id)
+	return err
+}
+
+// MonthSpendUSD returns the summed cost for a key within the current UTC
+// calendar month. Used for monthly budget enforcement at authentication time.
+func (s *Store) MonthSpendUSD(keyID string) float64 {
+	var sum sql.NullFloat64
+	monthStart := time.Now().UTC().Format("2006-01") + "-01 00:00:00"
+	s.db.QueryRow(db.Q(
+		`SELECT SUM(cost_usd) FROM request_logs WHERE key_id = ? AND created_at >= ?`),
+		keyID, monthStart).Scan(&sum)
+	if sum.Valid {
+		return sum.Float64
+	}
+	return 0
 }

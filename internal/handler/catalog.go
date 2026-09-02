@@ -12,6 +12,7 @@ import (
 	"ai-gateway/internal/catalog"
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/middleware"
+	"ai-gateway/internal/rbac"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -29,16 +30,16 @@ func (h *CatalogHandler) Routes(r chi.Router) {
 	// Mutating catalog routes are admin-only: without this gate even
 	// "readonly" could trigger upstream syncs, rewrite aliases and edit
 	// system settings.
-	r.With(middleware.RequireRole("admin")).Post("/sync", h.Sync)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/sync", h.Sync)
 	r.Get("/status", h.Status)
 	// aliases
 	r.Get("/aliases", h.ListAliases)
-	r.With(middleware.RequireRole("admin")).Post("/aliases", h.CreateAlias)
-	r.With(middleware.RequireRole("admin")).Delete("/aliases/{alias}", h.DeleteAlias)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/aliases", h.CreateAlias)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/aliases/{alias}", h.DeleteAlias)
 	// settings
 	r.Get("/settings", h.GetSettings)
-	r.With(middleware.RequireRole("admin")).Put("/settings", h.PutSettings)
-	r.With(middleware.RequireRole("admin")).Delete("/settings/{key}", h.DeleteSetting)
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Put("/settings", h.PutSettings)
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Delete("/settings/{key}", h.DeleteSetting)
 }
 
 func (h *CatalogHandler) List(w http.ResponseWriter, r *http.Request) {

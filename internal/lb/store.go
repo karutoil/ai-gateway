@@ -191,7 +191,7 @@ func (s *Store) DeleteRule(model string) error {
 // RuleForModel returns the ordered rule for a model, or nil when none exists.
 // Members marked health_status=down are still returned (selection filters
 // them); if every member is down the full set returns and lets normal
-// breaker/error handling report honestly.
+// retry/failure handling report honestly.
 func (s *Store) RuleForModel(model string) *Rule {
 	model = normalizeModel(model)
 	rows, err := s.DB.Query(db.Q(`SELECT lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE lr.model=? ORDER BY lr.position ASC`), model)
@@ -266,10 +266,10 @@ func (s *Store) AllRules() ([]Rule, error) {
 }
 
 // Select orders the rule's healthy members for this request according to the
-// rule's strategy. The caller picks the first member whose circuit is closed;
-// for failover rules the caller may walk the whole ordering. Down members are
-// filtered; if every member is down the full set returns and lets normal
-// breaker/error handling report honestly.
+// rule's strategy. The caller serves the first member and only walks further
+// members on failover rules. Down members are filtered; if every member is
+// down the full set returns and lets normal retry/failure handling report
+// honestly.
 func (s *Store) Select(rule *Rule) []*models.Provider {
 	if rule == nil || len(rule.Members) == 0 {
 		return nil
@@ -314,8 +314,8 @@ func (s *Store) orderMembers(rule *Rule) []Member {
 	case StrategyWeighted:
 		// Weighted random pick of the primary member, then the rest in
 		// position order after it. The primary lands proportionally to
-		// weight; remaining members only serve when the primary's circuit
-		// is open (caller-side skip), preserving availability.
+		// weight; remaining members only serve on retriable failure of the
+		// primary (caller-side failover), preserving availability.
 		total := 0
 		for _, m := range eligible {
 			w := m.Weight

@@ -1,0 +1,60 @@
+# ai-gateway service — pairs with ai-gateway.socket (socket activation).
+#
+# The socket unit owns the listening socket; this service is started on first
+# connection (or manually) and inherits the socket via LISTEN_FDS. Restarting
+# the service (`systemctl restart ai-gateway`) queues new connections in the
+# kernel backlog instead of refusing them, so users reconnect without issue.
+#
+# Secrets: put ADMIN_PASSWORD / MASTER_KEY / JWT_SECRET / DATABASE_URL etc. in
+# /etc/ai-gateway.env (mode 0600, root-owned). Generate secrets with:
+#   openssl rand -hex 32
+#
+# A persistent JWT_SECRET / MASTER_KEY keeps dashboard sessions and provider
+# credentials valid across restarts — without them users must log in again
+# after every deploy.
+
+[Unit]
+Description=AI Gateway
+Documentation=file:///opt/ai-gateway/README.md
+# Restart cleanly on failure; never on clean exit.
+Restart=on-failure
+RestartSec=2
+# The socket unit provides the listening socket even before we start.
+Requires=ai-gateway.socket
+After=ai-gateway.socket
+After=network.target
+
+[Service]
+Type=simple
+User=gateway
+Group=gateway
+EnvironmentFile=/etc/ai-gateway.env
+Environment=ENV=production
+ExecStart=/usr/local/bin/gateway
+WorkingDirectory=/var/lib/ai-gateway
+
+# socket-activation readiness: sd_notify not required; the gateway serves as
+# soon as Serve() starts. systemd considers the service started immediately,
+# which is correct — the socket was already accepting on our behalf.
+# NotifyAccess is unused (Type=simple).
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ai-gateway
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Graceful drain window for in-flight LLM streams on restart (matches the
+# gateway's SHUTDOWN_GRACE_SECONDS; raise both together for long streams).
+TimeoutStopSec=95
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

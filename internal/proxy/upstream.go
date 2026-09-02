@@ -27,6 +27,11 @@ type TimeoutsConfig struct {
 	// Deadline allowed until the FIRST byte reaches the client (header
 	// response grace for non-streaming semantics on zero-WriteTimeout servers).
 	WriteHeaderGrace time.Duration
+	// Client-facing time-to-first-byte budget. The gateway stays silent
+	// until upstream headers arrive; behind Cloudflare (~100s edge timeout)
+	// that silence becomes a synthesized 524. Zero disables (see
+	// DefaultTimeouts for the enabled default).
+	TTFB time.Duration
 }
 
 func DefaultTimeouts() TimeoutsConfig {
@@ -35,6 +40,10 @@ func DefaultTimeouts() TimeoutsConfig {
 		RequestTotal:     0,
 		StreamIdle:       300 * time.Second,
 		WriteHeaderGrace: 60 * time.Second,
+		// Deliberately inside Cloudflare's ~100s first-byte window so the
+		// gateway regains control (honest 504 / SSE keepalive) before the
+		// edge synthesizes a 524 the gateway never sees.
+		TTFB: 85 * time.Second,
 	}
 }
 

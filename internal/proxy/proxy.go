@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-gateway/internal/apikey"
@@ -47,7 +48,6 @@ type Handler struct {
 	Client        *http.Client
 	Cache         cache.Cache
 	Retry         resilience.RetryPolicy
-	Breaker       resilience.CircuitBreaker
 	Metrics       otel.Metrics
 	RateLimiter   middleware.Limiter
 
@@ -71,6 +71,13 @@ type Handler struct {
 	// StreamUsageInject injects stream_options.include_usage for OpenAI-style
 	// streams when missing (billing accuracy over maximum compatibility).
 	StreamUsageInject bool
+
+	// keyIDCache maps gateway-key prefix → gateway_keys.id for per-key
+	// analytics attribution on request_logs. Warmed on demand; entries are
+	// immutable in practice (a prefix maps to one key), so the empty-string
+	// miss result (session virtual keys, unknown prefixes) is cached too.
+	keyIDMu    sync.RWMutex
+	keyIDCache map[string]string
 }
 
 func New(ps *provider.Store, db *sql.DB) *Handler {
@@ -216,25 +223,13 @@ func (n *noopCache) Get(key string) ([]byte, int, http.Header, bool)            
 func (n *noopCache) Set(key string, body []byte, status int, headers http.Header, ttlSeconds int) {}
 func (n *noopCache) Invalidate(pattern string)                                                    {}
 
-type noopBreaker struct{}
-
-func (n *noopBreaker) Allow(string) bool   { return true }
-func (n *noopBreaker) Record(string, int)  {}
-func (n *noopBreaker) Release(string)      {}
-func (n *noopBreaker) State(string) string { return "closed" }
-
 func (h *Handler) cacheOrNoop() cache.Cache {
 	if h.Cache != nil {
 		return h.Cache
 	}
 	return &noopCache{}
 }
-func (h *Handler) breakerOrNoop() resilience.CircuitBreaker {
-	if h.Breaker != nil {
-		return h.Breaker
-	}
-	return &noopBreaker{}
-}
+
 func (h *Handler) retryOrDefault() resilience.RetryPolicy {
 	if h.Retry != nil {
 		return h.Retry
@@ -687,6 +682,11 @@ type proxyOpts struct {
 	// list — enabling per-member model overrides. Nil for pinned/legacy
 	// routes, where overrides never apply.
 	rule *lb.Rule
+	// ttfb, when non-nil, is the client-facing first-byte controller owned by
+	// proxyCandidates for the WHOLE candidate chain (one budget per client
+	// request, one potential keepalive commit). Nil = direct call; the handler
+	// creates a request-local controller instead.
+	ttfb *ttfbController
 }
 
 // providerAttempt is one tried-and-failed-over provider in a fallback chain.
@@ -737,17 +737,22 @@ type attemptOutcome struct {
 //     have not been committed — the gateway buffers only headers (never body
 //     bytes) while deciding.
 //   - Mid-stream failures terminate the SSE channel with protocol-correct
-//     error frames ([DONE]/anthropic error event), record honest outcomes and
-//     feed the circuit breaker.
+//     error frames ([DONE]/anthropic error event) and record honest outcomes.
 //
-// isClientCaused5xx detects 5xx responses that actually carry client-error
-// semantics. new-api style upstreams (observed live on ckff.dev) answer
+// isStream4xxRelayStatus reports whether an upstream status on a streaming
+// request should be relayed to the client verbatim (status + body) instead of
+// entering the SSE pump: plain client errors are the caller's fault and must
+// reach it unmangled. 429 and 5xx stay in the retry/failure machinery.
+func isStream4xxRelayStatus(status int) bool {
+	return status >= 400 && status < 500
+}
+
+// isClientCaused5xx detects 5xx responses that actually carry client-error// semantics. new-api style upstreams (observed live on ckff.dev) answer
 // deterministic JSON type mismatches (n: 2.5, temperature: "hot", stop with
 // non-string elements) with HTTP 500 + `"code":"invalid_request"`, raw Go
 // "cannot unmarshal" decode errors, or outright "Panic detected" crashes.
 // All three are deterministic for the identical request body: retrying
-// cannot succeed, and counting them against provider health would let two
-// garbage client requests open the circuit for everyone.
+// cannot succeed.
 func isClientCaused5xx(body []byte) bool {
 	var probe struct {
 		Error json.RawMessage `json:"error"`
@@ -794,7 +799,6 @@ func (h *Handler) proxyWithMetrics(w http.ResponseWriter, r *http.Request, targe
 
 func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, body []byte, isStream bool, model, providerID, keyPrefix, endpoint string, start time.Time, isAnthropicUpstream bool, opts proxyOpts) attemptOutcome {
 	c := h.cacheOrNoop()
-	breaker := h.breakerOrNoop()
 	retry := h.retryOrDefault()
 
 	cacheTTL := h.CacheTTLSeconds
@@ -815,14 +819,6 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		}
 	}
 
-	if !breaker.Allow(providerID) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":{"message":"circuit open for provider","type":"proxy_error","code":"circuit_open"}}`))
-		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusServiceUnavailable, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
-		return attemptOutcome{committed: true, status: http.StatusServiceUnavailable}
-	}
-
 	ctx := r.Context()
 	var cancelFn context.CancelFunc
 	if h.Timeouts.RequestTotal > 0 {
@@ -830,16 +826,26 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		defer cancelFn()
 	}
 
+	// Client-facing first-byte budget (default 85s, under Cloudflare's ~100s
+	// 524 window). The gateway is silent pre-commit by design; without this
+	// budget a slow upstream burns the whole window, the edge 524s, and the
+	// gateway later logs a 499 for a request that was still healthy.
+	// proxyCandidates owns one controller per client request and passes it in
+	// opts; direct callers create a request-local one here. In both cases the
+	// writer is wrapped so heartbeat frames and stream writes share one lock.
+	ttfb := opts.ttfb
+	if ttfb == nil {
+		ttfb = newTTFBController(h.Timeouts.TTFB, start)
+		defer ttfb.stop()
+		w = &keepaliveSafeWriter{ResponseWriter: w, c: ttfb}
+	}
+	defer ttfb.stop()
+
 	applyFallbackHeader := func(hdr http.Header) {
 		if opts.fallbackFrom != "" {
 			hdr.Set("X-Fallback-Used", opts.fallbackFrom)
 		}
 	}
-
-	// Note on breaker accounting: mid-stream transport deaths feed the breaker
-	// with status 599 (classified as failure); clean completions record the
-	// real header status. Pre-commit failures use their actual status.
-	const midStreamFailStatus = 599
 
 	var (
 		lastStatus int
@@ -852,15 +858,70 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	)
 
 	for attempt := 0; ; attempt++ {
+		// Budget already spent by earlier candidates/retries and this call is
+		// buffered (nothing in-band to keep alive): fail fast instead of
+		// piling another silent attempt onto a doomed request.
+		if !isStream && ttfb.expired() {
+			httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
+			h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false)
+			return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
+		}
 		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, body, isStream, isAnthropicUpstream)
 		if err != nil {
-			// Gateway-side failure, not the provider's — but the half-open
-			// probe slot taken by Allow must go back or the circuit wedges.
-			breaker.Release(providerID)
+			if ttfb.headersCommitted() {
+				writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream), "failed to create upstream request")
+				return attemptOutcome{committed: true, status: http.StatusInternalServerError}
+			}
 			httperr.Write(w, http.StatusInternalServerError, "failed to create upstream request", httperr.TypeProxy)
 			return attemptOutcome{committed: true, status: http.StatusInternalServerError}
 		}
+		// Bound THIS attempt's wait for upstream response headers by the
+		// client's remaining first-byte budget (not the body — a successful
+		// header arrival disarms the watchdog, leaving long streams free).
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		defer attemptCancel()
+		req = req.WithContext(attemptCtx)
+		ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 		resp, err := h.Client.Do(req)
+		if ttfbTimer != nil {
+			ttfbTimer.Stop()
+		}
+		if err != nil {
+			// First-byte budget spent while the upstream stayed silent: turn
+			// the transport timeout into a controlled outcome before the edge
+			// (Cloudflare 524) does it for us.
+			if ttfb.expired() {
+				lastErr, lastStatus = err, 0
+				if ttfb.headersCommitted() {
+					// Keepalive umbra already flowing (earlier attempt hit
+					// the budget; this one died too). A real status line is
+					// impossible — retry under the umbra or end in-band.
+					if retry.ShouldRetry(attempt, retryableCode(0)) {
+						sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
+						continue
+					}
+					writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream), "upstream is not responding; request aborted before first token")
+					return attemptOutcome{committed: true, status: 0, retriable: false, errText: "ttfb budget exhausted (stream keepalive committed)"}
+				}
+				if isStream {
+					// Streams: commit SSE headers + keepalive so the client
+					// (and any edge proxy) see bytes, then restart a fresh
+					// upstream attempt under the keepalive umbra.
+					ttfb.commitKeepalive(w, opts.fallbackFrom)
+					if retry.ShouldRetry(attempt, retryableCode(0)) {
+						sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
+						continue
+					}
+					writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream), "upstream is not responding; request aborted before first token")
+					return attemptOutcome{committed: true, status: 0, retriable: false, errText: "ttfb budget exhausted (stream keepalive committed)"}
+				}
+				// Buffered (or exhausted retries): an honest 504 that edges
+				// pass through beats a synthesized 524 the gateway never sees.
+				httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
+				h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+				return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
+			}
+		}
 		if err != nil || (resp != nil && resp.StatusCode >= 500) || (resp != nil && resp.StatusCode == 429) {
 			// Upstream unusable and NOTHING has been committed yet — both
 			// streams and buffered requests can recover here.
@@ -879,18 +940,9 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				// Some upstreams (new-api style, seen live on ckff.dev) answer
 				// JSON type mismatches — n: 2.5, temperature: "hot" — with a
 				// 500 carrying code "invalid_request". That is deterministic
-				// CLIENT error semantics: retrying cannot succeed, and
-				// booking it as a provider failure lets two garbage requests
-				// open the circuit for everyone. Classify, then skip retry
-				// and breaker penalty.
+				// CLIENT error semantics: retrying cannot succeed. Classify,
+				// then skip retry and fail the request directly.
 				clientCaused = isClientCaused5xx(retryBody)
-				if !clientCaused {
-					breaker.Record(providerID, status)
-				} else {
-					breaker.Release(providerID)
-				}
-			} else {
-				breaker.Record(providerID, 0)
 			}
 			lastErr, lastStatus, lastHdr, lastBody = err, status, retryHdr, retryBody
 			// Keep a bounded sample of the upstream's error output so the
@@ -930,13 +982,19 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		// the upstream's status + body verbatim. Previously this fell into
 		// pumpStream, whose non-SSE first-chunk guard laundered the upstream's
 		// informative 400 ("max_tokens: field required", bad model, …) into a
-		// generic 502 AND fed the breaker a synthetic 599 — so five cheap
-		// malformed streaming requests opened the provider circuit for
-		// everyone. A 4xx is the caller's error, not the provider's.
-		if isStream && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// generic 502. A 4xx is the caller's error, not the provider's.
+		if isStream && isStream4xxRelayStatus(resp.StatusCode) {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			breaker.Record(providerID, resp.StatusCode)
+			if ttfb.headersCommitted() {
+				// Keepalive headers already flowed: a real status line is
+				// impossible. Deliver the verdict in-band as an SSE error.
+				ttfb.stop()
+				writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream),
+					"upstream error "+strconv.Itoa(resp.StatusCode)+": "+upstreamErrorMessage(errBody, "client error"))
+				h.logRequestExtended(keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, true)
+				return attemptOutcome{committed: true, status: resp.StatusCode}
+			}
 			copyHeader(w.Header(), resp.Header)
 			applyFallbackHeader(w.Header())
 			w.WriteHeader(resp.StatusCode)
@@ -946,19 +1004,8 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		}
 
 		if isStream {
-			out := h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader)
-			if out.midStreamFailure && !out.clientGone {
-				// A genuine upstream death mid-stream feeds the breaker a
-				// synthetic 599. Client disconnects are NOT the provider's
-				// fault — penalizing them let client churn open circuits.
-				breaker.Record(providerID, midStreamFailStatus)
-			} else if !out.midStreamFailure {
-				breaker.Record(providerID, lastStatus)
-			} else {
-				// Mid-stream death AND the client is gone: not the provider's
-				// fault, but the probe slot still has to go back.
-				breaker.Release(providerID)
-			}
+			h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader, ttfb)
+			ttfb.stop()
 			return attemptOutcome{committed: true, status: lastStatus}
 		}
 
@@ -966,7 +1013,6 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		resp.Body.Close()
 		lastBody = bodyBytes
 		if readErr != nil && len(bodyBytes) == 0 {
-			breaker.Record(providerID, 0)
 			lastErr, lastStatus = readErr, 0
 			if retry.ShouldRetry(attempt, 0) {
 				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
@@ -979,7 +1025,6 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		// a "success" with no content — and caches it. Treat it as a
 		// transport-level failure: retry, then fail over / 502.
 		if lastStatus == 200 && len(bodyBytes) == 0 {
-			breaker.Record(providerID, 0)
 			lastErr, lastStatus = errEmptyUpstreamBody, 0
 			lastBody = nil
 			if retry.ShouldRetry(attempt, 0) {
@@ -989,11 +1034,9 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			return attemptOutcome{committed: false, status: 0, retriable: true, errText: errEmptyUpstreamBody.Error()}
 		}
 		if retry.ShouldRetry(attempt, resp.StatusCode) {
-			breaker.Record(providerID, resp.StatusCode)
 			sleepCtx(r.Context(), retryAfterDelay(resp.Header, retry.Backoff(attempt)))
 			continue
 		}
-		breaker.Record(providerID, resp.StatusCode)
 		break
 	}
 
@@ -1481,10 +1524,17 @@ func (sc *streamCapture) body() []byte {
 //   - framing-aware SSE parsing across TCP chunk boundaries,
 //   - protocol-correct termination on ANY abnormal exit,
 //   - honest downstream accounting (usage-so-far, real outcome status).
-func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response, model, keyPrefix, providerID, endpoint string, start time.Time, isAnthropicUpstream bool, applyFallbackHeader func(http.Header)) streamPumpResult {
+func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response, model, keyPrefix, providerID, endpoint string, start time.Time, isAnthropicUpstream bool, applyFallbackHeader func(http.Header), ttfb *ttfbController) streamPumpResult {
 	res := streamPumpResult{}
 
 	commit := func() {
+		if ttfb.headersCommitted() {
+			// Keepalive umbra: SSE headers + first keepalive frame already
+			// flowed from the pre-commit watchdog. Only the heartbeat has to
+			// stop — real stream bytes now take over the wire.
+			ttfb.stop()
+			return
+		}
 		copyHeader(w.Header(), resp.Header)
 		applyFallbackHeader(w.Header())
 		w.Header().Set("X-Cache", "MISS")
@@ -1699,6 +1749,13 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 						h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint,
 							http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, buf)
 						res.midStreamFailure = true
+						if ttfb.headersCommitted() {
+							// Keepalive headers already flowed; deliver the
+							// verdict in-band instead of a second status line.
+							ttfb.stop()
+							writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream), "upstream returned a non-stream payload for a streaming request")
+							return res
+						}
 						// Nothing committed: answer honestly instead of an
 						// implicit empty 200.
 						httperr.Proxy(w, http.StatusBadGateway, "upstream returned a non-stream payload for a streaming request")
@@ -2073,6 +2130,40 @@ func (h *Handler) logRequestExtendedBodies(keyPrefix, providerID, model, endpoin
 	h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		id, keyPrefix, providerID, model, endpoint, status, latencyMs, time.Now().UTC(), promptTokens, completionTokens, total, costUSD, isStream, nullIfEmpty(reqBodyStr), nullIfEmpty(respBodyStr),
 		nullIfEmpty(m.FinishReason), nullIfEmpty(m.FallbackChain), m.CacheRead, m.CacheWrite, m.Reasoning)
+	// Per-key analytics attribution: stamp the owning gateway key's id. Runs
+	// after the primary insert so a failure here never loses the request log.
+	if keyPrefix != "" && h.DB != nil {
+		if keyID := h.gatewayKeyID(keyPrefix); keyID != "" {
+			h.DB.Exec(db.Q(`UPDATE request_logs SET key_id=? WHERE id=?`), keyID, id)
+		}
+	}
+}
+
+// gatewayKeyID resolves a gateway key prefix to its stable gateway_keys.id,
+// with an unbounded-but-bounded-in-practice cache (one entry per key). The
+// empty string is cached for misses (session virtual keys, unknown prefixes)
+// so repeated traffic doesn't re-query the DB.
+func (h *Handler) gatewayKeyID(prefix string) string {
+	if prefix == "" || h == nil || h.DB == nil {
+		return ""
+	}
+	h.keyIDMu.RLock()
+	if id, ok := h.keyIDCache[prefix]; ok {
+		h.keyIDMu.RUnlock()
+		return id
+	}
+	h.keyIDMu.RUnlock()
+
+	var id string
+	_ = h.DB.QueryRow(db.Q(`SELECT id FROM gateway_keys WHERE prefix=? LIMIT 1`), prefix).Scan(&id)
+
+	h.keyIDMu.Lock()
+	if h.keyIDCache == nil {
+		h.keyIDCache = make(map[string]string)
+	}
+	h.keyIDCache[prefix] = id // empty on miss; cached so misses don't thrash
+	h.keyIDMu.Unlock()
+	return id
 }
 
 func nullIfEmpty(s string) interface{} {
@@ -2589,8 +2680,7 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		// Strip the "provider/model" prefix the client used for routing:
 		// chat/embeddings do this; completions forwarded "ckff/glm-5.3-flash"
 		// verbatim and upstreams answered 503 "No available channel for model
-		// ckff/…" — a deterministic routing error that also poisoned the
-		// provider's circuit.
+		// ckff/…" — a deterministic routing error.
 		upstream := stripProviderPrefix(model, p)
 		if upstream != translate.ExtractModel(body) {
 			body = replaceModelInBody(body, upstream)
@@ -3220,23 +3310,24 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
+	// Same client-facing first-byte budget as the chat/messages paths: the
+	// native probe and every translated attempt are bounded by the remaining
+	// budget; streams that exhaust it get SSE keepalive frames, buffered
+	// requests an honest 504 — all before a Cloudflare edge can 524.
+	ttfb := newTTFBController(h.Timeouts.TTFB, start)
+	defer ttfb.stop()
+	w = &keepaliveSafeWriter{ResponseWriter: w, c: ttfb}
 	// For anthropic providers, /v1/responses does not exist — skip native and translate directly
-	if p.Type != models.ProviderAnthropic && h.breakerOrNoop().Allow(p.ID) {
-		// The native probe consumed a breaker admission: every exit below
-		// must either Record (relay success, committed stream) or Release
-		// (fall-through to the translated path). Skipping this check let
-		// /v1/responses hammer an upstream even with the circuit open.
+	if p.Type != models.ProviderAnthropic {
 		target := strings.TrimRight(p.BaseURL, "/") + "/responses"
 		if strings.HasSuffix(p.BaseURL, "/v1") {
 			target = p.BaseURL + "/responses"
 		}
 		req, rerr := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(body))
 		if rerr != nil {
-			// Malformed operator-configured BaseURL: give the probe slot
-			// back and fall through to the translated path instead of
-			// nil-dereferencing req below.
+			// Malformed operator-configured BaseURL: fall through to the
+			// translated path instead of nil-dereferencing req below.
 			log.Warn().Err(rerr).Str("provider", p.ID).Str("target", target).Msg("native responses probe: bad upstream URL")
-			h.breakerOrNoop().Release(p.ID)
 		} else {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 			req.Header.Set("Content-Type", "application/json")
@@ -3245,7 +3336,13 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				// of silently downgrading to a buffered JSON answer.
 				req.Header.Set("Accept", "text/event-stream")
 			}
+			attemptCtx, attemptCancel := context.WithCancel(r.Context())
+			req = req.WithContext(attemptCtx)
+			ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 			resp, err := h.Client.Do(req)
+			if ttfbTimer != nil {
+				ttfbTimer.Stop()
+			}
 			// Only an explicit 200 is a usable native reply. Location-less 3xx
 			// bodies arrive without transport error and previously passed through as
 			// pseudo-success, bypassing translation. Redirects WITH Location are
@@ -3256,7 +3353,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					// TRUE native pass-through streaming: relay chunk-by-chunk,
 					// flush per read. A false return means nothing was committed
 					// (dead-on-arrival upstream) — fall through to translated.
-					if out := h.streamNativeResponses(w, r, resp, model, keyPrefix, p.ID, start); out.committed {
+					if out := h.streamNativeResponses(w, r, resp, model, keyPrefix, p.ID, start, ttfb); out.committed {
 						return
 					}
 					log.Info().Str("model", model).Str("provider", p.ID).Msg("native responses attempt unusable before commit; falling through to translated path")
@@ -3274,21 +3371,16 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 						pt, ct2 := extractUsage(bodyBytes)
 						cost := h.costForModel(model, pt, ct2)
 						h.logRequestExtended(keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), pt, ct2, cost, false)
-						// Billing + breaker parity: the native non-stream path
-						// previously logged spend but never fed the budget ledger
-						// or the circuit breaker, silently bypassing quotas.
+						// Billing parity: the native non-stream path previously
+						// logged spend but never fed the budget ledger,
+						// silently bypassing quotas.
 						h.recordUsage(keyPrefix, r, pt+ct2, cost)
-						if h.Breaker != nil {
-							h.Breaker.Record(p.ID, resp.StatusCode)
-						}
 						return
 					}
 				}
 			} else if resp != nil {
 				resp.Body.Close()
 			}
-			// Falling through to the translated path: give the probe slot back.
-			h.breakerOrNoop().Release(p.ID)
 		}
 	}
 	translated, _, err := translate.ResponsesToChat(body)
@@ -3344,10 +3436,10 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				upstreamBody = b2
 			}
 		}
-		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream)
+		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream, ttfb)
 		return
 	}
-	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true})
+	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true, ttfb: ttfb})
 	if !out.committed {
 		// Client-caused upstream 5xx (invalid_request / convert_request_failed
 		// semantics): relay the upstream's verdict instead of the generic

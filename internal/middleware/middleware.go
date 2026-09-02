@@ -3,9 +3,13 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"time"
 
 	"ai-gateway/internal/apikey"
 	"ai-gateway/internal/auth"
@@ -193,6 +197,23 @@ func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker
 					http.Error(w, `{"error":{"message":"invalid gateway api key","type":"authentication_error"}}`, http.StatusUnauthorized)
 					return
 				}
+				// Per-key IP allowlist: empty allows any client; the client IP must
+				// match an entry (exact IP or CIDR range) otherwise.
+				if key.IPAllowlist != "" && !clientIPAllowed(clientIP(r), key.IPAllowlist) {
+					log.Warn().Str("key_prefix", key.Prefix).Str("client_ip", clientIP(r)).Msg("gateway key rejected: IP not allowed")
+					http.Error(w, `{"error":{"message":"client IP not allowed for this key","type":"permission_error"}}`, http.StatusForbidden)
+					return
+				}
+				// Monthly spend cap: calendar-month spend for this key must stay
+				// under the configured budget before admitting another request.
+				if key.MonthlyBudgetUSD > 0 {
+					if spent := store.MonthSpendUSD(key.ID); spent >= key.MonthlyBudgetUSD {
+						log.Warn().Str("key_prefix", key.Prefix).Float64("spent", spent).Float64("budget", key.MonthlyBudgetUSD).Msg("gateway key: monthly budget exceeded")
+						w.Header().Set("Retry-After", secondsUntilNextMonthUTC())
+						http.Error(w, `{"error":{"message":"monthly spend budget exceeded for this key","type":"budget_exceeded"}}`, http.StatusTooManyRequests)
+						return
+					}
+				}
 				attachGatewayKey(next, w, r, key)
 				return
 			}
@@ -285,4 +306,43 @@ func claimsTV(claims jwt.MapClaims) int64 {
 		}
 	}
 	return 0
+}
+
+// clientIPAllowed reports whether ip matches the allowlist of exact IPs
+// and/or CIDR ranges (comma or whitespace separated).
+func clientIPAllowed(ip, allowlist string) bool {
+	if strings.TrimSpace(allowlist) == "" {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, entry := range strings.FieldsFunc(allowlist, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\t' }) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if prefix, err := netip.ParsePrefix(entry); err == nil {
+				addr, ok := netip.AddrFromSlice(parsed)
+				if ok && prefix.Contains(addr.Unmap()) {
+					return true
+				}
+			}
+			continue
+		}
+		if e := net.ParseIP(entry); e != nil && e.Equal(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// secondsUntilNextMonthUTC is the Retry-After hint when a monthly budget is
+// exhausted (the counter resets at the UTC month boundary).
+func secondsUntilNextMonthUTC() string {
+	now := time.Now().UTC()
+	next := time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+	return strconv.Itoa(int(next.Sub(now).Seconds()) + 1)
 }

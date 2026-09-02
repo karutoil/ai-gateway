@@ -22,7 +22,7 @@ import (
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/provider"
-	"ai-gateway/internal/resilience"
+	"ai-gateway/internal/rbac"
 	"ai-gateway/internal/user"
 	"ai-gateway/internal/webhook"
 
@@ -37,7 +37,6 @@ type AdminHandler struct {
 	DB            *sql.DB
 	Discovery     *discovery.Service
 	UserStore     *user.Store
-	Breaker       resilience.CircuitBreaker
 	// Recorder, when set, writes audit rows (logins, credential changes).
 	Recorder audit.Recorder
 	// AuthLimiter, when set, rate-limits the public credential endpoints.
@@ -86,21 +85,31 @@ func (h *AdminHandler) Routes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.AdminMiddlewareWithRevocation(h.Config.JWTSecret, h.UserStore))
 		r.Get("/providers", h.ListProviders)
-		r.With(middleware.RequireRole("admin", "member", "support")).Post("/providers", h.CreateProvider)
-		r.With(middleware.RequireRole("admin", "member", "support")).Put("/providers/{id}", h.UpdateProvider)
-		r.With(middleware.RequireRole("admin", "member", "support")).Delete("/providers/{id}", h.DeleteProvider)
-		r.With(middleware.RequireRole("admin", "member", "support", "readonly")).Post("/providers/test", h.TestProvider)
+		r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/providers", h.CreateProvider)
+		r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Put("/providers/{id}", h.UpdateProvider)
+		r.With(middleware.RequirePerm(rbac.PermProvidersDelete)).Delete("/providers/{id}", h.DeleteProvider)
+		r.With(middleware.RequirePerm(rbac.PermProvidersTest)).Post("/providers/test", h.TestProvider)
 
-		r.Get("/keys", h.ListKeys)
-		r.With(middleware.RequireRole("admin", "member", "support")).Post("/keys", h.CreateKey)
-		r.With(middleware.RequireRole("admin", "member", "support")).Put("/keys/{id}", h.UpdateKey)
-		r.With(middleware.RequireRole("admin", "member", "support")).Delete("/keys/{id}", h.DeleteKey)
-		r.With(middleware.RequireRole("admin", "member", "support")).Put("/keys/{id}/rate-limit", h.UpdateKeyRateLimit)
-		r.With(middleware.RequireRole("admin", "member", "support")).Put("/keys/{id}/limits", h.UpdateKeyLimits)
-		r.Get("/stats", h.Stats)
-		r.Get("/logs", h.Logs)
-		r.Get("/logs/{id}", h.GetLog)
-		r.Get("/billing/export", h.BillingExport)
+		// Keys: read passes with either keys:read (all) or keys:read_own —
+		// ListKeys narrows to owned keys when only the latter holds.
+		r.With(middleware.RequireAnyPerm(rbac.PermKeysRead, rbac.PermKeysReadOwn)).Get("/keys", h.ListKeys)
+		r.With(middleware.RequireAnyPerm(rbac.PermKeysRead, rbac.PermKeysReadOwn)).Get("/keys/{id}/analytics", h.KeyAnalytics)
+		r.With(middleware.RequirePerm(rbac.PermKeysCreate)).Post("/keys", h.CreateKey)
+		r.With(middleware.RequirePerm(rbac.PermKeysUpdate)).Put("/keys/{id}", h.UpdateKey)
+		r.With(middleware.RequirePerm(rbac.PermKeysDelete)).Delete("/keys/{id}", h.DeleteKey)
+		r.With(middleware.RequirePerm(rbac.PermKeysLimits)).Put("/keys/{id}/rate-limit", h.UpdateKeyRateLimit)
+		r.With(middleware.RequirePerm(rbac.PermKeysLimits)).Put("/keys/{id}/limits", h.UpdateKeyLimits)
+		r.With(middleware.RequirePerm(rbac.PermKeysLimits)).Put("/keys/{id}/owner", h.SetKeyOwner)
+		r.With(middleware.RequireAnyPerm(rbac.PermKeysRotate, rbac.PermKeysReadOwn)).Post("/keys/{id}/rotate", h.RotateKey)
+		// Request logs & billing: org-wide visibility requires logs:read.
+		// Callers with ONLY keys:read_own get scoped access (their keys'
+		// requests only) via handler-internal narrowing below.
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/stats", h.Stats)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/logs", h.Logs)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/logs/group", h.LogGroup)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/logs/export", h.LogsExport)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/logs/{id}", h.GetLog)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/billing/export", h.BillingExport)
 	})
 }
 
@@ -381,14 +390,6 @@ func (h *AdminHandler) ListProviders(w http.ResponseWriter, r *http.Request) {
 	if list == nil {
 		list = []models.Provider{}
 	}
-	if h.Breaker != nil {
-		for i := range list {
-			if h.Breaker.State(list[i].ID) == "open" {
-				st := "circuit_open"
-				list[i].HealthStatus = &st
-			}
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
 }
@@ -576,14 +577,49 @@ func (h *AdminHandler) TestProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := h.resolveScope(r)
-	if !ok {
-		httperr.Forbidden(w, "org scope required")
-		return
+	// Ownership-scoped callers (keys:read_own without keys:read) do not need
+	// an org claim: the ownership predicate is itself a complete data
+	// boundary (they only ever see keys they created). Denying here locked
+	// assigned-key users out of the dashboard in org deployments.
+	orgID := ""
+	if hasAll, _, _ := logScopeOwnOnly(r, h, "rl"); hasAll {
+		var ok bool
+		if orgID, ok = h.resolveScope(r); !ok {
+			httperr.Forbidden(w, "org scope required")
+			return
+		}
+	}
+
+	// Ownership scoping: callers with keys:read see everything; callers with
+	// ONLY keys:read_own see just the keys they created (RequireAnyPerm
+	// guarantees at least one and cached the effective set in context).
+	perms := auth.GetPerms(r)
+	role := auth.GetRole(r)
+	ownOnly := false
+	if role != "admin" {
+		if perms == nil {
+			// No cached set (bare-handler path): fall back to role defaults.
+			perms = rbac.Defaults(role)
+		}
+		if !rbac.Has(perms, "keys:read") && !rbac.Has(perms, "keys:read_own") {
+			// Defense in depth: the middleware should have blocked this, but
+			// never leak the full list if we somehow got here.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode([]models.GatewayKey{})
+			return
+		}
+		ownOnly = rbac.Has(perms, "keys:read_own") && !rbac.Has(perms, "keys:read")
 	}
 	var list []models.GatewayKey
 	var err error
-	if orgID != "" {
+	if ownOnly {
+		if uid := h.callerUserID(r); uid != "" {
+			list, err = h.APIKeyStore.ListCreatedBy(uid)
+		} else {
+			list = []models.GatewayKey{}
+		}
+	} else if orgID != "" {
 		list, err = h.APIKeyStore.ListForOrg(orgID)
 	} else {
 		list, err = h.APIKeyStore.List()
@@ -597,6 +633,75 @@ func (h *AdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
+}
+
+// RotateKey regenerates a key's secret in place. Permission model:
+// holders of keys:rotate may rotate any key; callers with only
+// keys:read_own may rotate **their own** keys (the requested feature —
+// a user can rotate credentials assigned to them without broader access).
+// The old secret keeps authenticating for a short grace window.
+func (h *AdminHandler) RotateKey(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	// Resolve the key first so ownership scoping can apply.
+	var createdBy string
+	err := h.DB.QueryRow(db.Q(`SELECT COALESCE(created_by,'') FROM gateway_keys WHERE id=? AND revoked_at IS NULL`), id).Scan(&createdBy)
+	if err != nil {
+		http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Permission resolution: keys:rotate = any key; else keys:read_own
+	// restricts to keys the caller created. RequireAnyPerm guarantees one.
+	role := auth.GetRole(r)
+	perms := auth.GetPerms(r)
+	if role != "admin" {
+		if perms == nil {
+			perms = rbac.Defaults(role)
+		}
+		if !rbac.Has(perms, rbac.PermKeysRotate) {
+			if !rbac.Has(perms, rbac.PermKeysReadOwn) || createdBy == "" || createdBy != h.callerUserID(r) {
+				http.Error(w, `{"error":"forbidden: you can only rotate your own keys"}`, http.StatusForbidden)
+				return
+			}
+		}
+	}
+
+	k, raw, err := h.APIKeyStore.Rotate(id)
+	if err != nil {
+		http.Error(w, `{"error":"rotation failed: `+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+	if h.Recorder != nil {
+		h.Recorder.Log(auth.GetSubject(r), "rotate", "gateway_key", id, "secret regenerated; old secret in grace window")
+	}
+	emitWebhook("key.rotated", map[string]any{
+		"key":    k.Name,
+		"name":   k.Name,
+		"prefix": k.Prefix,
+		"actor":  auth.GetSubject(r),
+	})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"key":          k.Name,
+		"prefix":       k.Prefix,
+		"secret":       raw, // one-time display; only the hash is stored
+		"grace_window": apikey.RotationGraceWindow.String(),
+		"note":         "The previous secret keeps working for " + apikey.RotationGraceWindow.String() + ". Update your apps, then it expires automatically.",
+	})
+}
+
+// callerUserID resolves the authenticated dashboard subject to its user id
+// ("" when unresolvable — e.g. legacy bootstrap tokens).
+func (h *AdminHandler) callerUserID(r *http.Request) string {
+	sub := auth.GetSubject(r)
+	if sub == "" || h.UserStore == nil {
+		return ""
+	}
+	if u, _, err := h.UserStore.GetByUsername(sub); err == nil {
+		return u.ID
+	}
+	return ""
 }
 
 func (h *AdminHandler) CreateKey(w http.ResponseWriter, r *http.Request) {
@@ -626,15 +731,17 @@ func (h *AdminHandler) CreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Same cross-org guard as CreateProvider: non-admins always get their own
-	// verified claim org; admins may target any org or global.
+	// verified claim org; admins may target any org or global. Unscoped
+	// creation (no org claim) is allowed only while the deployment has no
+	// organizations — same contract as resolveScope's single-tenant mode.
 	if auth.GetRole(r) != "admin" {
 		body.OrgID = auth.GetOrgID(r)
 	}
-	if body.OrgID == "" && auth.GetRole(r) != "admin" {
+	if body.OrgID == "" && auth.GetRole(r) != "admin" && !h.globalScopeAllowed() {
 		httperr.Forbidden(w, "org scope required")
 		return
 	}
-	k, err := h.APIKeyStore.CreateWithOrg(body.Name, body.OrgID)
+	k, err := h.APIKeyStore.CreateWithOrg(body.Name, body.OrgID, h.callerUserID(r))
 	if err != nil {
 		http.Error(w, `{"error":"create failed"}`, http.StatusInternalServerError)
 		return
@@ -664,6 +771,12 @@ func (h *AdminHandler) CreateKey(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(k)
+	emitWebhook("key.created", map[string]any{
+		"key":    k.Name,
+		"name":   k.Name,
+		"prefix": k.Prefix,
+		"actor":  auth.GetSubject(r),
+	})
 }
 
 func (h *AdminHandler) DeleteKey(w http.ResponseWriter, r *http.Request) {
@@ -675,14 +788,62 @@ func (h *AdminHandler) DeleteKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
 		return
 	}
+	emitWebhook("key.revoked", map[string]any{
+		"key":   id,
+		"actor": auth.GetSubject(r),
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := h.resolveScope(r)
-	if !ok {
-		httperr.Forbidden(w, "org scope required")
+// SetKeyOwner reassigns a key's owner (created_by). Body: {"user_id": "..."}
+// or {"user_id": null} to clear ownership. Gated by keys:limits (the same
+// permission as other key administration); also requires that the caller can
+// see users at all (defense against an keys:limits-only principal probing
+// user ids — a bad user id 404s rather than confirming existence).
+func (h *AdminHandler) SetKeyOwner(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if !h.requireWriteTarget(w, r, "gateway_keys", id) {
 		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	var body struct {
+		UserID *string `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httperr.Invalid(w, "invalid json: expected {\"user_id\": \"...\" | null}")
+		return
+	}
+	owner := ""
+	if body.UserID != nil {
+		owner = strings.TrimSpace(*body.UserID)
+	}
+	if owner != "" && h.UserStore != nil {
+		if _, err := h.UserStore.GetByID(owner); err != nil {
+			http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+			return
+		}
+	}
+	if err := h.APIKeyStore.SetKeyOwner(id, owner); err != nil {
+		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
+		return
+	}
+	if h.Recorder != nil {
+		h.Recorder.Log(auth.GetSubject(r), "update", "gateway_key_owner", id, "owner set to "+owner)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"id": id, "created_by": owner})
+}
+
+func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
+	// Own-key-scoped callers bypass the org requirement: their view
+	// is already bounded to keys they created (logScopeOwnOnly).
+	orgID := ""
+	if hasAll, _, _ := logScopeOwnOnly(r, h, ""); hasAll {
+		var ok bool
+		if orgID, ok = h.resolveScope(r); !ok {
+			httperr.Forbidden(w, "org scope required")
+			return
+		}
 	}
 	var providerCount, keyCount, logCount int
 	if orgID != "" {
@@ -694,17 +855,37 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		h.DB.QueryRow(`SELECT COUNT(*) FROM gateway_keys WHERE revoked_at IS NULL`).Scan(&keyCount)
 		h.DB.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&logCount)
 	}
+	// Ownership narrowing for badge counts: keys:read_own-only callers count
+	// their own keys (by created_by - key_id is a request_logs column, not on
+	// gateway_keys, so the generic scope SQL cannot be reused here) and the
+	// requests made with those keys.
+	if _, scopeSQL, scopeArgs := logScopeOwnOnly(r, h, ""); scopeSQL != "" {
+		if scopeSQL != "1=0" && len(scopeArgs) == 1 {
+			h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM gateway_keys WHERE revoked_at IS NULL AND created_by = ?`), scopeArgs[0]).Scan(&keyCount)
+			h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE `+scopeSQL), scopeArgs...).Scan(&logCount)
+		} else {
+			// Fail-closed scope: no keys or requests visible at all.
+			keyCount, logCount = 0, 0
+		}
+	}
 	var totalTokens sql.NullInt64
 	var totalCost sql.NullFloat64
 	// Cross-tenant guard: every request_logs aggregate below must honor the
 	// same org scope as the counts above — previously only the counts were
 	// filtered, leaking other orgs' tokens/cost/latency metadata to
-	// org-scoped callers.
+	// org-scoped callers. Ownership guard: keys:read_own-only callers see
+	// only their own keys' aggregates (RequireAnyPerm admitted them with
+	// keys:read_own alone).
 	orgFilter := ""
 	orgArgs := []any{}
 	if orgID != "" {
 		orgFilter = " AND provider_id IN (SELECT id FROM providers WHERE org_id=?)"
 		orgArgs = []any{orgID}
+	}
+	_, scopeSQL, scopeArgs := logScopeOwnOnly(r, h, "")
+	if scopeSQL != "" {
+		orgFilter += " AND " + scopeSQL
+		orgArgs = append(orgArgs, scopeArgs...)
 	}
 	totArgs := append([]any{}, orgArgs...)
 	h.DB.QueryRow(db.Q(`SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0) FROM request_logs WHERE 1=1`+orgFilter), totArgs...).Scan(&totalTokens, &totalCost)
@@ -991,10 +1172,15 @@ func percentile(sorted []int64, p int) int64 {
 // key (key_prefix prefix), endpoint (substring), status ("failed" or code),
 // since (RFC3339 timestamp or Go duration like 24h).
 func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := h.resolveScope(r)
-	if !ok {
-		httperr.Forbidden(w, "org scope required")
-		return
+	// Own-key-scoped callers bypass the org requirement: their view is
+	// already bounded to keys they created (logScopeOwnOnly).
+	orgID := ""
+	if hasAll, _, _ := logScopeOwnOnly(r, h, "rl"); hasAll {
+		var ok bool
+		if orgID, ok = h.resolveScope(r); !ok {
+			httperr.Forbidden(w, "org scope required")
+			return
+		}
 	}
 	q := r.URL.Query()
 	limit := 100
@@ -1006,44 +1192,19 @@ func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 		offset = v
 	}
 
-	where := []string{}
-	args := []any{}
-	if orgID != "" {
-		where = append(where, "p.org_id=?")
-		args = append(args, orgID)
-	}
-	if m := strings.TrimSpace(q.Get("model")); m != "" {
-		where = append(where, "(rl.model LIKE ? OR rl.model = ?)")
-		args = append(args, "%"+m+"%", m)
-	}
-	if k := strings.TrimSpace(q.Get("key")); k != "" {
-		where = append(where, "rl.key_prefix LIKE ?")
-		args = append(args, k+"%")
-	}
-	if ep := strings.TrimSpace(q.Get("endpoint")); ep != "" {
-		where = append(where, "rl.endpoint LIKE ?")
-		args = append(args, "%"+ep+"%")
-	}
-	if s := strings.TrimSpace(q.Get("status")); s != "" {
-		if s == "failed" {
-			where = append(where, "rl.status >= 400")
-		} else if code, err := strconv.Atoi(s); err == nil {
-			where = append(where, "rl.status=?")
-			args = append(args, code)
+	// Shared filter builder (log_filters.go): status/time/model/key/endpoint
+	// plus the extended key_id/provider_id/stream/latency/error/search set.
+	whereSQL, args := logFilterWhere(orgID, q)
+	// Ownership narrowing: keys:read_own-only callers see only their keys'
+	// requests (never other users' traffic).
+	_, scopeSQL, scopeArgs := logScopeOwnOnly(r, h, "rl")
+	if scopeSQL != "" {
+		sep := " AND "
+		if whereSQL == "" {
+			sep = " WHERE "
 		}
-	}
-	if sv := strings.TrimSpace(q.Get("since")); sv != "" {
-		if t, err := time.Parse(time.RFC3339, sv); err == nil {
-			where = append(where, "rl.created_at >= ?")
-			args = append(args, t.UTC())
-		} else if d, err := time.ParseDuration(sv); err == nil && d > 0 {
-			where = append(where, "rl.created_at >= ?")
-			args = append(args, time.Now().UTC().Add(-d))
-		}
-	}
-	whereSQL := ""
-	if len(where) > 0 {
-		whereSQL = " WHERE " + strings.Join(where, " AND ")
+		whereSQL += sep + scopeSQL
+		args = append(args, scopeArgs...)
 	}
 	from := " FROM request_logs rl LEFT JOIN providers p ON rl.provider_id = p.id" + whereSQL
 
@@ -1099,10 +1260,53 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 	// resolveScope (not the raw claim) so unscoped non-admins are denied once
 	// organizations exist — this detail view uniquely carries stored
 	// request/response bodies.
-	orgID, scopeOK := h.resolveScope(r)
-	if !scopeOK {
-		httperr.Forbidden(w, "org scope required")
-		return
+	// Own-key-scoped callers bypass the org requirement: their view of the
+	// log row is bounded by the ownership check below.
+	orgID := ""
+	if hasAll, _, _ := logScopeOwnOnly(r, h, "rl"); hasAll {
+		var ok bool
+		if orgID, ok = h.resolveScope(r); !ok {
+			httperr.Forbidden(w, "org scope required")
+			return
+		}
+	}
+	// Body visibility: request/response payloads require logs:read_bodies.
+	// The row itself (status/latency/tokens) needs only logs:read or
+	// keys:read_own — bodies are stripped below when the perm is missing.
+	role := auth.GetRole(r)
+	if role != "admin" {
+		perms := auth.GetPerms(r)
+		if perms == nil {
+			perms = rbac.Defaults(role)
+		}
+		if !rbac.Has(perms, rbac.PermLogsReadBodies) && !rbac.Has(perms, rbac.PermLogsRead) {
+			// Neither bodies perm nor logs:read → deny entirely (this view
+			// exists to show details; a metadata-only caller has no path
+			// here anyway since ListRows carry the summary).
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
+		}
+	}
+	// Ownership narrowing: keys:read_own-only callers may only open their
+	// keys' rows. Fetch the key_id first and compare.
+	_, scopeSQL, scopeArgs := logScopeOwnOnly(r, h, "rl")
+	if scopeSQL != "" {
+		var rowKeyID sql.NullString
+		if err := h.DB.QueryRow(db.Q(`SELECT COALESCE(key_id,'') FROM request_logs WHERE id=?`), id).Scan(&rowKeyID); err != nil || !rowKeyID.Valid || rowKeyID.String == "" {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		allowed := false
+		// scopeArgs = [uid]; direct membership check.
+		if len(scopeArgs) == 1 {
+			var cnt int
+			h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM gateway_keys WHERE id=? AND created_by=?`), rowKeyID.String, scopeArgs[0]).Scan(&cnt)
+			allowed = cnt > 0
+		}
+		if !allowed {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
 	}
 	var l models.RequestLog
 	var ttft sql.NullInt64
@@ -1166,6 +1370,18 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 	h.DB.QueryRow(db.Q(`SELECT name FROM providers WHERE id=?`), l.ProviderID).Scan(&providerName)
 	var keyName sql.NullString
 	h.DB.QueryRow(db.Q(`SELECT name FROM gateway_keys WHERE prefix=?`), l.KeyPrefix).Scan(&keyName)
+	// Body visibility: without logs:read_bodies the stored payloads are
+	// stripped from the response entirely (never sent to the client).
+	if role != "admin" {
+		perms := auth.GetPerms(r)
+		if perms == nil {
+			perms = rbac.Defaults(role)
+		}
+		if !rbac.Has(perms, rbac.PermLogsReadBodies) {
+			l.RequestBody = ""
+			l.ResponseBody = ""
+		}
+	}
 	extra := map[string]any{
 		"log":           l,
 		"provider_name": providerName.String,
@@ -1271,15 +1487,18 @@ func (h *AdminHandler) UpdateKeyLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		RPM           *int      `json:"rpm"`
-		RPH           *int      `json:"rph"`
-		RPD           *int      `json:"rpd"`
-		TPM           *int      `json:"tpm"`
-		RateLimitRPM  *int      `json:"rate_limit_rpm"`
-		RateLimitRPH  *int      `json:"rate_limit_rph"`
-		RateLimitRPD  *int      `json:"rate_limit_rpd"`
-		RateLimitTPM  *int      `json:"rate_limit_tpm"`
-		AllowedModels *[]string `json:"allowed_models"`
+		RPM              *int      `json:"rpm"`
+		RPH              *int      `json:"rph"`
+		RPD              *int      `json:"rpd"`
+		TPM              *int      `json:"tpm"`
+		RateLimitRPM     *int      `json:"rate_limit_rpm"`
+		RateLimitRPH     *int      `json:"rate_limit_rph"`
+		RateLimitRPD     *int      `json:"rate_limit_rpd"`
+		RateLimitTPM     *int      `json:"rate_limit_tpm"`
+		AllowedModels    *[]string `json:"allowed_models"`
+		ExpiresAt        *string   `json:"expires_at"`
+		IPAllowlist      *string   `json:"ip_allowlist"`
+		MonthlyBudgetUSD *float64  `json:"monthly_budget_usd"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, 400)
@@ -1301,13 +1520,47 @@ func (h *AdminHandler) UpdateKeyLimits(w http.ResponseWriter, r *http.Request) {
 	if tpm == nil {
 		tpm = body.RateLimitTPM
 	}
-	if rpm == nil && rph == nil && rpd == nil && tpm == nil && body.AllowedModels == nil {
+	if rpm == nil && rph == nil && rpd == nil && tpm == nil && body.AllowedModels == nil &&
+		body.ExpiresAt == nil && body.IPAllowlist == nil && body.MonthlyBudgetUSD == nil {
 		http.Error(w, `{"error":"no fields to update"}`, 400)
 		return
 	}
 	if err := h.APIKeyStore.UpdateLimits(id, rpm, rph, rpd, tpm, body.AllowedModels); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), 400)
 		return
+	}
+	// Extended key-management fields (0.15): expiry, IP allowlist, budget.
+	if body.ExpiresAt != nil {
+		var t *time.Time
+		if s := strings.TrimSpace(*body.ExpiresAt); s != "" {
+			// Accept RFC3339 or a bare date/datetime-local value.
+			for _, layout := range []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02"} {
+				if parsed, err := time.Parse(layout, s); err == nil {
+					t = &parsed
+					break
+				}
+			}
+			if t == nil {
+				http.Error(w, `{"error":"expires_at must be RFC3339 or YYYY-MM-DD"}`, 400)
+				return
+			}
+		}
+		if err := h.APIKeyStore.SetExpiresAt(id, t); err != nil {
+			http.Error(w, `{"error":"expiry update failed"}`, 500)
+			return
+		}
+	}
+	if body.IPAllowlist != nil {
+		if err := h.APIKeyStore.SetIPAllowlist(id, *body.IPAllowlist); err != nil {
+			http.Error(w, `{"error":"allowlist update failed"}`, 500)
+			return
+		}
+	}
+	if body.MonthlyBudgetUSD != nil {
+		if err := h.APIKeyStore.SetMonthlyBudget(id, *body.MonthlyBudgetUSD); err != nil {
+			http.Error(w, `{"error":"budget update failed"}`, 500)
+			return
+		}
 	}
 	updated, err := h.APIKeyStore.GetByID(id)
 	if err != nil {
@@ -1349,10 +1602,15 @@ func (h *AdminHandler) UpdateKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := h.resolveScope(r)
-	if !ok {
-		httperr.Forbidden(w, "org scope required")
-		return
+	// Own-key-scoped callers bypass the org requirement: their view is
+	// already bounded to keys they created (logScopeOwnOnly).
+	orgID := ""
+	if hasAll, _, _ := logScopeOwnOnly(r, h, ""); hasAll {
+		var ok bool
+		if orgID, ok = h.resolveScope(r); !ok {
+			httperr.Forbidden(w, "org scope required")
+			return
+		}
 	}
 	// billing export webhook (Phase 3): emit audit-style webhook for exports
 	if webhook.Global != nil {
@@ -1381,10 +1639,17 @@ func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
 	}
 	var rows *sql.Rows
 	var err error
+	// Ownership narrowing: keys:read_own-only callers export only their
+	// keys' rows (composed into both branches).
+	_, scopeSQL, scopeArgs := logScopeOwnOnly(r, h, "")
+	scopeAll := ""
+	if scopeSQL != "" {
+		scopeAll = " AND " + scopeSQL
+	}
 	if orgID != "" {
-		rows, err = h.DB.Query(db.Q(`SELECT rl.id, rl.key_prefix, rl.provider_id, rl.model, rl.endpoint, rl.status, rl.latency_ms, rl.created_at, rl.prompt_tokens, rl.completion_tokens, rl.total_tokens, rl.cost_usd FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE p.org_id=? AND rl.created_at >= ? ORDER BY rl.created_at DESC`), orgID, start)
+		rows, err = h.DB.Query(db.Q(`SELECT rl.id, rl.key_prefix, rl.provider_id, rl.model, rl.endpoint, rl.status, rl.latency_ms, rl.created_at, rl.prompt_tokens, rl.completion_tokens, rl.total_tokens, rl.cost_usd FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE p.org_id=? AND rl.created_at >= ?`+scopeAll+` ORDER BY rl.created_at DESC`), append([]any{orgID, start}, scopeArgs...)...)
 	} else {
-		rows, err = h.DB.Query(db.Q(`SELECT id, key_prefix, provider_id, model, endpoint, status, latency_ms, created_at, prompt_tokens, completion_tokens, total_tokens, cost_usd FROM request_logs WHERE created_at >= ? ORDER BY created_at DESC`), start)
+		rows, err = h.DB.Query(db.Q(`SELECT id, key_prefix, provider_id, model, endpoint, status, latency_ms, created_at, prompt_tokens, completion_tokens, total_tokens, cost_usd FROM request_logs WHERE created_at >= ?`+scopeAll+` ORDER BY created_at DESC`), append([]any{start}, scopeArgs...)...)
 	}
 	if err != nil {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)

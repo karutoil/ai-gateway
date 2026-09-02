@@ -7,9 +7,11 @@ import (
 	"time"
 
 	"ai-gateway/internal/audit"
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/rbac"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -37,9 +39,9 @@ func (h *OrgHandler) ensureTables() {
 
 func (h *OrgHandler) Routes(r chi.Router) {
 	r.Get("/orgs", h.ListOrgs)
-	r.With(middleware.RequireRole("admin")).Post("/orgs", h.CreateOrg)
-	r.With(middleware.RequireRole("admin")).Delete("/orgs/{id}", h.DeleteOrg)
-	r.With(middleware.RequireRole("admin")).Post("/orgs/{id}/members", h.AddMember)
+	r.With(middleware.RequirePerm(rbac.PermOrgsWrite)).Post("/orgs", h.CreateOrg)
+	r.With(middleware.RequirePerm(rbac.PermOrgsWrite)).Delete("/orgs/{id}", h.DeleteOrg)
+	r.With(middleware.RequirePerm(rbac.PermOrgsWrite)).Post("/orgs/{id}/members", h.AddMember)
 	r.Get("/orgs/{id}/members", h.ListMembers)
 }
 
@@ -70,6 +72,10 @@ func (h *OrgHandler) CreateOrg(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(org)
+	emitWebhook("org.created", map[string]any{
+		"name":  body.Name,
+		"actor": auth.GetSubject(r),
+	})
 }
 
 func (h *OrgHandler) ListOrgs(w http.ResponseWriter, r *http.Request) {

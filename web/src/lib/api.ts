@@ -83,17 +83,63 @@ export function extractApiError(text: string, fallback = 'request failed'): stri
   return t.length > 400 ? t.slice(0, 400) + '…' : t
 }
 
-/** Query params accepted by GET /api/logs. */
+/** Query params accepted by GET /api/logs (and /api/logs/group + /api/logs/export). */
 export type LogsQuery = {
   limit?: number
   offset?: number
   model?: string
+  /** key prefix filter (prefix match) */
   key?: string
+  /** exact gateway key id */
+  key_id?: string
+  /** exact provider id */
+  provider_id?: string
   endpoint?: string
   /** "failed" or an HTTP status code as a string */
   status?: string
   /** e.g. "1h", "24h", "7d", "30d" */
   since?: string
+  /** stream / non-stream / any (omit) */
+  stream?: 'true' | 'false'
+  min_latency_ms?: number
+  max_latency_ms?: number
+  has_error?: 'true'
+  /** server-side search across model, endpoint, error (and bodies with search_bodies) */
+  q?: string
+  /** opt-in: include request/response bodies in q search */
+  search_bodies?: 'true'
+}
+
+/** Params for GET /api/logs/group (group-by reporting). */
+export type LogsGroupQuery = Omit<LogsQuery, 'limit' | 'offset'> & {
+  group_by: 'key' | 'model' | 'provider' | 'endpoint' | 'finish_reason' | 'status' | 'error'
+  /** window: 24h / 7d / 30d (default 7d) */
+  range?: string
+  limit?: number
+  order?: 'requests' | 'cost' | 'tokens'
+}
+
+export type LogGroupRow = {
+  group: string
+  name?: string
+  requests: number
+  tokens: number
+  cost: number
+  failed: number
+  avg_latency_ms: number
+  p50_latency_ms: number
+  p95_latency_ms: number
+}
+
+/** Build a query string from a params object, skipping empty values. */
+export function logsParamsToSearch(params: Record<string, unknown>): string {
+  const p = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue
+    p.set(k, String(v))
+  }
+  const s = p.toString()
+  return s ? `?${s}` : ''
 }
 
 // Load-balancer routing rules: per-model provider groups with a strategy.
@@ -146,8 +192,14 @@ export const api = {
     remove: (id:string) => req(`/api/keys/${id}`, { method:'DELETE'}),
     setRpm: (id:string, rpm:number) => req(`/api/keys/${id}/rate-limit`, { method:'PUT', body: JSON.stringify({rpm})}),
     setLimits: (id:string, data: Record<string, unknown>) => req(`/api/keys/${id}/limits`, { method:'PUT', body: JSON.stringify(data)}),
+    /** Reassign a key's owner (created_by). Pass null to clear ownership. */
+    setOwner: (id:string, userId: string | null) => req(`/api/keys/${id}/owner`, { method:'PUT', body: JSON.stringify({user_id: userId})}),
+    /** Rotate a key's secret; returns the one-time new secret + grace info. */
+    rotate: (id: string) => req(`/api/keys/${id}/rotate`, { method: 'POST' }) as Promise<{ key: string; prefix: string; grace_window: string; note: string; secret: string }>,
     update: (id:string, data:{name:string}) => req(`/api/keys/${id}`, { method:'PUT', body: JSON.stringify(data)}),
     bulkRemove: (ids:string[]) => Promise.all(ids.map(id=> req(`/api/keys/${id}`, { method:'DELETE'}))),
+    /** Per-key usage analytics: GET /api/keys/{id}/analytics?range=24h|7d|30d */
+    analytics: (id: string, range: '24h'|'7d'|'30d' = '7d') => req(`/api/keys/${encodeURIComponent(id)}/analytics?range=${range}`),
   },
   stats: () => req('/api/stats'),
   logs: () => req('/api/logs'),
@@ -156,15 +208,7 @@ export const api = {
    * matching row count rides on the X-Total-Count header.
    */
   logsQuery: async (params: LogsQuery = {}): Promise<{ rows: any[]; total: number | null }> => {
-    const p = new URLSearchParams()
-    if (params.limit != null) p.set('limit', String(params.limit))
-    if (params.offset != null) p.set('offset', String(params.offset))
-    if (params.model) p.set('model', params.model)
-    if (params.key) p.set('key', params.key)
-    if (params.endpoint) p.set('endpoint', params.endpoint)
-    if (params.status) p.set('status', params.status)
-    if (params.since) p.set('since', params.since)
-    const res = await fetch(apiUrl(`/api/logs?${p.toString()}`), { credentials: 'same-origin' })
+    const res = await fetch(apiUrl(`/api/logs${logsParamsToSearch(params)}`), { credentials: 'same-origin' })
     if (!res.ok) {
       if (res.status === 401) { setBearerToken(null); window.dispatchEvent(new CustomEvent('gw:unauthorized')) }
       const text = await res.text()
@@ -174,6 +218,40 @@ export const api = {
     const totalHdr = res.headers.get('X-Total-Count')
     const total = totalHdr != null && totalHdr !== '' && !Number.isNaN(Number(totalHdr)) ? Number(totalHdr) : null
     return { rows: Array.isArray(rows) ? rows : [], total }
+  },
+  /**
+   * Group-by reporting rollup (GET /api/logs/group): requests/tokens/cost/
+   * latency percentiles per dimension over the shared log filters.
+   */
+  logsGroup: async (params: LogsGroupQuery): Promise<{ group_by: string; range: string; rows: LogGroupRow[] }> => {
+    const { limit, ...rest } = params
+    return req(`/api/logs/group${logsParamsToSearch({ limit: limit ?? 20, ...rest })}`)
+  },
+  /**
+   * Download the filtered log set as CSV (GET /api/logs/export). Returns the
+   * filename and whether the export was truncated at the server cap.
+   */
+  logsExport: async (params: LogsQuery = {}): Promise<{ filename: string; truncated: boolean }> => {
+    const res = await fetch(apiUrl(`/api/logs/export${logsParamsToSearch(params)}`), { credentials: 'same-origin' })
+    if (!res.ok) {
+      if (res.status === 401) { setBearerToken(null); window.dispatchEvent(new CustomEvent('gw:unauthorized')) }
+      const text = await res.text()
+      throw new Error(extractApiError(text, `export failed (${res.status})`))
+    }
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    // Content-Disposition filename, falling back to a generated one.
+    const cd = res.headers.get('Content-Disposition') || ''
+    const m = cd.match(/filename="?([^"]+)"?/)
+    const filename = m?.[1] || `logs-${new Date().toISOString().slice(0, 10)}.csv`
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    return { filename, truncated: res.headers.get('X-Truncated') === 'true' }
   },
   health: () => fetch(apiUrl('/health')).then(r=>r.json()),
   catalog: {
@@ -219,11 +297,24 @@ export const api = {
     members: (orgId: string) => req(`/api/orgs/${orgId}/members`),
     addMember: (orgId: string, user_id: string, role: string) => req(`/api/orgs/${orgId}/members`, { method:'POST', body: JSON.stringify({ user_id, role })}),
   },
+  webhooks: {
+    list: () => req('/api/webhooks'),
+    create: (data: { name: string; url: string; events?: string; secret?: string; enabled?: boolean }) =>
+      req('/api/webhooks', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id: string, data: Record<string, unknown>) =>
+      req(`/api/webhooks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    remove: (id: string) => req(`/api/webhooks/${id}`, { method: 'DELETE' }),
+    test: (id: string) => req(`/api/webhooks/${id}/test`, { method: 'POST' }),
+  },
   profile: {
     get: () => req('/api/profile'),
     update: (data:any) => req('/api/profile', { method:'PUT', body: JSON.stringify(data)}),
     changePassword: (old_password:string, new_password:string) => req('/api/profile/password', { method:'POST', body: JSON.stringify({ old_password, new_password })}),
     activity: () => req('/api/profile/activity'),
+    tokens: () => req('/api/profile/tokens'),
+    createToken: (data: { name: string; expires_days?: number; scopes?: string }) =>
+      req('/api/profile/tokens', { method: 'POST', body: JSON.stringify(data) }),
+    revokeToken: (id: string) => req(`/api/profile/tokens/${id}`, { method: 'DELETE' }),
     logins: () => req('/api/profile/logins'),
   },
   users: {
@@ -233,6 +324,14 @@ export const api = {
     update: (id:string, data:any) => req(`/api/admin/users/${id}`, { method:'PUT', body: JSON.stringify(data)}),
     remove: (id:string) => req(`/api/admin/users/${id}`, { method:'DELETE'}),
     resetPassword: (id:string, password:string) => req(`/api/admin/users/${id}/reset-password`, { method:'POST', body: JSON.stringify({password})}),
+    /** Effective + override permissions for a user (admin only). */
+    getPermissions: (id:string) => req(`/api/admin/users/${id}/permissions`),
+    /**
+     * Upsert permission overrides. Values: true (allow), false (deny),
+     * null (clear override → role default).
+     */
+    setPermissions: (id:string, overrides: Record<string, boolean | null>) =>
+      req(`/api/admin/users/${id}/permissions`, { method:'PUT', body: JSON.stringify(overrides)}),
   },
   /** Admin-only audit trail: GET /api/audit?limit=&offset=&actor= */
   audit: {

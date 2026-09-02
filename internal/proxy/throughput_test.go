@@ -76,6 +76,7 @@ type throughputHarness struct {
 	srv      *httptest.Server
 	upstream *throughputUpstream
 	key      string // raw sk-gw-... bearer token
+	keyID    string // gateway_keys.id of the harness key
 	database *sql.DB
 }
 
@@ -150,7 +151,6 @@ func newThroughputHarness(tb testing.TB) *throughputHarness {
 	h.StreamUsageInject = true
 	h.Cache = cache.NewMemoryCache(512)
 	h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 2, BaseDelay: 200 * time.Millisecond}
-	h.Breaker = resilience.NewMemoryCircuitBreakerFull(5, 60*time.Second, 30*time.Second, 2)
 	h.Metrics = otel.NewMetrics()
 	limiter := budget.NewDBLimiter(database)
 	h.Usage = &budget.UsageSink{Limiter: limiter}
@@ -176,7 +176,7 @@ func newThroughputHarness(tb testing.TB) *throughputHarness {
 
 	srv := httptest.NewServer(r)
 
-	return &throughputHarness{srv: srv, upstream: up, key: k.Key, database: database}
+	return &throughputHarness{srv: srv, upstream: up, key: k.Key, keyID: k.ID, database: database}
 }
 
 func (th *throughputHarness) close() {

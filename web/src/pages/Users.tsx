@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
 import { registerPasskey, authenticatePasskey } from '../lib/webauthn'
+import UserPermissionsModal from './UserPermissionsModal'
 import {
   PageHeader, Card, Button, Input, Select, Field, Badge, Icon, CopyButton,
   TableShell, Th, Td, TableSkeleton, EmptyState, ErrorNote, Modal, Confirm, useToast,
@@ -11,6 +13,8 @@ type DashboardUser = {
   passkey_enabled:boolean; has_recovery_code:boolean; passkey_count:number; disabled:boolean
   last_login_at?: string | null
   login_count?: number
+  /** non-revoked keys created by this user (from ListUsers enrichment) */
+  key_count?: number
 }
 
 function ago(iso?: string | null): string {
@@ -48,6 +52,7 @@ function Avatar({ user }: { user: DashboardUser }) {
 }
 
 export default function Users(){
+	const navigate = useNavigate();
   const [list, setList] = useState<DashboardUser[]>([])
   const [me, setMe] = useState<DashboardUser|null>(null)
   const [loading, setLoading] = useState(true)
@@ -66,6 +71,7 @@ export default function Users(){
   const [deleteTarget, setDeleteTarget] = useState<DashboardUser | null>(null)
   const [accountDisableTarget, setAccountDisableTarget] = useState<DashboardUser | null>(null)
   const [passkeyDisableTarget, setPasskeyDisableTarget] = useState<string | null>(null)
+  const [permsTarget, setPermsTarget] = useState<string | null>(null)
 
   const toast = useToast()
 
@@ -258,11 +264,12 @@ export default function Users(){
       )}
 
       <TableShell>
-        <table className="w-full text-sm min-w-[760px]">
+        <table className="w-full text-sm min-w-[860px]">
           <thead>
             <tr>
               <Th>User</Th>
               <Th>Role</Th>
+              <Th>Keys</Th>
               <Th>Passkey</Th>
               <Th>Recovery</Th>
               <Th>Last login</Th>
@@ -270,7 +277,7 @@ export default function Users(){
             </tr>
           </thead>
           {loading ? (
-            <TableSkeleton rows={4} cols={6} />
+            <TableSkeleton rows={4} cols={7} />
           ) : (
             <tbody>
               {list.map(u=>(
@@ -292,6 +299,21 @@ export default function Users(){
                   </Td>
                   <Td>
                     <Badge tone={ROLE_TONE[u.role] ?? 'neutral'} dot>{u.role}</Badge>
+                  </Td>
+                  <Td>
+                    {/* Assigned keys: keys this user created / owns (non-revoked). */}
+{u.role === 'admin' ? (
+                      <span className="text-xs text-muted">all keys</span>
+                    ) : (
+                      <button
+                        className="inline-flex items-center gap-1.5 hover:text-teal transition-colors focus:outline-none"
+                        title={`${u.key_count ?? 0} key(s) assigned \u2014 click to view in API Keys`}
+                        onClick={() => navigate(`/keys?key_id=${u.id}`)}
+                      >
+                        <Icon name="key" size={13} className={(u.key_count ?? 0) > 0 ? 'text-teal' : 'text-muted/40'} />
+                        <span className="tabular-nums text-xs">{u.key_count ?? 0}</span>
+                      </button>
+                    )}
                   </Td>
                   <Td>
                     <div className="flex flex-col items-start gap-1.5">
@@ -356,6 +378,11 @@ export default function Users(){
                           <Icon name="userCog" size={14} /> Role
                         </Button>
                       )}
+                      {canManage && (
+                        <Button size="sm" variant="ghost" onClick={()=>setPermsTarget(u.id)} title={u.role === 'admin' ? 'View permissions (admins hold all by design)' : 'Edit permissions'}>
+                          <Icon name="shield" size={14} /> Perms
+                        </Button>
+                      )}
                       <Button size="sm" variant="ghost" onClick={()=>{ setResetTarget(u); setResetPwValue('') }} title="Reset password">
                         <Icon name="key" size={14} />
                       </Button>
@@ -376,7 +403,7 @@ export default function Users(){
                 </tr>
               ))}
               {list.length===0 && (
-                <tr><td colSpan={6}>
+                <tr><td colSpan={7}>
                   <EmptyState icon="users" title="No users yet" hint={canManage ? 'Create an admin or support account above.' : 'No accounts exist yet.'} />
                 </td></tr>
               )}
@@ -385,6 +412,7 @@ export default function Users(){
         </table>
         <div className="px-4 py-3 border-t border-stone bg-app/60 text-[11px] text-muted leading-relaxed">
           RBAC: <span className="text-amber font-medium">admin</span> = full access · <span className="text-teal font-medium">support / member</span> = providers &amp; keys · readonly = view only.
+          Use <span className="text-paper">Perms</span> for fine-grained overrides (e.g. let a user see only their own keys) — changes apply immediately.
           Passkeys use WebAuthn — the private key stays on device; a recovery code is required if the passkey is lost.
         </div>
       </TableShell>
@@ -468,6 +496,13 @@ export default function Users(){
         title="Disable passkey?"
         confirmLabel="Disable passkey"
         body="This removes passkey sign-in for this user — they will need their password again, plus recovery-code handling if they lose access."
+      />
+
+      {/* per-user fine-grained permissions editor */}
+      <UserPermissionsModal
+        userId={permsTarget}
+        onClose={()=>setPermsTarget(null)}
+        onSaved={load}
       />
     </div>
   )

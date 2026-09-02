@@ -179,9 +179,9 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 	}
 
 	// 3. Curated LB rule (checked on post-alias model name first, then the
-	// raw/alias spelling). The rule's strategy orders healthy members; the
-	// first member with a closed circuit serves. failover rules hand the
-	// full ordering to proxyCandidates as ordered fallback candidates.
+	// raw/alias spelling). The rule's strategy orders healthy members;
+	// failover rules hand the full ordering to proxyCandidates as ordered
+	// fallback candidates.
 	if h.LB != nil {
 		for _, key := range []string{model, rawModel} {
 			key = strings.ToLower(strings.TrimSpace(key))
@@ -209,17 +209,6 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 					// Explicit opt-in: walk members in position order on
 					// retriable failures.
 					picked = eligible
-				} else if h.Breaker != nil {
-					// Prefer the first member whose circuit is closed over
-					// 503-ing while healthy group members exist.
-					for i, cand := range eligible {
-						if h.Breaker.State(cand.ID) != "open" {
-							if i != 0 {
-								eligible[0], eligible[i] = eligible[i], eligible[0]
-							}
-							break
-						}
-					}
 				}
 				for _, p := range picked {
 					consider(p)
@@ -274,6 +263,26 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	}
 	primaryID := candidates[0].ID
 
+	// One client-facing first-byte budget per client request, shared across
+	// the whole candidate chain: every upstream attempt is bounded by the
+	// REMAINING budget, so a chain of slow candidates still answers before
+	// an edge proxy (Cloudflare ~100s) can 524 the client. Streams that run
+	// out of budget get SSE keepalive headers + frames; buffered requests
+	// get an honest 504.
+	ttfb := newTTFBController(h.Timeouts.TTFB, start)
+	defer ttfb.stop()
+	w = &keepaliveSafeWriter{ResponseWriter: w, c: ttfb}
+	// In-band terminal error once keepalive headers have flowed (a second
+	// HTTP status is impossible at that point). /v1/messages clients speak
+	// anthropic SSE; everything else OpenAI SSE.
+	terminalError := func(status int, msg string) {
+		if ttfb.headersCommitted() {
+			writeSSEUpstreamError(w, endpoint == "messages", msg)
+			return
+		}
+		httperr.Proxy(w, status, msg)
+	}
+
 	var (
 		lastBW         *bufWriter
 		lastProvider   *models.Provider
@@ -291,9 +300,6 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	)
 
 	for idx, p := range candidates {
-		if !h.breakerOrNoop().Allow(p.ID) {
-			continue
-		}
 		// Per-member model override: rule members may send a different model
 		// id upstream (e.g. a pinned date version). Only rule-routed traffic
 		// gets rewrites — pins and legacy routes have no rule, hence no
@@ -313,7 +319,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		if p.ID != primaryID && idx > 0 && candidates[0] != nil {
 			fallbackName = p.Name
 		}
-		callOpts := proxyOpts{fallbackFrom: fallbackName, attempts: chain, rule: rule}
+		callOpts := proxyOpts{fallbackFrom: fallbackName, attempts: chain, rule: rule, ttfb: ttfb}
 
 		if isStream {
 			outcome := h.proxyWithMetricsOpts(w, r, target, apiKey, outBody, true, candModel, p.ID, keyPrefix, endpoint, start, isAnth, callOpts)
@@ -325,11 +331,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			// Client-caused 5xx (upstream "invalid_request" semantics):
 			// relay the upstream's verdict — no failover, no generic 502.
 			if outcome.clientCaused {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(outboundStatus(outcome.status))
-				if outcome.errSnippet != "" {
-					_, _ = w.Write([]byte(outcome.errSnippet))
-				}
+				terminalError(outboundStatus(outcome.status), truncateDetail(outcome.errSnippet))
 				return
 			}
 			if outcome.committed || !outcome.retriable {
@@ -354,11 +356,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			// relay the upstream's verdict instead of the retryable-looking
 			// generic envelope.
 			if outcome.clientCaused {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(outboundStatus(outcome.status))
-				if outcome.errSnippet != "" {
-					_, _ = w.Write([]byte(outcome.errSnippet))
-				}
+				terminalError(outboundStatus(outcome.status), truncateDetail(outcome.errSnippet))
 				return
 			}
 			lastFailStatus = outcome.status
@@ -366,7 +364,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 				chain = append(chain, providerAttempt{ProviderID: p.ID, Name: p.Name, Status: outcome.status})
 				continue
 			}
-			httperr.Proxy(w, outboundStatus(outcome.status), "upstream unavailable")
+			terminalError(outboundStatus(outcome.status), "upstream unavailable")
 			return
 		}
 		if bw.code > 0 && bw.code < 400 {
@@ -394,11 +392,11 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		lastBW.flushTo(w)
 		return
 	}
-	// Nothing was even attempted → all providers were circuit-open.
+	// Nothing was even attempted: no eligible candidates, or every candidate
+	// failed gateway-side request preparation (e.g. credential decryption).
+	// There is no upstream status to relay.
 	if !attempted {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":{"message":"circuit open for provider","type":"proxy_error","code":"circuit_open"}}`))
+		httperr.Proxy(w, http.StatusBadGateway, "no provider available for this model")
 		return
 	}
 	status := http.StatusBadGateway
@@ -410,7 +408,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	// Log the upstream's own answer and persist the failed request.
 	log.Error().Str("provider", lastProviderName).Str("model", model).Str("endpoint", endpoint).Int("upstream_status", lastFailStatus).Str("detail", truncateDetail(lastDetail)).Msg("all provider attempts failed")
 	h.logRequestExtendedBodies(keyPrefix, lastProviderID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{FallbackChain: marshalAttemptChain(chain)})
-	httperr.Proxy(w, status, "all provider attempts failed")
+	terminalError(status, "all provider attempts failed")
 }
 
 // truncateDetail bounds upstream error text for structured logs.

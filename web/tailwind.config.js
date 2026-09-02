@@ -14,8 +14,10 @@ export default {
         app: "rgb(var(--c-graphite) / <alpha-value>)",
         raised: "rgb(var(--c-raised) / <alpha-value>)",
         // Legacy palette (pages not yet migrated still compile).
-        amber: "#FFB84D",
-        teal: "#2CD9A3",
+        // teal/amber resolve to CSS vars so light mode can soften them;
+        // dark mode keeps the original neon values.
+        amber: "rgb(var(--c-amber) / <alpha-value>)",
+        teal: "rgb(var(--c-teal) / <alpha-value>)",
         cream: "#FDFBF7",
         sand: "#F5F0E6",
         clay: "#E8E0D1",
@@ -27,9 +29,9 @@ export default {
         mono: ["IBM Plex Mono", "ui-monospace", "monospace"],
       },
       boxShadow: {
-        card: '0 1px 2px rgb(0 0 0 / 0.18), 0 1px 3px rgb(0 0 0 / 0.10)',
-        pop: '0 10px 30px rgb(0 0 0 / 0.35), 0 2px 8px rgb(0 0 0 / 0.25)',
-        glow: '0 0 6px rgb(44 217 163 / 0.55)',
+        card: 'var(--shadow-card, 0 1px 2px rgb(0 0 0 / 0.18), 0 1px 3px rgb(0 0 0 / 0.10))',
+        pop: 'var(--shadow-pop, 0 10px 30px rgb(0 0 0 / 0.35), 0 2px 8px rgb(0 0 0 / 0.25))',
+        glow: 'var(--shadow-glow, 0 0 6px rgb(44 217 163 / 0.55))',
       },
       keyframes: {
         pageIn: {

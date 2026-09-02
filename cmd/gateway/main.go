@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	pathpkg "path"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,8 +32,10 @@ import (
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/otel"
 	"ai-gateway/internal/passkey"
+	"ai-gateway/internal/pat"
 	"ai-gateway/internal/provider"
 	"ai-gateway/internal/proxy"
+	"ai-gateway/internal/rbac"
 	"ai-gateway/internal/resilience"
 	"ai-gateway/internal/user"
 	"ai-gateway/internal/webhook"
@@ -85,6 +88,14 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to open db")
 	}
+	// One-time backfill of request_logs.key_id from the key prefix for rows
+	// written before per-key attribution existed (migration 012). Best-effort
+	// and idempotent; ambiguous legacy prefixes are skipped.
+	if n, err := db.BackfillKeyIDs(database); err != nil {
+		log.Warn().Err(err).Msg("key_id backfill failed")
+	} else if n > 0 {
+		log.Info().Int64("rows", n).Msg("backfilled per-key analytics attribution")
+	}
 
 	providerStore := provider.NewStore(database, cfg.MasterKey)
 	apiKeyStore := apikey.NewStore(database)
@@ -127,6 +138,18 @@ func main() {
 		StreamIdle:       time.Duration(cfg.StreamIdleTimeoutSecs) * time.Second,
 		WriteHeaderGrace: time.Duration(cfg.WriteHeaderGraceSecs) * time.Second,
 	}
+	// Client-facing first-byte budget: default 85s (inside Cloudflare's
+	// ~100s edge window so the gateway answers before it can 524). Explicit
+	// values win, including 0 to disable; -1 (the env default) keeps 85s.
+	switch {
+	case cfg.TTFBTimeoutSecs >= 0:
+		proxyHandler.Timeouts.TTFB = time.Duration(cfg.TTFBTimeoutSecs) * time.Second
+		if cfg.TTFBTimeoutSecs == 0 {
+			log.Info().Msg("TTFB_TIMEOUT_SECONDS=0: client first-byte budget disabled (edge proxies may 524 slow upstreams)")
+		}
+	default:
+		proxyHandler.Timeouts.TTFB = proxy.DefaultTimeouts().TTFB
+	}
 	proxyHandler.CacheTTLSeconds = cfg.CacheTTLSeconds
 	proxyHandler.LogBodies = cfg.LogBodies
 	proxyHandler.BodyLogMaxBytes = cfg.BodyLogMaxBytes
@@ -149,12 +172,6 @@ func main() {
 	}
 	discoveryService.Cache = proxyHandler.Cache
 	proxyHandler.Retry = &resilience.DefaultRetryPolicy{MaxRetries: cfg.RetryMaxRetries, BaseDelay: time.Duration(cfg.RetryBaseDelayMs) * time.Millisecond}
-	proxyHandler.Breaker = resilience.NewMemoryCircuitBreakerFull(
-		cfg.BreakerAllowedFails,
-		60*time.Second,
-		time.Duration(cfg.BreakerCooldownSeconds)*time.Second,
-		cfg.BreakerHalfOpenSuccesses,
-	)
 	proxyHandler.Metrics = otel.NewMetrics()
 
 	go func() {
@@ -290,18 +307,44 @@ func main() {
 		DB:            database,
 		Discovery:     discoveryService,
 		UserStore:     userStore,
-		Breaker:       proxyHandler.Breaker,
 		Recorder:      rec,
 		AuthLimiter:   middleware.NewAuthRateLimiter(),
 	}
+	patStore := pat.NewStore(database)
+	auth.SetPATAuthenticator(
+		func(raw string) (string, string, bool) {
+			uid, scopes, ok := patStore.Authenticate(raw)
+			if !ok || !patStore.UserIDValid(uid) {
+				return "", "", false
+			}
+			return uid, scopes, true
+		},
+		func(userID string) (string, string, error) {
+			u, err := userStore.GetByID(userID)
+			if err != nil || u.Disabled {
+				return "", "", fmt.Errorf("user disabled or missing")
+			}
+			return u.Username, string(u.Role), nil
+		},
+	)
+
 	usersHandler := &handler.UsersHandler{
-		Store:  userStore,
-		Config: cfg,
-		DB:     database,
+		Store:       userStore,
+		Config:      cfg,
+		DB:          database,
+		Recorder:    rec,
+		APIKeyStore: apiKeyStore,
 	}
+
+	// DB-backed webhooks: every enabled webhook row receives matching events.
+	webhookDispatch := webhook.NewDBDispatch(database)
+	webhook.SetGlobal(webhookDispatch)
+	webhookHandler := &handler.WebhookHandler{DB: database, Dispatcher: webhookDispatch, Recorder: rec}
 	profileHandler := &handler.ProfileHandler{
-		Store: userStore,
-		DB:    database,
+		Store:    userStore,
+		DB:       database,
+		Recorder: rec,
+		PATs:     patStore,
 	}
 	passkeyHandler, err := passkey.NewHandler(database, userStore, cfg)
 	if err != nil {
@@ -323,6 +366,9 @@ func main() {
 		// CSRF origin-integrity for cookie-authenticated mutations (bearer-token
 		// API clients are unaffected).
 		r.Use(middleware.CSRFProtection)
+		// Fine-grained RBAC: RequirePerm middleware resolves effective
+		// permissions through the user store (live per request).
+		r.Use(middleware.WithPermResolver(userStore))
 		admin.Routes(r)
 		// Passkey public endpoints (no auth) — for login via passkey + recovery.
 		// Each credential-verification path gets brute-force limiting.
@@ -336,6 +382,7 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(auth.AdminMiddlewareWithRevocation(cfg.JWTSecret, userStore))
 			profileHandler.Routes(r)
+			webhookHandler.Routes(r)
 			usersHandler.Routes(r)
 			if passkeyHandler != nil {
 				r.Post("/auth/passkey/register/begin", passkeyHandler.BeginRegistration)
@@ -344,20 +391,20 @@ func main() {
 				r.Post("/auth/passkey/recovery/generate", passkeyHandler.GenerateRecovery)
 				r.Post("/auth/passkey/disable", passkeyHandler.DisablePasskey)
 			}
-			r.With(middleware.RequireRole("admin")).Get("/audit", admin.ListAudit)
+			r.With(middleware.RequirePerm(rbac.PermAuditRead)).Get("/audit", admin.ListAudit)
 			r.Route("/models", catalogHandler.Routes)
 			// Load-balancer rule management (admin-only).
 			routingHandler := handler.NewRoutingHandler(lbStore)
 			routingHandler.Routes(r)
 			// Mutating discovery/catalog/config routes are admin-only; readonly
 			// and member roles retain read access where exposed.
-			r.With(middleware.RequireRole("admin")).Post("/provider-models", discoveryHandler.AddManual)
+			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models", discoveryHandler.AddManual)
 			r.Get("/provider-models", discoveryHandler.List)
-			r.With(middleware.RequireRole("admin")).Put("/provider-models/{id}", discoveryHandler.Update)
-			r.With(middleware.RequireRole("admin")).Post("/provider-models/{id}/enrich", discoveryHandler.Enrich)
-			r.With(middleware.RequireRole("admin")).Delete("/provider-models/{id}", discoveryHandler.Delete)
-			r.With(middleware.RequireRole("admin")).Post("/providers/{id}/discover", discoveryHandler.DiscoverProvider)
-			r.With(middleware.RequireRole("admin")).Post("/discover-all", discoveryHandler.DiscoverAll)
+			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Put("/provider-models/{id}", discoveryHandler.Update)
+			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/{id}/enrich", discoveryHandler.Enrich)
+			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/provider-models/{id}", discoveryHandler.Delete)
+			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/providers/{id}/discover", discoveryHandler.DiscoverProvider)
+			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/discover-all", discoveryHandler.DiscoverAll)
 			// org scaffold — admin-only, RBAC enforced
 			orgHandler.Routes(r)
 		})
@@ -415,7 +462,17 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	go func() {
+	// Socket activation (systemd): when launched with LISTEN_FDS, serve on the
+	// inherited listener instead of binding our own. The socket then belongs to
+	// systemd, not the process, so a gateway restart stops accepting only for
+	// microseconds — connections that arrive during the restart are queued in
+	// the kernel backlog and served by the new process. Without this, every
+	// restart drops connections from the moment the old process closes its
+	// listener until the new one binds (SDKs retry, but tail latency spikes).
+	ln, listenFDs := inheritListener()
+	if ln != nil {
+		log.Info().Int("fds", listenFDs).Msg("socket activation: serving on inherited listener (LISTEN_FDS)")
+	} else {
 		log.Info().Str("addr", addr).Str("public_url", cfg.PublicURL).Strs("cors", cfg.AllowedOrigins()).Msg("starting AI Gateway " + handler.GatewayVersion + " (tunnel-ready)")
 		if cfg.PublicURL != "" {
 			log.Info().Str("public_url", cfg.PublicURL).Msg("Cloudflare Tunnel: ensure cloudflared points to http://localhost:" + cfg.Port + " and PUBLIC_URL matches tunnel hostname")
@@ -423,7 +480,15 @@ func main() {
 		log.Info().Msg("Admin login: POST /api/auth/login {password: $ADMIN_PASSWORD} -> token")
 		log.Info().Msg("Gateway auth: Authorization: Bearer sk-gw-... for /v1/*")
 		log.Info().Msg("Models catalog: GET /api/models/catalog?q=gpt&provider=openai (auth required)")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	}
+	go func() {
+		var err error
+		if ln != nil {
+			err = srv.Serve(ln)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("server failed")
 		}
 	}()
@@ -432,12 +497,60 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info().Msg("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownGraceSecs)*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Error().Err(err).Msg("shutdown error")
+	// Graceful drain: stop accepting, then let in-flight requests (long LLM
+	// streams included) finish within SHUTDOWN_GRACE_SECONDS. After the grace
+	// window, Close() force-terminates whatever remains so the process always
+	// exits — a stuck stream must not turn SIGTERM into a SIGKILL from the
+	// supervisor (which would lose the graceful handoff entirely).
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownGraceSecs)*time.Second)
+	defer drainCancel()
+	if err := srv.Shutdown(drainCtx); err != nil {
+		log.Warn().Err(err).Msg("drain window expired; closing remaining connections")
+		_ = srv.Close()
+	}
+	// Flush SQLite WAL so the on-disk database is consistent for the next
+	// process even if the machine loses power right after exit.
+	if err := database.Close(); err != nil {
+		log.Warn().Err(err).Msg("db close error")
 	}
 	log.Info().Msg("exited")
+}
+
+// inheritListener implements the systemd socket-activation protocol
+// (sd_listen_fds): when LISTEN_FDS=1 and LISTEN_PID equals this process's
+// pid, fd 3 is an already-bound, already-listening socket passed by the
+// supervisor. Returning it lets restarts hand off the listen socket with no
+// connection loss. Any malformed activation environment is ignored — the
+// gateway then binds normally.
+func inheritListener() (net.Listener, int) {
+	pid := os.Getenv("LISTEN_PID")
+	fds := os.Getenv("LISTEN_FDS")
+	if pid == "" || fds == "" {
+		return nil, 0
+	}
+	if n, err := strconv.Atoi(pid); err != nil || n != os.Getpid() {
+		return nil, 0
+	}
+	n, err := strconv.Atoi(fds)
+	if err != nil || n < 1 {
+		return nil, 0
+	}
+	// Unset the env vars so child processes (none today, but discovery or
+	// future plugins) don't inherit a stale activation context.
+	defer os.Unsetenv("LISTEN_PID")
+	defer os.Unsetenv("LISTEN_FDS")
+	// sd_listen_fds spec: fds 0/1/2 are stdin/stdout/stderr, so the first
+	// listening socket is fd 3.
+	file := os.NewFile(3, "systemd-listen-fd")
+	if file == nil {
+		return nil, 0
+	}
+	ln, err := net.FileListener(file)
+	if err != nil {
+		log.Warn().Err(err).Msg("socket activation: inherited fd is not a usable listener; falling back to bind")
+		return nil, 0
+	}
+	return ln, n
 }
 
 func forwardedHeaders(next http.Handler) http.Handler {
@@ -525,10 +638,13 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		// Baseline CSP: same-origin resources; inline kept because the Vite
-		// build injects inline styles/bootstrap script. Still blocks external
-		// script/object/iframe injection paths an XSS payload relies on.
+		// build injects inline styles/bootstrap script. Google Fonts (loaded
+		// by web/index.html) is allowed for stylesheet + font fetches; its CSS
+		// is fetched with CORS so style-src-elem needs the explicit origin.
+		// Still blocks external script/object/iframe injection paths an XSS
+		// payload relies on.
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -635,10 +751,25 @@ func serveWeb(database *sql.DB) http.HandlerFunc {
 		if path == "" {
 			path = "index.html"
 		}
+		// Cache policy: hashed /assets/* files are immutable (content hash in
+		// the filename) — cache for a year. index.html and SPA fallbacks must
+		// never be cached: they reference the hashed filenames, and a stale
+		// shell leaves users stuck on an old UI version after every deploy.
+		if strings.HasPrefix(path, "assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		}
 		// SPA fallback: unknown paths (client-side routes like /keys) get
 		// index.html. Serve it explicitly — http.FileServer re-resolves
-		// r.URL.Path itself and would 404 the original path.
+		// r.URL.Path itself and would 404 the original path. Asset paths are
+		// exempt: a missing /assets/*.js is a real 404 (stale HTML reference),
+		// not a client-side route.
 		if _, err := fs.Stat(sub, path); err != nil {
+			if strings.HasPrefix(path, "assets/") {
+				http.NotFound(w, r)
+				return
+			}
 			// Guard against path traversal ("/../"): only serve the app shell
 			// when the request path is clean.
 			if r.URL.Path != pathpkg.Clean(r.URL.Path) {
