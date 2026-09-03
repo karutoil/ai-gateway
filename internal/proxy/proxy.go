@@ -3331,24 +3331,38 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	w = &keepaliveSafeWriter{ResponseWriter: w, c: ttfb}
 	// For anthropic providers, /v1/responses does not exist — skip native and translate directly
 	if p.Type != models.ProviderAnthropic {
-		target := strings.TrimRight(p.BaseURL, "/") + "/responses"
-		if strings.HasSuffix(p.BaseURL, "/v1") {
-			target = p.BaseURL + "/responses"
+		isAzureUpstream := p.Type == models.ProviderAzure
+		target := upstreamTarget(p.BaseURL, "/responses", model, isAzureUpstream)
+		// Strip the "provider/model" routing prefix before probing native:
+		// chat/completions/embeddings all do this; the native probe sent
+		// "oc1/model" verbatim and strict upstreams 404'd model_not_found,
+		// forcing a spurious fallback to /chat/completions (the 502s).
+		upstreamModel := stripProviderPrefix(model, p)
+		nativeBody := body
+		if upstreamModel != translate.ExtractModel(body) {
+			nativeBody = replaceModelInBody(body, upstreamModel)
 		}
-		req, rerr := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(body))
+		req, rerr := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(nativeBody))
 		if rerr != nil {
 			// Malformed operator-configured BaseURL: fall through to the
 			// translated path instead of nil-dereferencing req below.
 			log.Warn().Err(rerr).Str("provider", p.ID).Str("target", target).Msg("native responses probe: bad upstream URL")
 		} else {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
+			if strings.Contains(target, "/openai/deployments/") {
+				req.Header.Set("api-key", apiKey)
+			} else {
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+			}
 			req.Header.Set("Content-Type", "application/json")
 			if isStream {
 				// Ask for a real stream so SSE-native providers open one instead
 				// of silently downgrading to a buffered JSON answer.
 				req.Header.Set("Accept", "text/event-stream")
+			} else {
+				req.Header.Set("Accept", "application/json")
 			}
 			attemptCtx, attemptCancel := context.WithCancel(r.Context())
+			defer attemptCancel()
 			req = req.WithContext(attemptCtx)
 			ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 			resp, err := h.Client.Do(req)
