@@ -630,3 +630,78 @@ func TestResponsesStreamPreCommitRetryThenFailedFrame(t *testing.T) {
 		t.Fatalf("expected 2 upstream attempts (initial + retry), got %d", n)
 	}
 }
+
+// --------------------------------- 6. native ping/[DONE] filtered for strict clients
+//
+// Strict Responses clients (Grok Build CLI's Rust serde enum) fail hard with
+// "unknown variant `ping`" instead of ignoring transport keepalives. The
+// native pass-through must drop ping + [DONE] while relaying real
+// response.* frames byte-exact.
+func TestResponsesStreamNativeFiltersPingForStrictClients(t *testing.T) {
+	up := rsNewUpstream(t, map[string]http.HandlerFunc{
+		"/v1/responses": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fl, _ := w.(http.Flusher)
+			frames := []string{
+				"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+				"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+				"data: {\"type\":\"ping\"}\n\n",
+				": upstream keepalive comment\n\n",
+				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+				"data: [DONE]\n\n",
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+			}
+			for _, f := range frames {
+				io.WriteString(w, f)
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+		},
+	})
+
+	gw := rsNewGateway(t, models.ProviderOpenAI, up.srv.URL+"/v1", nil)
+
+	resp := rsPostStreaming(t, gw, `{"model":"gpt-rs-test","input":"hi","stream":true}`)
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	rawStr := string(raw)
+
+	// Strict-client simulation: no ping variant and no [DONE] sentinel may
+	// reach the client; every data payload must be a response.* / error type
+	// or a comment (which rsParseEvents already skips).
+	if strings.Contains(rawStr, `"type":"ping"`) || strings.Contains(rawStr, "event: ping") {
+		t.Fatalf("ping leaked to strict client, raw=%s", rawStr)
+	}
+	if strings.Contains(rawStr, "[DONE]") {
+		t.Fatalf("[DONE] leaked to Responses client (terminator is response.completed), raw=%s", rawStr)
+	}
+
+	events := rsParseEvents(rawStr)
+	for _, ev := range events {
+		if ev.name == "ping" {
+			t.Fatalf("ping event relayed, raw=%s", rawStr)
+		}
+		if ev.name != "" && !strings.HasPrefix(ev.name, "response.") {
+			t.Fatalf("non-response event %q relayed to strict client, raw=%s", ev.name, rawStr)
+		}
+	}
+
+	// Real protocol frames survive filtering.
+	names := rsNames(events)
+	hasCreated, hasDelta, hasCompleted := false, false, false
+	for _, n := range names {
+		switch n {
+		case "response.created":
+			hasCreated = true
+		case "response.output_text.delta":
+			hasDelta = true
+		case "response.completed":
+			hasCompleted = true
+		}
+	}
+	if !hasCreated || !hasDelta || !hasCompleted {
+		t.Fatalf("real frames lost during ping filtering, got %v raw=%s", names, rawStr)
+	}
+}

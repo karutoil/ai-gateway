@@ -31,6 +31,66 @@ func (h *Handler) sseSampleCap() int {
 	return c
 }
 
+// isResponsesKeepaliveEvent reports whether an SSE event is a transport-level
+// keepalive / sentinel rather than real Responses protocol:
+//
+//   - event: ping (or data {"type":"ping"}): some OpenAI-compatible upstreams
+//     (xAI and others) emit these to keep idle connections alive;
+//   - data: [DONE]: the Chat Completions sentinel, NOT part of the Responses
+//     protocol (which terminates with response.completed / response.failed).
+//
+// Strict Responses clients (e.g. Grok Build CLI's Rust serde enum expecting
+// only response.created / response.in_progress / response.completed /
+// response.failed / response.incomplete / response.*) fail HARD on these with
+// "serialization error: unknown variant `ping`" instead of ignoring them.
+// The gateway must therefore never forward them verbatim on the native
+// Responses path.
+func isResponsesKeepaliveEvent(ev sseEvent) bool {
+	if ev.name == "ping" {
+		return true
+	}
+	data := bytes.TrimSpace(ev.data)
+	if len(data) == 0 {
+		return false
+	}
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return true
+	}
+	if len(data) == 0 || data[0] != '{' {
+		return false
+	}
+	var m map[string]interface{}
+	if json.Unmarshal(data, &m) != nil {
+		return false
+	}
+	if t, _ := m["type"].(string); t == "ping" {
+		return true
+	}
+	return false
+}
+
+// cutCompleteSSEBlock extracts the first complete SSE block (terminated by a
+// blank line) from pending. It handles both LF and CRLF framing and preserves
+// the original bytes verbatim for forwarding. ok=false means no complete
+// block yet — the caller must wait for more upstream bytes.
+func cutCompleteSSEBlock(pending []byte) (block, rest []byte, ok bool) {
+	pos := 0
+	for pos < len(pending) {
+		nl := bytes.IndexByte(pending[pos:], '\n')
+		if nl < 0 {
+			return nil, pending, false
+		}
+		lineEnd := pos + nl + 1
+		if len(bytes.TrimSpace(pending[pos:lineEnd])) == 0 {
+			block = pending[:lineEnd]
+			rest = append([]byte(nil), pending[lineEnd:]...)
+			return block, rest, true
+		}
+		pos = lineEnd
+	}
+	return nil, pending, false
+}
+
 // nativeStreamChunk is pumpStream's pump-channel payload shape: a fixed-size
 // value copy avoids aliasing between the producer goroutine and the relay loop.
 type nativeStreamChunk struct {
@@ -178,11 +238,63 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		return res
 	}
 
+	first := true
+
 	finishClean := func() nativeStreamResult {
 		resp.Body.Close()
 		if len(pending) > 0 {
-			harvestFrame(pending)
+			// Flush a trailing fragment that never got its blank-line
+			// terminator (upstream closed without final \n\n). Probe it as
+			// a complete event: ping/[DONE] fragments are still dropped so
+			// a ping-only stream correctly falls through to translated.
+			trimmed := bytes.TrimSpace(pending)
+			if len(trimmed) > 0 {
+				probe := append(append([]byte(nil), pending...), '\n', '\n')
+				evs := parseSSEEvents(probe)
+				if len(evs) == 0 {
+					// Pure comment fragment (e.g. ": keepalive" without
+					// terminator): safe, forward verbatim.
+					if first {
+						first = false
+						commit()
+					}
+					w.Write(pending)
+					if flusher != nil {
+						flusher.Flush()
+					}
+				} else {
+					suppressed := false
+					for _, ev := range evs {
+						if isResponsesKeepaliveEvent(ev) {
+							suppressed = true
+							break
+						}
+					}
+					if !suppressed {
+						if first {
+							first = false
+							commit()
+						}
+						w.Write(pending)
+						if flusher != nil {
+							flusher.Flush()
+						}
+						harvestFrame(probe)
+					}
+				}
+			}
 			pending = nil
+		}
+		if first {
+			// Nothing but ping/[DONE]/comments (or nothing at all) arrived:
+			// fall through to the translated path which synthesizes a
+			// strict-client-safe response.* transcript instead of emitting
+			// an empty protocol violation.
+			resp.Body.Close()
+			drainChan(chunks)
+			log.Info().Str("model", model).Str("provider", providerID).Msg("native responses stream produced no usable events before commit; falling through to translated path")
+			res.committed = false
+			return res
 		}
 		cost := h.costForModel(model, promptTok, completionTok)
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
@@ -191,7 +303,60 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		return res
 	}
 
-	first := true
+	// relayBlock forwards one complete SSE block after strict-client
+	// filtering. Returns true if the block committed real protocol bytes
+	// (and therefore flipped `first`).
+	relayBlock := func(block []byte) bool {
+		evs := parseSSEEvents(block)
+		if len(evs) == 0 {
+			// Pure SSE comment (": keepalive" from upstream or edge):
+			// invisible to event parsers but a real byte for idle timers.
+			// Safe for strict clients — forward verbatim.
+			if first {
+				first = false
+				commit()
+			}
+			w.Write(block)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if sampleCap > 0 && sample.Len() < sampleCap {
+				take := len(block)
+				if room := sampleCap - sample.Len(); take > room {
+					take = room
+				}
+				sample.Write(block[:take])
+			}
+			return true
+		}
+		for _, ev := range evs {
+			if isResponsesKeepaliveEvent(ev) {
+				// Drop: strict Responses clients fail hard on unknown
+				// `ping` / [DONE] variants. The gateway's own TTFB
+				// heartbeat (": keepalive" comments) already keeps edge
+				// idle timers fed, so dropping loses no liveness.
+				return false
+			}
+		}
+		if first {
+			first = false
+			commit()
+		}
+		w.Write(block)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if sampleCap > 0 && sample.Len() < sampleCap {
+			take := len(block)
+			if room := sampleCap - sample.Len(); take > room {
+				take = room
+			}
+			sample.Write(block[:take])
+		}
+		harvestFrame(block)
+		return true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -215,31 +380,29 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 
 			// Process payload FIRST: Read may deliver n>0 together with err==io.EOF.
 			if cm.n > 0 {
-				if first {
-					first = false
-					commit()
-				}
 				buf := cm.data[:cm.n]
-				w.Write(buf)
-				if flusher != nil {
-					flusher.Flush()
-				}
-				if sampleCap > 0 && sample.Len() < sampleCap {
-					take := len(buf)
-					if room := sampleCap - sample.Len(); take > room {
-						take = room
-					}
-					sample.Write(buf[:take])
-				}
 				pending = append(pending, buf...)
-				if idx := bytes.LastIndexByte(pending, '\n'); idx >= 0 {
-					frame := pending[:idx+1]
-					harvestFrame(frame)
-					rest := append([]byte(nil), pending[idx+1:]...)
+				for {
+					block, rest, ok := cutCompleteSSEBlock(pending)
+					if !ok {
+						break
+					}
 					pending = rest
+					relayBlock(block)
 				}
 				if len(pending) > 1<<20 { // runaway non-SSE payload guard
+					// No blank-line terminator in 1MB: not SSE. Treat as
+					// opaque — harvest for usage, forward once so the
+					// client is not hung, and reset.
 					harvestFrame(pending)
+					if first {
+						first = false
+						commit()
+					}
+					w.Write(pending)
+					if flusher != nil {
+						flusher.Flush()
+					}
 					pending = pending[:0]
 				}
 			}
