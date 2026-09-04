@@ -27,7 +27,8 @@ func StartHealthChecker(db *sql.DB, store *Store, interval time.Duration) {
 	}()
 }
 
-func checkAll(db *sql.DB, store *Store) {	providers, err := store.List()
+func checkAll(db *sql.DB, store *Store) {
+	providers, err := store.List()
 	if err != nil {
 		log.Error().Err(err).Msg("health: list providers failed")
 		return

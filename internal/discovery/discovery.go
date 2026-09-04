@@ -410,7 +410,8 @@ func (s *Service) Delete(id string) error {
 	return err
 }
 
-func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel) (string, error) {	id := uuid.NewString()
+func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel) (string, error) {
+	id := uuid.NewString()
 	ctx, maxOut := upd.ContextWindow, upd.MaxOutput
 	if ctx == 0 && maxOut == 0 && s.catalogStore != nil {
 		if cm, err := s.catalogStore.Get(modelID); err == nil {
