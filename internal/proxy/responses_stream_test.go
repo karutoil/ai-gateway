@@ -705,3 +705,37 @@ func TestResponsesStreamNativeFiltersPingForStrictClients(t *testing.T) {
 		t.Fatalf("real frames lost during ping filtering, got %v raw=%s", names, rawStr)
 	}
 }
+
+// Strict clients require output on every Response object.
+func TestResponsesStreamResponseObjectsCarryOutput(t *testing.T) {
+	up := rsNewUpstream(t, map[string]http.HandlerFunc{
+		"/v1/responses": func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) },
+		"/v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			io.WriteString(w, `{"error":{"message":"kaput"}}`)
+		},
+	})
+	gw := rsNewGateway(t, models.ProviderOpenAI, up.srv.URL+"/v1", func(h *Handler) {
+		h.Retry = &resilience.DefaultRetryPolicy{MaxRetries: 0, BaseDelay: time.Millisecond}
+	})
+	resp := rsPostStreaming(t, gw, `{"model":"gpt-rs-test","input":"hi","stream":true}`)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	for _, ev := range rsParseEvents(string(raw)) {
+		if !strings.HasPrefix(ev.name, "response.") {
+			continue
+		}
+		var env map[string]interface{}
+		if err := json.Unmarshal([]byte(ev.data), &env); err != nil {
+			t.Fatalf("malformed %q data: %v", ev.name, err)
+		}
+		inner, _ := env["response"].(map[string]interface{})
+		if inner == nil {
+			continue
+		}
+		if _, ok := inner["output"]; !ok {
+			t.Fatalf("event %s missing output: %s", ev.name, ev.data)
+		}
+	}
+}

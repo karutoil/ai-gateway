@@ -2036,6 +2036,22 @@ func chatToResponsesJSON(body []byte, model string) []byte {
 	return out
 }
 
+// hasResponsesOutput reports whether a native /v1/responses JSON body carries
+// the output array strict clients require. Bodies without it relay as a
+// serialization failure on the client, so the caller falls through to the
+// translated path instead.
+func hasResponsesOutput(body []byte) bool {
+	var probe map[string]interface{}
+	if json.Unmarshal(body, &probe) != nil {
+		return false
+	}
+	out, ok := probe["output"]
+	if !ok || out == nil {
+		return false
+	}
+	return true
+}
+
 // recordUsage forwards real usage to the budget ledger sink when wired.
 func (h *Handler) recordUsage(keyPrefix string, r *http.Request, tokens int, costUSD float64) {
 	if h.Usage == nil || (tokens == 0 && costUSD == 0) {
@@ -2602,6 +2618,15 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, err.Error())
 		return
 	}
+	// Multi-protocol providers serve each model on exactly one upstream
+	// endpoint. Fail fast with the right endpoint instead of forwarding a
+	// chat body to a messages/responses-only model for a cryptic 400.
+	if p0 := candidates[0]; isMultiProtocolProvider(p0) {
+		if api := UpstreamAPIForModel(p0, model); api == UpstreamMessages || api == UpstreamResponses {
+			httperr.Invalid(w, "model '"+model+"' is served via "+correctInboundFor(api)+" on this provider; use POST "+correctInboundFor(api)+" instead of /v1/chat/completions")
+			return
+		}
+	}
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
@@ -2678,6 +2703,14 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	if p.Type == models.ProviderAnthropic {
 		httperr.Invalid(w, "model '"+model+"' is an anthropic model; use POST /v1/messages instead of /v1/completions")
 		return
+	}
+	// Multi-protocol providers serve messages/responses models on their own
+	// endpoints; legacy /v1/completions cannot speak them.
+	if isMultiProtocolProvider(p) {
+		if api := UpstreamAPIForModel(p, model); api == UpstreamMessages || api == UpstreamResponses {
+			httperr.Invalid(w, "model '"+model+"' is served via "+correctInboundFor(api)+" on this provider; use POST "+correctInboundFor(api)+" instead of /v1/completions")
+			return
+		}
 	}
 	apiKey, derr := h.ProviderStore.DecryptKey(p)
 	if derr != nil {
@@ -3213,14 +3246,20 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
 	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
-		return p.Type == models.ProviderAnthropic
+		if p.Type == models.ProviderAnthropic {
+			return true
+		}
+		// Multi-protocol providers (OpenCode Go/Zen) expose /v1/messages
+		// alongside chat/responses on one base URL + key. Without this a
+		// single entry cannot serve its messages-models (qwen/minimax).
+		return isMultiProtocolProvider(p)
 	})
 	if len(candidates) == 0 {
 		if h.unroutedModel() {
 			noRouteFor(w, model)
 			return
 		}
-		if p, err := h.ProviderStore.Resolve(model, providerHint); err == nil && p != nil && p.Type != models.ProviderAnthropic {
+		if p, err := h.ProviderStore.Resolve(model, providerHint); err == nil && p != nil && p.Type != models.ProviderAnthropic && !isMultiProtocolProvider(p) {
 			httperr.Invalid(w, "model '"+model+"' is not an anthropic model; use POST /v1/chat/completions, /v1/completions or /v1/responses")
 			return
 		}
@@ -3232,6 +3271,16 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if err := h.validateReasoning(candidates[0].ID, model, body); err != nil {
 		httperr.Invalid(w, err.Error())
 		return
+	}
+	// Multi-protocol providers serve each model on exactly one upstream
+	// endpoint. A messages-model called here is correct; a chat/responses
+	// model is a client wiring error — fail fast with the right endpoint
+	// instead of forwarding to /v1/messages for a cryptic upstream 400.
+	if p0 := candidates[0]; isMultiProtocolProvider(p0) {
+		if api := UpstreamAPIForModel(p0, model); api == UpstreamChat || api == UpstreamResponses {
+			httperr.Invalid(w, "model '"+model+"' is served via "+correctInboundFor(api)+" on this provider; use POST "+correctInboundFor(api)+" instead of /v1/messages")
+			return
+		}
 	}
 	start := time.Now()
 	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
@@ -3329,8 +3378,11 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	ttfb := newTTFBController(h.Timeouts.TTFB, start)
 	defer ttfb.stop()
 	w = &keepaliveSafeWriter{ResponseWriter: w, c: ttfb}
-	// For anthropic providers, /v1/responses does not exist — skip native and translate directly
-	if p.Type != models.ProviderAnthropic {
+	// For anthropic providers, /v1/responses does not exist — skip native and translate directly.
+	// Multi-protocol messages-models (OpenCode Go qwen/minimax) likewise
+	// never speak /responses upstream; probing it wastes a call and logs noise.
+	needsMessagesUpstream := p.Type == models.ProviderAnthropic || UpstreamAPIForModel(p, model) == UpstreamMessages
+	if p.Type != models.ProviderAnthropic && !needsMessagesUpstream {
 		isAzureUpstream := p.Type == models.ProviderAzure
 		target := upstreamTarget(p.BaseURL, "/responses", model, isAzureUpstream)
 		// Strip the "provider/model" routing prefix before probing native:
@@ -3390,7 +3442,9 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 						(strings.HasPrefix(ct, "text/event-stream") || bytes.Contains(bodyBytes, []byte("\ndata: ")) || bytes.Contains(bodyBytes, []byte("data: ")))
 					jsonOK := json.Valid(bodyBytes)
 					noHTML := !bytes.Contains(bytes.ToLower(bodyBytes), []byte("<!doctype")) && !bytes.Contains(bytes.ToLower(bodyBytes), []byte("<html"))
-					if (jsonOK && noHTML) || nativeSSE {
+					if !nativeSSE && jsonOK && noHTML && !hasResponsesOutput(bodyBytes) {
+						log.Info().Str("model", model).Str("provider", p.ID).Msg("native responses JSON missing output; falling through to translated path")
+					} else if (jsonOK && noHTML) || nativeSSE {
 						copyHeader(w.Header(), resp.Header)
 						w.WriteHeader(resp.StatusCode)
 						w.Write(bodyBytes)
@@ -3430,7 +3484,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	target := upstreamTarget(p.BaseURL, "/chat/completions", model, p.Type == models.ProviderAzure)
 	upstreamBody := translated
 	isAnthropicUpstream := false
-	if p.Type == models.ProviderAnthropic {
+	if p.Type == models.ProviderAnthropic || UpstreamAPIForModel(p, model) == UpstreamMessages {
 		translated2, _, convErr := translate.OpenAIToAnthropic(translated)
 		if convErr != nil || len(translated2) == 0 {
 			httperr.Invalid(w, "failed to translate responses to anthropic")

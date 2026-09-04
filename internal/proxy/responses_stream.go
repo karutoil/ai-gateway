@@ -707,6 +707,7 @@ func (h *Handler) emitTranslatedResponsesFailure(w http.ResponseWriter, model, k
 		"created_at": time.Now().Unix(),
 		"status":     "failed",
 		"model":      model,
+		"output":     []interface{}{},
 		"error":      map[string]interface{}{"code": code, "message": reason},
 	}
 	em.emit("response.failed", map[string]interface{}{"response": respObj})
@@ -806,6 +807,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			"created_at": createdAt,
 			"status":     status,
 			"model":      model,
+			"output":     []interface{}{},
 		}
 	}
 

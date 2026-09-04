@@ -27,8 +27,7 @@ func StartHealthChecker(db *sql.DB, store *Store, interval time.Duration) {
 	}()
 }
 
-func checkAll(db *sql.DB, store *Store) {
-	providers, err := store.List()
+func checkAll(db *sql.DB, store *Store) {	providers, err := store.List()
 	if err != nil {
 		log.Error().Err(err).Msg("health: list providers failed")
 		return
@@ -174,6 +173,27 @@ func checkAll(db *sql.DB, store *Store) {
 						break
 					}
 				}
+				// Multi-protocol providers (OpenCode Go/Zen) also serve
+				// /v1/messages. If the OpenAI probe did not establish health,
+				// try the Anthropic dialect before declaring down.
+				if !success && isMultiProtocolBase(p.BaseURL, p.Name) {
+					anthTarget := strings.TrimRight(target, "/") + "/v1/models"
+					if strings.HasSuffix(target, "/v1/models") {
+						anthTarget = target
+					}
+					if req, _ := http.NewRequest("GET", anthTarget, nil); req != nil {
+						req.Header.Set("x-api-key", key)
+						req.Header.Set("anthropic-version", "2023-06-01")
+						if resp, err := client.Do(req); err == nil {
+							resp.Body.Close()
+							if resp.StatusCode == 200 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 429 {
+								status = "up"
+								msg = "OK (anthropic probe)"
+								success = true
+							}
+						}
+					}
+				}
 				if !success && status == "unknown" {
 					status = "down"
 					msg = "unreachable"
@@ -184,4 +204,20 @@ func checkAll(db *sql.DB, store *Store) {
 			log.Error().Err(err).Str("provider", p.Name).Msg("health update failed")
 		}
 	}
+}
+
+// isMultiProtocolBase mirrors proxy.isMultiProtocolProvider without importing
+// the proxy package. Keep the two in sync.
+func isMultiProtocolBase(baseURL, name string) bool {
+	base := strings.ToLower(strings.TrimSpace(baseURL))
+	nm := strings.ToLower(strings.TrimSpace(name))
+	if strings.Contains(base, "opencode.ai/zen") || strings.Contains(base, "opencode.ai/go") {
+		return true
+	}
+	for _, pre := range []string{"opencode-go", "opencode_go", "opencodego", "opencode-zen", "opencode_zen"} {
+		if nm == pre || strings.HasPrefix(nm, pre+"/") || strings.HasPrefix(nm, pre+"-") || strings.HasPrefix(nm, pre+"_") {
+			return true
+		}
+	}
+	return false
 }

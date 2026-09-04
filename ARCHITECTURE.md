@@ -123,6 +123,15 @@ SQLite (WAL, single-conn writes) is the default dialect; `postgres://` DSNs swit
 | Responses API | Chat translate: `input`->messages, `instructions`->system, `reasoning.effort`->`reasoning_effort` | Anthropic translate | streaming supported |
 | Models | aggregate from all providers + catalog enrichment + aliases | — | dedupe by id, alias as gateway-alias |
 
+Multi-protocol providers (OpenCode Go/Zen): one entry serves chat, responses,
+and messages models on one base URL + key. Each model speaks exactly one
+upstream endpoint (Go: glm/kimi via chat, grok/gpt/muse-spark via responses,
+qwen/minimax via messages; Zen: minimax via chat, claude via messages).
+`/v1/messages` accepts `openai_compatible` multi entries natively;
+`/v1/responses` routes messages-models via Responses→Anthropic; wrong-endpoint
+calls fail fast with the correct POST path. Discovery merges both dialects;
+health is up when either probe succeeds.
+
 Reasoning mapping: OpenAI `reasoning_effort` (low/medium/high/max) <-> Anthropic `thinking.effort` or legacy `budget_tokens` via budgetToEffort heuristic; validated against catalog `reasoning_levels/limits`.
 
 ---

@@ -54,18 +54,37 @@ func (s *Service) Discover(providerID string) (int, error) {
 		return 0, err
 	}
 	var fetched []rawModel
-	switch p.Type {
-	case models.ProviderAnthropic:
-		fetched = s.fetchAnthropic(p, apiKey)
-	case models.ProviderAzure:
-		fetched = s.fetchAzure(p, apiKey)
-		if len(fetched) == 0 {
-			fetched = s.fetchOpenAI(p, apiKey)
+	// Multi-protocol providers (OpenCode Go/Zen) list different models per
+	// endpoint family. Probe both dialects and merge so one provider entry
+	// discovers its chat, responses, and messages models together.
+	if isMultiProvider(p) {
+		seen := map[string]bool{}
+		for _, m := range s.fetchOpenAI(p, apiKey) {
+			if !seen[m.ID] {
+				seen[m.ID] = true
+				fetched = append(fetched, m)
+			}
 		}
-	default:
-		fetched = s.fetchOpenAI(p, apiKey)
-		if len(fetched) == 0 && p.Type == models.ProviderAnthropic {
+		for _, m := range s.fetchAnthropic(p, apiKey) {
+			if !seen[m.ID] {
+				seen[m.ID] = true
+				fetched = append(fetched, m)
+			}
+		}
+	} else {
+		switch p.Type {
+		case models.ProviderAnthropic:
 			fetched = s.fetchAnthropic(p, apiKey)
+		case models.ProviderAzure:
+			fetched = s.fetchAzure(p, apiKey)
+			if len(fetched) == 0 {
+				fetched = s.fetchOpenAI(p, apiKey)
+			}
+		default:
+			fetched = s.fetchOpenAI(p, apiKey)
+			if len(fetched) == 0 && p.Type == models.ProviderAnthropic {
+				fetched = s.fetchAnthropic(p, apiKey)
+			}
 		}
 	}
 	if len(fetched) == 0 {
@@ -391,8 +410,7 @@ func (s *Service) Delete(id string) error {
 	return err
 }
 
-func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel) (string, error) {
-	id := uuid.NewString()
+func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel) (string, error) {	id := uuid.NewString()
 	ctx, maxOut := upd.ContextWindow, upd.MaxOutput
 	if ctx == 0 && maxOut == 0 && s.catalogStore != nil {
 		if cm, err := s.catalogStore.Get(modelID); err == nil {
@@ -432,4 +450,23 @@ func (s *Service) DiscoverAll() (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// isMultiProvider mirrors proxy.isMultiProtocolProvider without importing the
+// proxy package (which would cycle). Keep the two in sync.
+func isMultiProvider(p *models.Provider) bool {
+	if p == nil {
+		return false
+	}
+	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
+	name := strings.ToLower(strings.TrimSpace(p.Name))
+	if strings.Contains(base, "opencode.ai/zen") || strings.Contains(base, "opencode.ai/go") {
+		return true
+	}
+	for _, pre := range []string{"opencode-go", "opencode_go", "opencodego", "opencode-zen", "opencode_zen"} {
+		if name == pre || strings.HasPrefix(name, pre+"/") || strings.HasPrefix(name, pre+"-") || strings.HasPrefix(name, pre+"_") {
+			return true
+		}
+	}
+	return false
 }
