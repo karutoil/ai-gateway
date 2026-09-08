@@ -15,12 +15,6 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// pasteRedirectURI is the loopback callback the bundled public OAuth client is
-// authorized for. Paste mode never requires operators to register their own
-// Google OAuth app: the browser lands on localhost:51121, the user copies the
-// URL, and the gateway exchanges the code.
-const pasteRedirectURI = "http://localhost:51121/oauth-callback"
-
 // OAuthHandler drives the generic Authorization Code + PKCE flow for any
 // registered internal/oauth definition. Providers stay thin: adding a future
 // OAuth upstream is one Register() call, no handler changes.
@@ -64,6 +58,8 @@ func defToProviderType(defID string) models.ProviderType {
 	switch defID {
 	case "antigravity":
 		return models.ProviderAntigravity
+	case "devin":
+		return models.ProviderDevin
 	default:
 		return models.ProviderOpenAICompatible
 	}
@@ -85,11 +81,10 @@ func (h *OAuthHandler) gatewayCallbackURL(r *http.Request) string {
 }
 
 // Start creates (or reuses) a provider row and returns the browser auth URL.
-// Default is paste mode (loopback redirect + copy/paste) so the bundled public
-// client works with zero Google Cloud setup. Operators with their own OAuth app
-// get server mode automatically when a custom client id env is configured —
-// detected per-definition by comparing resolved vs bundled client ids is
-// overkill; instead callers may pass ?mode=redirect explicitly via header.
+// Default is paste mode (loopback redirect + copy/paste) so bundled public
+// clients work with zero OAuth-app setup. Operators with their own OAuth app
+// get server mode via the X-OAuth-Mode: redirect header when they registered
+// the gateway callback URL with the provider.
 func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body oauthStartReq
@@ -133,7 +128,10 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 	// Paste mode uses the loopback redirect the public client allows.
 	// Server mode (custom apps) uses the gateway callback; opt in with
 	// X-OAuth-Mode: redirect when the operator registered that URL in Google Cloud.
-	redirectURI := pasteRedirectURI
+	redirectURI := def.PasteRedirectURI
+	if redirectURI == "" {
+		redirectURI = oauth.DefaultPasteRedirectURI
+	}
 	mode := "paste"
 	if strings.EqualFold(r.Header.Get("X-OAuth-Mode"), "redirect") {
 		redirectURI = h.gatewayCallbackURL(r)

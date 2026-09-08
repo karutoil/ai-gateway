@@ -37,7 +37,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
 
   // OAuth connections (generic registry; Antigravity ships built-in).
   const [oauthDefs, setOauthDefs] = useState<any[]>([])
-  const [oauthSession, setOauthSession] = useState<{ auth_url: string; state: string; provider_id: string; provider_name: string } | null>(null)
+  const [oauthSession, setOauthSession] = useState<{ auth_url: string; state: string; provider_id: string; provider_name: string; redirect_uri: string } | null>(null)
   const [pasteUrl, setPasteUrl] = useState('')
   const [oauthBusy, setOauthBusy] = useState(false)
   const [oauthError, setOauthError] = useState('')
@@ -67,7 +67,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
     setOauthError(''); setOauthBusy(true)
     try {
       const s = await api.oauth.start(defId, providerName, providerId)
-      setOauthSession({ auth_url: s.auth_url, state: s.state, provider_id: s.provider_id, provider_name: s.provider_name })
+      setOauthSession({ auth_url: s.auth_url, state: s.state, provider_id: s.provider_id, provider_name: s.provider_name, redirect_uri: s.redirect_uri })
       setPasteUrl('')
       window.open(s.auth_url, '_blank', 'noopener')
     } catch (e: any) {
@@ -210,13 +210,14 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <option value="openai_compatible">openai_compatible</option>
                 <option value="azure">azure</option>
                 <option value="antigravity">antigravity (OAuth)</option>
+                <option value="devin">devin (OAuth)</option>
               </Select>
             </Field>
             <Field label="Base URL" hint="Optional. Leave blank to use the provider's official endpoint.">
               <Input placeholder="https://api.example.com/v1" value={base} onChange={e=>setBase(e.target.value)} />
             </Field>
-            {type === 'antigravity' ? (
-              <Field label="API Key" hint="Not needed — Antigravity connects with Google OAuth after creation.">
+            {type === 'antigravity' || type === 'devin' ? (
+              <Field label="API Key" hint="Not needed — this provider connects with OAuth after creation.">
                 <Input placeholder="OAuth — no key required" value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" disabled />
               </Field>
             ) : (
@@ -277,7 +278,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <HealthDot health={p.health_status} />
                 <span className={healthTextCls(p.health_status)}>{p.health_status || 'checking'}</span>
               </div>
-              {p.type === 'antigravity' && (
+              {(p.type === 'antigravity' || p.type === 'devin') && (
                 <div className="flex items-center gap-1.5">
                   {p.oauth_connected
                     ? <Badge tone="good">OAuth {p.oauth_email || 'connected'}</Badge>
@@ -300,12 +301,12 @@ export default function Providers({ role = 'admin' }: { role?: string }){
 
             {canWrite && (
               <div className="mt-auto pt-3 flex justify-end gap-1 flex-wrap">
-                {p.type === 'antigravity' && !p.oauth_connected && (
-                  <Button variant="ghost" size="sm" onClick={()=>startOAuth(p.oauth_def_id || 'antigravity', p.id)} disabled={oauthBusy}>
+                {(p.type === 'antigravity' || p.type === 'devin') && !p.oauth_connected && (
+                  <Button variant="ghost" size="sm" onClick={()=>startOAuth(p.oauth_def_id || p.type, p.id)} disabled={oauthBusy}>
                     Connect
                   </Button>
                 )}
-                {p.type === 'antigravity' && p.oauth_connected && (
+                {(p.type === 'antigravity' || p.type === 'devin') && p.oauth_connected && (
                   <>
                     <Button variant="ghost" size="sm" onClick={()=>refreshOAuth(p.id)}>Refresh</Button>
                     <Button variant="ghost" size="sm" onClick={()=>disconnectOAuth(p.id)}>Disconnect</Button>
@@ -382,7 +383,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
           <div className="space-y-4">
             {oauthError && <ErrorNote message={oauthError} />}
             <p className="text-sm text-muted">
-              Google sign-in opened in a new tab. After approving, your browser lands on a localhost URL that cannot load —
+              Sign-in opened in a new tab. After approving, your browser lands on a localhost URL that cannot load —
               copy that full URL from the address bar and paste it below.
             </p>
             <Field label="Sign-in URL" hint="Opened automatically — reopen if your popup blocker stopped it.">
@@ -391,7 +392,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <CopyButton value={oauthSession.auth_url} />
               </div>
             </Field>
-            <Field label="Pasted callback URL" hint="http://localhost:51121/oauth-callback?state=…&code=…">
+            <Field label="Pasted callback URL" hint={`${oauthSession.redirect_uri}?state=…&code=…`}>
               <Input value={pasteUrl} onChange={e=>setPasteUrl(e.target.value)} placeholder="Paste the localhost URL here" spellCheck={false} autoFocus />
             </Field>
           </div>

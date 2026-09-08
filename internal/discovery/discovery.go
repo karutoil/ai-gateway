@@ -53,6 +53,10 @@ func (s *Service) Discover(providerID string) (int, error) {
 	if p.Type == models.ProviderAntigravity {
 		return s.discoverAntigravity(p)
 	}
+	// Devin uses OAuth + Connect-proto model configs, not /v1/models.
+	if p.Type == models.ProviderDevin {
+		return s.discoverDevin(p)
+	}
 	apiKey, err := s.providerStore.DecryptKey(p)
 	if err != nil {
 		return 0, err

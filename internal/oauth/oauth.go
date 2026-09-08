@@ -64,7 +64,15 @@ type Definition struct {
 	ExtraAuthParams map[string]string `json:"extra_auth_params,omitempty"`
 	// UserInfoURL, when set, is fetched with the access token to learn the email.
 	UserInfoURL string `json:"-"`
+	// PasteRedirectURI is the loopback callback advertised in paste mode
+	// (the browser lands there, the user copies the URL). Defaults to
+	// DefaultPasteRedirectURI when empty.
+	PasteRedirectURI string `json:"-"`
 }
+
+// DefaultPasteRedirectURI is the loopback callback used in paste mode unless
+// a definition overrides it.
+const DefaultPasteRedirectURI = "http://localhost:51121/oauth-callback"
 
 // ClientIDResolved returns env override or default.
 func (d *Definition) ClientIDResolved() string {
@@ -87,11 +95,21 @@ func (d *Definition) ClientSecretResolved() string {
 }
 
 // Hooks customizes the generic flow per provider without forking handlers.
+// Standard OAuth2 providers only need AfterExchange/AfterRefresh; providers
+// with non-standard authorize or token endpoints (no client_id, JSON token
+// exchange, long-lived session tokens) override BuildAuthURL, Exchange, or
+// DoRefresh instead.
 type Hooks struct {
 	// AfterExchange enriches tokens post-code-exchange (fetch email, project id...).
 	AfterExchange func(ctx context.Context, def *Definition, tok *Tokens, httpClient *http.Client) error
 	// AfterRefresh enriches tokens post-refresh.
 	AfterRefresh func(ctx context.Context, def *Definition, tok *Tokens, httpClient *http.Client) error
+	// BuildAuthURL overrides the standard authorize-URL builder entirely.
+	BuildAuthURL func(def *Definition, p PendingLogin) string
+	// Exchange overrides the standard form-encoded code exchange entirely.
+	Exchange func(ctx context.Context, def *Definition, p PendingLogin, code string, httpClient *http.Client) (*Tokens, error)
+	// DoRefresh overrides the standard refresh_token grant entirely.
+	DoRefresh func(ctx context.Context, def *Definition, refreshToken string, httpClient *http.Client) (*Tokens, error)
 	// Redact scrubs provider errors for UI display.
 	Redact func(string) string
 }
@@ -212,6 +230,14 @@ func PeekPending(state string) (PendingLogin, bool) {
 
 // AuthURL builds the browser redirect URL for a pending login.
 func AuthURL(def Definition, p PendingLogin) string {
+	if _, hooks, ok := Get(def.ID); ok && hooks.BuildAuthURL != nil {
+		return hooks.BuildAuthURL(&def, p)
+	}
+	return standardAuthURL(def, p)
+}
+
+// standardAuthURL builds an OAuth2 authorize URL with client_id + scopes.
+func standardAuthURL(def Definition, p PendingLogin) string {
 	q := url.Values{}
 	q.Set("client_id", def.ClientIDResolved())
 	q.Set("response_type", "code")
@@ -231,6 +257,18 @@ func AuthURL(def Definition, p PendingLogin) string {
 
 // ExchangeCode performs the code->tokens exchange generically.
 func ExchangeCode(ctx context.Context, def Definition, p PendingLogin, code string, httpClient *http.Client) (*Tokens, error) {
+	if _, hooks, ok := Get(def.ID); ok && hooks.Exchange != nil {
+		tok, err := hooks.Exchange(ctx, &def, p, code, httpClient)
+		if err != nil {
+			return nil, err
+		}
+		if _, hooks, ok := Get(def.ID); ok && hooks.AfterExchange != nil {
+			if err := hooks.AfterExchange(ctx, &def, tok, httpClient); err != nil {
+				return nil, err
+			}
+		}
+		return tok, nil
+	}
 	form := url.Values{}
 	form.Set("client_id", def.ClientIDResolved())
 	if s := def.ClientSecretResolved(); s != "" {
@@ -256,6 +294,21 @@ func ExchangeCode(ctx context.Context, def Definition, p PendingLogin, code stri
 
 // Refresh performs a refresh_token grant generically.
 func Refresh(ctx context.Context, def Definition, refreshToken string, httpClient *http.Client) (*Tokens, error) {
+	if _, hooks, ok := Get(def.ID); ok && hooks.DoRefresh != nil {
+		tok, err := hooks.DoRefresh(ctx, &def, refreshToken, httpClient)
+		if err != nil {
+			return nil, err
+		}
+		if tok.Refresh == "" {
+			tok.Refresh = refreshToken
+		}
+		if _, hooks, ok := Get(def.ID); ok && hooks.AfterRefresh != nil {
+			if err := hooks.AfterRefresh(ctx, &def, tok, httpClient); err != nil {
+				return nil, err
+			}
+		}
+		return tok, nil
+	}
 	form := url.Values{}
 	form.Set("client_id", def.ClientIDResolved())
 	if s := def.ClientSecretResolved(); s != "" {
@@ -352,6 +405,12 @@ func ParseCallbackURL(raw, expectedState string) (code string, err error) {
 }
 
 func envGet(k string) string { return os.Getenv(k) }
+
+// PKCEChallenge derives the S256 code_challenge for a verifier.
+func PKCEChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
 
 func randomString(n int) string {
 	b := make([]byte, n)

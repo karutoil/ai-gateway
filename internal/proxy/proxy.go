@@ -2682,6 +2682,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.proxyAntigravity(w, r, body, body, isStream, model, "chat.completions", keyPrefix, start, p0)
 		return
 	}
+	// Devin speaks Connect-proto (OAuth session token), not OpenAI — translate.
+	if p0 := candidates[0]; isDevin(p0) {
+		h.proxyDevin(w, r, body, isStream, model, "chat.completions", keyPrefix, start, p0)
+		return
+	}
 	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
@@ -3305,6 +3310,9 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		if isAntigravity(p) {
 			return true
 		}
+		if isDevin(p) {
+			return true
+		}
 		// Multi-protocol providers (OpenCode Go/Zen) expose /v1/messages
 		// alongside chat/responses on one base URL + key. Without this a
 		// single entry cannot serve its messages-models (qwen/minimax).
@@ -3347,6 +3355,17 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		start := time.Now()
 		h.proxyAntigravity(w, r, body, chatBody, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, p0)
+		return
+	}
+	// Devin via OAuth: normalize Anthropic -> OpenAI chat, then translate.
+	if p0 := candidates[0]; isDevin(p0) {
+		chatBody, _, err := translate.AnthropicToOpenAI(body)
+		if err != nil {
+			httperr.Invalid(w, "invalid anthropic body: "+err.Error())
+			return
+		}
+		start := time.Now()
+		h.proxyDevin(w, r, chatBody, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, p0)
 		return
 	}
 	start := time.Now()
@@ -3440,6 +3459,16 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.proxyAntigravity(w, r, body, chatBody, isStream, model, "responses", r.Header.Get("X-Gateway-Key-Prefix"), time.Now(), p)
+		return
+	}
+	// Devin via OAuth: normalize Responses -> OpenAI chat, then translate.
+	if isDevin(p) {
+		chatBody, _, err := translate.ResponsesToChat(body)
+		if err != nil {
+			httperr.Invalid(w, "invalid responses body: "+err.Error())
+			return
+		}
+		h.proxyDevin(w, r, chatBody, isStream, model, "responses", r.Header.Get("X-Gateway-Key-Prefix"), time.Now(), p)
 		return
 	}
 	apiKey, derr := h.ProviderStore.DecryptKey(p)

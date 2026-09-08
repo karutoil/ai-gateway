@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -202,9 +201,9 @@ tried:
 
 	switch endpoint {
 	case "messages":
-		h.serveAntigravityAsAnthropic(w, r, resp, originalBody, chatBody, model, publicID, usedRuntime, keyPrefix, start, p.ID, isStream)
+		h.serveAntigravityAsAnthropic(w, r, resp, model, publicID, keyPrefix, start, p.ID, isStream)
 	case "responses":
-		h.serveAntigravityAsResponses(w, r, resp, model, publicID, usedRuntime, keyPrefix, start, p.ID, isStream)
+		h.serveAntigravityAsResponses(w, r, resp, model, publicID, keyPrefix, start, p.ID, isStream)
 	default:
 		h.serveAntigravityAsOpenAI(w, r, resp, model, publicID, usedRuntime, keyPrefix, start, p.ID, isStream)
 	}
@@ -360,25 +359,10 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-	fl, _ := w.(http.Flusher)
-
-	id := "chatcmpl-" + uuid.NewString()[:8]
-	roleSent := false
-	toolIdx := map[string]int{}
-	nextIdx := 0
-	var prompt, completion, cacheRead, reasoningTok, total int
-	finish := "stop"
-	latencyFirst := int64(0)
-	firstByte := true
+	st := newOpenAIChunkStreamer(w, model)
 
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 8*1024*1024)
-	flush := func(s string) {
-		_, _ = w.Write([]byte(s))
-		if fl != nil {
-			fl.Flush()
-		}
-	}
 	for sc.Scan() {
 		if r.Context().Err() != nil {
 			break
@@ -387,56 +371,136 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		c := antigravity.ParseChunk(strings.TrimPrefix(line, "data:"))
-		if firstByte && (c.HasData) {
-			latencyFirst = time.Since(start).Milliseconds()
-			firstByte = false
-		}
-		for _, t := range c.Texts {
-			d := map[string]any{"content": t}
-			if !roleSent {
-				d["role"] = "assistant"
-				roleSent = true
-			}
-			flush("data: " + mustJSONString(map[string]any{"id": id, "object": "chat.completion.chunk", "created": 0, "model": model, "choices": []any{map[string]any{"index": 0, "delta": d, "finish_reason": nil}}}) + "\n\n")
-		}
-		for _, tc := range c.ToolCalls {
-			idx, ok := toolIdx[tc.ID]
-			if !ok {
-				idx = nextIdx
-				toolIdx[tc.ID] = idx
-				nextIdx++
-			}
-			args, _ := json.Marshal(tc.Arguments)
-			d := map[string]any{"tool_calls": []any{map[string]any{"index": idx, "id": tc.ID, "type": "function", "function": map[string]any{"name": tc.Name, "arguments": string(args)}}}}
-			if !roleSent {
-				d["role"] = "assistant"
-				roleSent = true
-			}
-			flush("data: " + mustJSONString(map[string]any{"id": id, "object": "chat.completion.chunk", "created": 0, "model": model, "choices": []any{map[string]any{"index": 0, "delta": d, "finish_reason": nil}}}) + "\n\n")
-		}
-		if c.Usage.HasUsage {
-			prompt, completion, cacheRead, reasoningTok, total = c.Usage.Input, c.Usage.Output, c.Usage.CacheRead, c.Usage.Reasoning, c.Usage.Total
-		}
-		if c.Finish != "" && !strings.HasPrefix(c.Finish, "error:") {
-			finish = mapAntigravityFinish(c.Finish, len(toolIdx) > 0)
-		}
+		st.WriteChunk(antigravity.ParseChunk(strings.TrimPrefix(line, "data:")))
 	}
-	if len(toolIdx) > 0 && finish == "stop" {
-		finish = "tool_calls"
-	}
-	flush("data: " + mustJSONString(map[string]any{"id": id, "object": "chat.completion.chunk", "created": 0, "model": model, "choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}}}) + "\n\n")
-	flush("data: [DONE]\n\n")
-	cost := antigravityCost(publicID, prompt, completion)
-	_ = cacheRead
-	_ = reasoningTok
-	_ = total
-	_ = latencyFirst
-	_ = runtime
-	h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
+	st.Close()
+	cost := antigravityCost(publicID, st.prompt, st.completion)
+	h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, cost, true)
 	if h.Metrics != nil {
 		h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 	}
+	_ = runtime
+}
+
+// openAIChunkStreamer incrementally renders normalized ParsedChunk frames as
+// OpenAI chat-completion SSE. Shared by OAuth transports (Antigravity,
+// Devin) so new providers reuse the client dialect instead of reimplementing
+// it.
+type openAIChunkStreamer struct {
+	w          http.ResponseWriter
+	fl         http.Flusher
+	model      string
+	id         string
+	roleSent   bool
+	toolIdx    map[string]int
+	nextIdx    int
+	prompt     int
+	completion int
+	toolSeen   bool
+	finish     string
+}
+
+func newOpenAIChunkStreamer(w http.ResponseWriter, model string) *openAIChunkStreamer {
+	fl, _ := w.(http.Flusher)
+	return &openAIChunkStreamer{
+		w: w, fl: fl, model: model,
+		id:      "chatcmpl-" + uuid.NewString()[:8],
+		toolIdx: map[string]int{}, finish: "stop",
+	}
+}
+
+func (s *openAIChunkStreamer) emit(payload string) {
+	_, _ = s.w.Write([]byte(payload))
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+func (s *openAIChunkStreamer) deltaBase() map[string]any {
+	d := map[string]any{}
+	if !s.roleSent {
+		d["role"] = "assistant"
+		s.roleSent = true
+	}
+	return d
+}
+
+func (s *openAIChunkStreamer) frame(delta map[string]any, finish *string) string {
+	choice := map[string]any{"index": 0, "delta": delta, "finish_reason": nil}
+	if finish != nil {
+		choice["finish_reason"] = *finish
+	}
+	return "data: " + mustJSONString(map[string]any{
+		"id": s.id, "object": "chat.completion.chunk", "created": 0,
+		"model": s.model, "choices": []any{choice},
+	}) + "\n\n"
+}
+
+// WriteText emits one text delta.
+func (s *openAIChunkStreamer) WriteText(t string) {
+	d := s.deltaBase()
+	d["content"] = t
+	s.emit(s.frame(d, nil))
+}
+
+// WriteToolCall emits one tool-call delta frame. start=true carries the
+// id/name header (first frame per call); later frames carry only the
+// arguments fragment being streamed.
+func (s *openAIChunkStreamer) WriteToolCall(id, name, argsFragment string, start bool) {
+	idx, ok := s.toolIdx[id]
+	if !ok {
+		idx = s.nextIdx
+		s.toolIdx[id] = idx
+		s.nextIdx++
+	}
+	s.toolSeen = true
+	fn := map[string]any{"arguments": argsFragment}
+	tc := map[string]any{"index": idx, "function": fn}
+	if start {
+		tc["id"] = id
+		tc["type"] = "function"
+		fn["name"] = name
+	}
+	d := s.deltaBase()
+	d["tool_calls"] = []any{tc}
+	s.emit(s.frame(d, nil))
+}
+
+// WriteUsage records the latest usage frame (upstreams overwrite, not sum).
+func (s *openAIChunkStreamer) WriteUsage(prompt, completion int) {
+	s.prompt, s.completion = prompt, completion
+}
+
+// SetFinish records an upstream finish reason verbatim.
+func (s *openAIChunkStreamer) SetFinish(finish string) {
+	s.finish = finish
+}
+
+// WriteChunk renders one normalized chunk (text, tool calls, usage, finish).
+func (s *openAIChunkStreamer) WriteChunk(c antigravity.ParsedChunk) {
+	for _, t := range c.Texts {
+		s.WriteText(t)
+	}
+	for _, tc := range c.ToolCalls {
+		args, _ := json.Marshal(tc.Arguments)
+		s.WriteToolCall(tc.ID, tc.Name, string(args), true)
+	}
+	if c.Usage.HasUsage {
+		s.WriteUsage(c.Usage.Input, c.Usage.Output)
+	}
+	if c.Finish != "" && !strings.HasPrefix(c.Finish, "error:") {
+		s.finish = mapAntigravityFinish(c.Finish, len(s.toolIdx) > 0)
+	}
+}
+
+// Close emits the terminal chunk and [DONE].
+func (s *openAIChunkStreamer) Close() {
+	finish := s.finish
+	if s.toolSeen && finish == "stop" {
+		finish = "tool_calls"
+	}
+	s.emit(s.frame(map[string]any{}, &finish))
+	s.emit("data: [DONE]\n\n")
 }
 
 func mapAntigravityFinish(fr string, hasTools bool) string {
@@ -462,12 +526,25 @@ func mustJSONString(v any) string {
 }
 
 // serveAntigravityAsAnthropic renders Antigravity output in Anthropic messages SSE/JSON.
-func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, r *http.Request, resp *http.Response, originalBody, _ []byte, model, publicID, runtime, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, _ *http.Request, resp *http.Response, model, publicID, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	chunks, err := collectAntigravityChunks(resp)
 	if err != nil {
 		httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
 		return
 	}
+	h.serveChunksAsAnthropic(w, chunks, model, "messages", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
+}
+
+// antigravityCostFor binds a public model id to a usage->USD function.
+func antigravityCostFor(publicID string) func(prompt, completion int) float64 {
+	return func(prompt, completion int) float64 {
+		return antigravityCost(publicID, prompt, completion)
+	}
+}
+
+// serveChunksAsAnthropic renders normalized chunks in the Anthropic messages
+// dialect. Shared by OAuth transports; costFn maps usage to USD.
+func (h *Handler) serveChunksAsAnthropic(w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
 	var texts []string
 	var toolCalls []antigravity.ParsedToolCall
 	prompt, completion := 0, 0
@@ -486,7 +563,7 @@ func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, r *http.Req
 	if len(toolCalls) > 0 {
 		finish = "tool_use"
 	}
-	cost := antigravityCost(publicID, prompt, completion)
+	cost := costFn(prompt, completion)
 	if !isStream {
 		content := []any{}
 		if text != "" {
@@ -504,7 +581,7 @@ func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
-		h.logRequestExtended(keyPrefix, providerID, model, "messages", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -536,16 +613,22 @@ func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, r *http.Req
 	}
 	emit("message_delta", mustJSONString(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": finish}, "usage": map[string]any{"output_tokens": completion}}))
 	emit("message_stop", mustJSONString(map[string]any{"type": "message_stop"}))
-	h.logRequestExtended(keyPrefix, providerID, model, "messages", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
+	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
 }
 
 // serveAntigravityAsResponses renders Antigravity output in OpenAI Responses dialect.
-func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Request, resp *http.Response, model, publicID, runtime, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, _ *http.Request, resp *http.Response, model, publicID, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	chunks, err := collectAntigravityChunks(resp)
 	if err != nil {
 		httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
 		return
 	}
+	h.serveChunksAsResponses(w, chunks, model, "responses", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
+}
+
+// serveChunksAsResponses renders normalized chunks in the OpenAI Responses
+// dialect. Shared by OAuth transports; costFn maps usage to USD.
+func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
 	var texts []string
 	prompt, completion := 0, 0
 	for _, c := range chunks {
@@ -555,7 +638,7 @@ func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Req
 		}
 	}
 	text := strings.Join(texts, "")
-	cost := antigravityCost(publicID, prompt, completion)
+	cost := costFn(prompt, completion)
 	respID := "resp_" + uuid.NewString()
 	if !isStream {
 		out := map[string]any{
@@ -567,7 +650,7 @@ func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
-		h.logRequestExtended(keyPrefix, providerID, model, "responses", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -592,7 +675,5 @@ func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Req
 	emit(map[string]any{"type": "response.content_part.done", "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}}})
 	emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": itemID, "type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}, "status": "completed"}})
 	emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": respID, "model": model, "status": "completed", "usage": map[string]any{"input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion}}})
-	h.logRequestExtended(keyPrefix, providerID, model, "responses", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
-	_ = fmt.Sprintf
-	_ = runtime
+	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
 }

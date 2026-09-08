@@ -1326,9 +1326,9 @@ components:
       required: [name, type]
       properties:
         name: { type: string, example: openai }
-        type: { type: string, enum: [openai, anthropic, azure, openai_compatible, antigravity], example: openai }
+        type: { type: string, enum: [openai, anthropic, azure, openai_compatible, antigravity, devin], example: openai }
         base_url: { type: string, example: https://api.openai.com/v1 }
-        api_key: { type: string, example: sk-... , description: 'Not required for antigravity (OAuth).'}
+        api_key: { type: string, example: sk-... , description: 'Not required for OAuth providers (antigravity, devin).'}
     CreateKey:
       type: object
       description: All fields optional except none — a key with no name gets key-<uuid8>.

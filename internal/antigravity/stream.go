@@ -29,12 +29,13 @@ type ParsedToolCall struct {
 
 // Usage mirrors usageMetadata.
 type Usage struct {
-	Input     int
-	Output    int
-	CacheRead int
-	Reasoning int
-	Total     int
-	HasUsage  bool
+	Input      int
+	Output     int
+	CacheRead  int
+	CacheWrite int
+	Reasoning  int
+	Total      int
+	HasUsage   bool
 }
 
 // ParseChunk parses one SSE data: line body (JSON).

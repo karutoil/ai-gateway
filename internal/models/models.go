@@ -10,6 +10,7 @@ const (
 	ProviderAzure            ProviderType = "azure"
 	ProviderOpenAICompatible ProviderType = "openai_compatible"
 	ProviderAntigravity      ProviderType = "antigravity"
+	ProviderDevin            ProviderType = "devin"
 )
 
 type Provider struct {

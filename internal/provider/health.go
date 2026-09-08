@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/devin"
+
 	gatewaydb "ai-gateway/internal/db"
 
 	"github.com/rs/zerolog/log"
@@ -51,6 +53,26 @@ func checkAll(db *sql.DB, store *Store) {
 			} else if _, _, _, rerr := store.EnsureFreshAccess(checkCtx(), &p, client); rerr != nil {
 				status = "down"
 				msg = "oauth refresh failed — reconnect"
+			} else {
+				status = "up"
+				msg = "OK (oauth)"
+			}
+			if _, err := db.Exec(gatewaydb.Q(`UPDATE providers SET health_status=?, last_health=? WHERE id=?`), status, msg, p.ID); err != nil {
+				log.Error().Err(err).Str("provider", p.Name).Msg("health update failed")
+			}
+			continue
+		}
+		// Devin is OAuth-backed: health = session token + user-JWT probe.
+		if p.Type == "devin" {
+			if tok, _, err := store.OAuthTokens(&p); err != nil || tok == nil || tok.Refresh == "" {
+				status = "down"
+				msg = "oauth not connected — connect in Providers"
+			} else if access, _, _, rerr := store.EnsureFreshAccess(checkCtx(), &p, client); rerr != nil {
+				status = "down"
+				msg = "oauth refresh failed — reconnect"
+			} else if _, derr := devin.GetUserJWT(access, p.BaseURL, client); derr != nil {
+				status = "down"
+				msg = "devin auth failed — reconnect"
 			} else {
 				status = "up"
 				msg = "OK (oauth)"
