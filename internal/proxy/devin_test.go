@@ -147,3 +147,17 @@ func TestProxyDevinNotConnected(t *testing.T) {
 		t.Fatalf("status = %d, want 502", w.Result().StatusCode)
 	}
 }
+
+func TestFriendlyDevinTrailerError(t *testing.T) {
+	msg := friendlyDevinTrailerError("an internal error occurred (error ID: abc)(trace ID: def)")
+	if !strings.Contains(msg, "try another Devin model") {
+		t.Fatalf("missing guidance: %q", msg)
+	}
+	if !strings.Contains(msg, "error ID: abc") || !strings.Contains(msg, "trace ID: def") {
+		t.Fatalf("IDs must survive: %q", msg)
+	}
+	plain := friendlyDevinTrailerError("quota exhausted")
+	if plain != "quota exhausted" {
+		t.Fatalf("non-internal errors pass through: %q", plain)
+	}
+}

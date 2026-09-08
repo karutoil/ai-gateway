@@ -123,6 +123,18 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 	}
 }
 
+// friendlyDevinTrailerError classifies in-stream trailer errors. Backend
+// internal errors carry error/trace IDs for Devin support and are
+// model/account-specific, so the message keeps the IDs and advises trying
+// another model.
+func friendlyDevinTrailerError(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if strings.Contains(strings.ToLower(msg), "internal error") {
+		return "Devin backend reported an internal error for this model/account — try another Devin model (availability varies per model and account). " + msg
+	}
+	return msg
+}
+
 func friendlyDevinMessage(status int, body string) string {
 	msg := ScrubSecrets(strings.TrimSpace(body))
 	if len(msg) > 500 {
@@ -204,7 +216,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 	if !isStream {
 		deltas, trailerErr := collectDevinDeltas(resp.Body)
 		if trailerErr != "" {
-			httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+trailerErr)
+			httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+friendlyDevinTrailerError(trailerErr))
 			h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, false)
 			return
 		}
@@ -248,7 +260,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 			if fr.Trailer {
 				// Headers already flowed, so errors terminate in-band.
 				if msg := devin.TrailerError(fr.Payload); msg != "" {
-					writeSSEUpstreamError(w, false, "Devin stream error: "+msg)
+					writeSSEUpstreamError(w, false, "Devin stream error: "+friendlyDevinTrailerError(msg))
 					return
 				}
 				continue
@@ -294,7 +306,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 func (h *Handler) serveDevinBuffered(w http.ResponseWriter, resp *http.Response, model, endpoint, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	deltas, trailerErr := collectDevinDeltas(resp.Body)
 	if trailerErr != "" {
-		httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+trailerErr)
+		httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+friendlyDevinTrailerError(trailerErr))
 		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
