@@ -593,11 +593,39 @@ func (h *Handler) writeJSONCached(w http.ResponseWriter, cacheKey string, ttl in
 // upstreams. The old code used a deny-list for auth/gateway hops only, so
 // cookies, arbitrary SDK telemetry, anthropic-version (against OpenAI targets)
 // and other residue rode along when fallback switched providers mid-request.
+// x-opencode-session is required by OpenCode Go/Zen (see
+// https://opencode.ai/docs/go/#where-can-i-use-it): without it the upstream
+// rejects requests with 400 MissingSessionID on /responses (and 500s on the
+// translated /chat/completions fallback). The gateway must not strip it.
 var upstreamForwardHeaders = map[string]bool{
-	"accept":          true,
-	"accept-language": true,
-	"user-agent":      true,
-	"x-request-id":    true,
+	"accept":             true,
+	"accept-language":    true,
+	"user-agent":         true,
+	"x-request-id":       true,
+	"x-opencode-session": true,
+}
+
+// opencodeSessionForRequest is the stable session ID the gateway sends to
+// OpenCode Go/Zen upstreams when the client did not supply one. The upstream
+// hard-requires x-opencode-session (400 MissingSessionID otherwise) and asks
+// for a stable value per conversation so it can optimize routing and prompt
+// caching: a per-request UUID would defeat that, so this reuses the
+// client's x-request-id, falling back to a fixed gateway identifier.
+func opencodeSessionForRequest(r *http.Request) string {
+	if v := r.Header.Get("x-opencode-session"); v != "" {
+		return v
+	}
+	if v := r.Header.Get("x-request-id"); v != "" {
+		return v
+	}
+	return "ai-gateway"
+}
+
+// isOpencodeTarget reports whether the upstream URL is an OpenCode Go/Zen
+// endpoint that hard-requires the x-opencode-session header.
+func isOpencodeTarget(targetURL string) bool {
+	l := strings.ToLower(targetURL)
+	return strings.Contains(l, "opencode.ai/zen")
 }
 
 // azureAPIVersion is the default Azure OpenAI API version used for
@@ -645,6 +673,12 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, targe
 		for _, v := range vv {
 			req.Header.Add(k, v)
 		}
+	}
+	if req.Header.Get("x-opencode-session") == "" && isOpencodeTarget(targetURL) {
+		// OpenCode Go/Zen hard-requires a session ID (400 MissingSessionID
+		// otherwise) and asks for a stable value per conversation; inject the
+		// gateway default when the client sent none (see opencodeSessionForRequest).
+		req.Header.Set("x-opencode-session", opencodeSessionForRequest(r))
 	}
 	if isAnthropicUpstream {
 		req.Header.Set("x-api-key", apiKey)
@@ -3321,6 +3355,7 @@ func hasPreviousResponseID(body []byte) bool {
 
 // Responses handles POST /v1/responses (OpenAI Responses API)
 func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
+	retry := h.retryOrDefault()
 	body, bodyOK := h.readProxyBody(w, r)
 	if !bodyOK {
 		return
@@ -3406,6 +3441,20 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				req.Header.Set("Authorization", "Bearer "+apiKey)
 			}
 			req.Header.Set("Content-Type", "application/json")
+			// OpenCode Go/Zen requires the client's x-opencode-session for
+			// routing/prompt-caching (400 MissingSessionID without it). The
+			// native probe builds its request manually, so forward the
+			// allowlisted session/user headers explicitly like
+			// newUpstreamRequest does, synthesizing one when the client
+			// sent none (opencodeSessionForRequest).
+			for _, hk := range []string{"x-opencode-session", "user-agent", "accept-language", "x-request-id"} {
+				if v := r.Header.Get(hk); v != "" {
+					req.Header.Set(hk, v)
+				}
+			}
+			if isOpencodeTarget(target) && req.Header.Get("x-opencode-session") == "" {
+				req.Header.Set("x-opencode-session", opencodeSessionForRequest(r))
+			}
 			if isStream {
 				// Ask for a real stream so SSE-native providers open one instead
 				// of silently downgrading to a buffered JSON answer.
@@ -3420,6 +3469,28 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 			resp, err := h.Client.Do(req)
 			if ttfbTimer != nil {
 				ttfbTimer.Stop()
+			}
+			// Transient probe failures (upstream 429/5xx) are retried within
+			// the same budget before falling through: OpenCode Go rate-limits
+			// muse-spark bursts with 429s, and a silent probe fall-through
+			// lands on the translated /chat/completions path, which upstream
+			// 500s for Responses-only models — turning a retryable upstream
+			// hiccup into a hard client-visible failure.
+			for probeAttempt := 0; err == nil && resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && retry.ShouldRetry(probeAttempt, resp.StatusCode); probeAttempt++ {
+				io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+				sleepCtx(r.Context(), retryAfterDelay(resp.Header, retry.Backoff(probeAttempt)))
+				req2, rerr2 := http.NewRequestWithContext(r.Context(), "POST", target, bytes.NewReader(nativeBody))
+				if rerr2 != nil {
+					break
+				}
+				req2.Header = req.Header.Clone()
+				req2 = req2.WithContext(attemptCtx)
+				ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
+				resp, err = h.Client.Do(req2)
+				if ttfbTimer != nil {
+					ttfbTimer.Stop()
+				}
 			}
 			// Only an explicit 200 is a usable native reply. Location-less 3xx
 			// bodies arrive without transport error and previously passed through as
@@ -3459,6 +3530,30 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			} else if resp != nil {
+				// A 429 is endpoint-agnostic: the upstream rate-limits the
+				// MODEL, so the translated path would hit the same limit —
+				// and for Responses-only models (muse-spark-*) it is a
+				// guaranteed 500 besides. Relay the 429 (and its Retry-After)
+				// so client SDKs can back off, instead of masking it as a
+				// translated-path 502.
+				if resp.StatusCode == http.StatusTooManyRequests {
+					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					resp.Body.Close()
+					copyHeader(w.Header(), resp.Header)
+					if w.Header().Get("Retry-After") == "" {
+						w.Header().Set("Retry-After", "2")
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					if len(bodyBytes) > 0 {
+						w.Write(bodyBytes)
+					} else {
+						w.Write([]byte(`{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"upstream rate limit exceeded; retry shortly"}}`))
+					}
+					h.logRequestExtended(keyPrefix, p.ID, model, "responses", http.StatusTooManyRequests, time.Since(start).Milliseconds(), 0, 0, 0, false)
+					return
+				}
+				log.Info().Str("model", model).Str("provider", p.ID).Int("status", resp.StatusCode).Msg("native responses probe rejected; falling through to translated path")
 				resp.Body.Close()
 			}
 		}
