@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"strings"
@@ -10,6 +11,10 @@ import (
 
 	"github.com/rs/zerolog/log"
 )
+
+func checkCtx() context.Context {
+	return context.Background()
+}
 
 func StartHealthChecker(db *sql.DB, store *Store, interval time.Duration) {
 	if interval <= 0 {
@@ -38,6 +43,23 @@ func checkAll(db *sql.DB, store *Store) {
 		status := "unknown"
 		msg := ""
 		target := p.BaseURL
+		// Antigravity is OAuth-backed: health = token refreshability, not /models.
+		if p.Type == "antigravity" {
+			if tok, _, err := store.OAuthTokens(&p); err != nil || tok == nil || tok.Refresh == "" {
+				status = "down"
+				msg = "oauth not connected — connect in Providers"
+			} else if _, _, _, rerr := store.EnsureFreshAccess(checkCtx(), &p, client); rerr != nil {
+				status = "down"
+				msg = "oauth refresh failed — reconnect"
+			} else {
+				status = "up"
+				msg = "OK (oauth)"
+			}
+			if _, err := db.Exec(gatewaydb.Q(`UPDATE providers SET health_status=?, last_health=? WHERE id=?`), status, msg, p.ID); err != nil {
+				log.Error().Err(err).Str("provider", p.Name).Msg("health update failed")
+			}
+			continue
+		}
 		switch p.Type {
 		case "anthropic":
 			// anthropic: try to ping /v1/models with x-api-key if possible, otherwise mark unknown

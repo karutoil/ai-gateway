@@ -49,6 +49,10 @@ func (s *Service) Discover(providerID string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Antigravity uses OAuth + Cloud Code Assist catalog, not /v1/models.
+	if p.Type == models.ProviderAntigravity {
+		return s.discoverAntigravity(p)
+	}
 	apiKey, err := s.providerStore.DecryptKey(p)
 	if err != nil {
 		return 0, err

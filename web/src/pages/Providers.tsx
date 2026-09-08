@@ -35,13 +35,69 @@ export default function Providers({ role = 'admin' }: { role?: string }){
   const [editError, setEditError] = useState('')
   const toast = useToast()
 
+  // OAuth connections (generic registry; Antigravity ships built-in).
+  const [oauthDefs, setOauthDefs] = useState<any[]>([])
+  const [oauthSession, setOauthSession] = useState<{ auth_url: string; state: string; provider_id: string; provider_name: string } | null>(null)
+  const [pasteUrl, setPasteUrl] = useState('')
+  const [oauthBusy, setOauthBusy] = useState(false)
+  const [oauthError, setOauthError] = useState('')
+
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const load = () => api.providers.list()
     .then((data)=>{ setList(Array.isArray(data) ? data : []); setLoadError('') })
     .catch((e:any)=> setLoadError(e?.message || String(e)))
     .finally(()=> setLoading(false))
-  useEffect(()=>{ load(); return ()=>{ if (pollTimer.current) clearTimeout(pollTimer.current) } },[])
+  useEffect(()=>{
+    load()
+    api.oauth.listDefs().then(setOauthDefs).catch(()=>{})
+    try {
+      const q = new URLSearchParams(window.location.search)
+      if (q.get('oauth') === 'connected') {
+        toast.success('OAuth connected')
+        q.delete('oauth'); q.delete('provider')
+        window.history.replaceState({}, '', window.location.pathname + (q.toString() ? `?${q}` : ''))
+        load()
+      }
+    } catch {}
+    return ()=>{ if (pollTimer.current) clearTimeout(pollTimer.current) }
+  },[])
+
+  const startOAuth = async (defId: string, providerId?: string, providerName?: string) => {
+    setOauthError(''); setOauthBusy(true)
+    try {
+      const s = await api.oauth.start(defId, providerName, providerId)
+      setOauthSession({ auth_url: s.auth_url, state: s.state, provider_id: s.provider_id, provider_name: s.provider_name })
+      setPasteUrl('')
+      window.open(s.auth_url, '_blank', 'noopener')
+    } catch (e: any) {
+      setOauthError(e?.message || String(e))
+      toast.error(e?.message || String(e))
+    } finally { setOauthBusy(false) }
+  }
+
+  const submitPaste = async () => {
+    if (!oauthSession) return
+    setOauthError(''); setOauthBusy(true)
+    try {
+      await api.oauth.exchange({ state: oauthSession.state, provider_id: oauthSession.provider_id, callback_url: pasteUrl })
+      toast.success(`Connected ${oauthSession.provider_name}`)
+      setOauthSession(null); setPasteUrl('')
+      load()
+    } catch (e: any) {
+      setOauthError(e?.message || String(e))
+    } finally { setOauthBusy(false) }
+  }
+
+  const refreshOAuth = async (id: string) => {
+    try { await api.oauth.refresh(id); toast.success('Token refreshed'); load() }
+    catch (e: any) { toast.error(e?.message || String(e)) }
+  }
+
+  const disconnectOAuth = async (id: string) => {
+    try { await api.oauth.disconnect(id); toast.success('OAuth disconnected'); load() }
+    catch (e: any) { toast.error(e?.message || String(e)) }
+  }
 
   /**
    * After adding a provider the backend auto-discovers its models in a
@@ -153,14 +209,21 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <option value="anthropic">anthropic</option>
                 <option value="openai_compatible">openai_compatible</option>
                 <option value="azure">azure</option>
+                <option value="antigravity">antigravity (OAuth)</option>
               </Select>
             </Field>
             <Field label="Base URL" hint="Optional. Leave blank to use the provider's official endpoint.">
               <Input placeholder="https://api.example.com/v1" value={base} onChange={e=>setBase(e.target.value)} />
             </Field>
-            <Field label="API Key">
-              <Input placeholder="sk-..." value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" />
-            </Field>
+            {type === 'antigravity' ? (
+              <Field label="API Key" hint="Not needed — Antigravity connects with Google OAuth after creation.">
+                <Input placeholder="OAuth — no key required" value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" disabled />
+              </Field>
+            ) : (
+              <Field label="API Key">
+                <Input placeholder="sk-..." value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" />
+              </Field>
+            )}
           </div>
           {err && <div className="mt-3"><ErrorNote message={err} /></div>}
           <div className="mt-4">
@@ -168,6 +231,27 @@ export default function Providers({ role = 'admin' }: { role?: string }){
               <Icon name="plus" size={15} /> Add Provider
             </Button>
           </div>
+        </Card>
+      )}
+
+      {/* OAuth connections */}
+      {oauthDefs.length > 0 && (
+        <Card>
+          <div className="flex items-center gap-2 mb-2">
+            <Icon name="key" size={16} className="text-teal" />
+            <h2 className="font-semibold tracking-tight">OAuth connections</h2>
+          </div>
+          <p className="text-sm text-muted mb-4">
+            Sign in with your account instead of pasting keys. Adding another OAuth provider later is one server registration — no UI changes.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {oauthDefs.map((d: any) => (
+              <Button key={d.id} variant="secondary" onClick={()=>startOAuth(d.id)} disabled={oauthBusy || !canWrite}>
+                Connect {d.name || d.id}
+              </Button>
+            ))}
+          </div>
+          {oauthError && <div className="mt-3"><ErrorNote message={oauthError} /></div>}
         </Card>
       )}
 
@@ -193,6 +277,13 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <HealthDot health={p.health_status} />
                 <span className={healthTextCls(p.health_status)}>{p.health_status || 'checking'}</span>
               </div>
+              {p.type === 'antigravity' && (
+                <div className="flex items-center gap-1.5">
+                  {p.oauth_connected
+                    ? <Badge tone="good">OAuth {p.oauth_email || 'connected'}</Badge>
+                    : <Badge tone="neutral">OAuth not connected</Badge>}
+                </div>
+              )}
               {p.created_at && !isNaN(new Date(p.created_at).getTime()) && (
                 <div className="text-muted">
                   created {new Date(p.created_at).toLocaleDateString()}
@@ -208,7 +299,18 @@ export default function Providers({ role = 'admin' }: { role?: string }){
             </div>
 
             {canWrite && (
-              <div className="mt-auto pt-3 flex justify-end gap-1">
+              <div className="mt-auto pt-3 flex justify-end gap-1 flex-wrap">
+                {p.type === 'antigravity' && !p.oauth_connected && (
+                  <Button variant="ghost" size="sm" onClick={()=>startOAuth(p.oauth_def_id || 'antigravity', p.id)} disabled={oauthBusy}>
+                    Connect
+                  </Button>
+                )}
+                {p.type === 'antigravity' && p.oauth_connected && (
+                  <>
+                    <Button variant="ghost" size="sm" onClick={()=>refreshOAuth(p.id)}>Refresh</Button>
+                    <Button variant="ghost" size="sm" onClick={()=>disconnectOAuth(p.id)}>Disconnect</Button>
+                  </>
+                )}
                 <Button variant="ghost" size="sm"
                   title={`Edit ${p.name}`}
                   onClick={()=>openEdit(p)}>
@@ -273,6 +375,34 @@ export default function Providers({ role = 'admin' }: { role?: string }){
         }
         confirmLabel="Delete"
       />
+
+      {/* OAuth paste modal (headless/loopback callback) */}
+      {oauthSession && (
+        <Modal open onClose={()=>{ if(!oauthBusy) setOauthSession(null) }} title={`Connect ${oauthSession.provider_name}`} width="max-w-md">
+          <div className="space-y-4">
+            {oauthError && <ErrorNote message={oauthError} />}
+            <p className="text-sm text-muted">
+              Google sign-in opened in a new tab. After approving, your browser lands on a localhost URL that cannot load —
+              copy that full URL from the address bar and paste it below.
+            </p>
+            <Field label="Sign-in URL" hint="Opened automatically — reopen if your popup blocker stopped it.">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-xs truncate flex-1">{oauthSession.auth_url}</span>
+                <CopyButton value={oauthSession.auth_url} />
+              </div>
+            </Field>
+            <Field label="Pasted callback URL" hint="http://localhost:51121/oauth-callback?state=…&code=…">
+              <Input value={pasteUrl} onChange={e=>setPasteUrl(e.target.value)} placeholder="Paste the localhost URL here" spellCheck={false} autoFocus />
+            </Field>
+          </div>
+          <div className="flex justify-end gap-2 mt-6">
+            <Button variant="ghost" onClick={()=>setOauthSession(null)} disabled={oauthBusy}>Cancel</Button>
+            <Button variant="primary" onClick={submitPaste} disabled={oauthBusy || !pasteUrl.trim()}>
+              {oauthBusy ? 'Connecting…' : 'Connect'}
+            </Button>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }

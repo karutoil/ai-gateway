@@ -64,6 +64,9 @@ var migration015SQL string
 //go:embed migrations/016_webhook_format.sql
 var migration016SQL string
 
+//go:embed migrations/017_oauth.sql
+var migration017SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -242,6 +245,7 @@ func Migrate(db *sql.DB) error {
 		{14, migration014SQL},
 		{15, migration015SQL},
 		{16, migration016SQL},
+		{17, migration017SQL},
 	}
 
 	for _, m := range migrations {
@@ -418,7 +422,20 @@ func Migrate(db *sql.DB) error {
 	applyUserPermissionsAlters(db)
 	applyKeyRotationAlters(db)
 	applyKeyFeaturesAlters(db)
+	applyOAuthAlters(db)
 	return nil
+}
+
+// applyOAuthAlters adds OAuth credential columns idempotently for DBs
+// created before migration 017, mirroring migrations/017_oauth.sql.
+func applyOAuthAlters(db *sql.DB) {
+	execAlterIdempotent(db, "ALTER TABLE providers ADD COLUMN oauth_def_id TEXT NOT NULL DEFAULT ''")
+	execAlterIdempotent(db, "ALTER TABLE providers ADD COLUMN oauth_refresh_enc BLOB")
+	execAlterIdempotent(db, "ALTER TABLE providers ADD COLUMN oauth_access_enc BLOB")
+	execAlterIdempotent(db, "ALTER TABLE providers ADD COLUMN oauth_expires_at BIGINT")
+	execAlterIdempotent(db, "ALTER TABLE providers ADD COLUMN oauth_email TEXT NOT NULL DEFAULT ''")
+	execAlterIdempotent(db, "ALTER TABLE providers ADD COLUMN oauth_project_id TEXT NOT NULL DEFAULT ''")
+	execCreateIndexIdempotent(db, "idx_providers_oauth_def", "CREATE INDEX IF NOT EXISTS idx_providers_oauth_def ON providers(oauth_def_id)")
 }
 
 // applyKeyFeaturesAlters adds key-management columns (IP allowlist, monthly

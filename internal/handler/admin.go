@@ -407,7 +407,12 @@ func (h *AdminHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "invalid json")
 		return
 	}
-	if body.Name == "" || body.APIKey == "" || body.Type == "" {
+	if body.Name == "" || body.Type == "" {
+		httperr.Invalid(w, "name, type required")
+		return
+	}
+	// OAuth-backed providers (antigravity) connect via browser flow — no key at create time.
+	if body.Type != string(models.ProviderAntigravity) && body.APIKey == "" {
 		httperr.Invalid(w, "name, type, api_key required")
 		return
 	}

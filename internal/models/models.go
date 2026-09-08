@@ -9,6 +9,7 @@ const (
 	ProviderAnthropic        ProviderType = "anthropic"
 	ProviderAzure            ProviderType = "azure"
 	ProviderOpenAICompatible ProviderType = "openai_compatible"
+	ProviderAntigravity      ProviderType = "antigravity"
 )
 
 type Provider struct {
@@ -22,6 +23,12 @@ type Provider struct {
 	LastHealth   *string      `json:"last_health,omitempty"`
 	HealthStatus *string      `json:"health_status,omitempty"`
 	OrgID        *string      `json:"org_id,omitempty"` // nullable, Phase 2.5 scaffold — global when NULL
+	// OAuth status (never secrets): populated for oauth-backed providers.
+	OAuthDefID     string  `json:"oauth_def_id,omitempty"`
+	OAuthEmail     string  `json:"oauth_email,omitempty"`
+	OAuthProject   string  `json:"oauth_project_id,omitempty"`
+	OAuthExpires   *string `json:"oauth_expires_at,omitempty"`
+	OAuthConnected bool    `json:"oauth_connected,omitempty"`
 }
 
 type GatewayKey struct {

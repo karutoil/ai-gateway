@@ -76,7 +76,7 @@ func (s *Store) List() ([]models.Provider, error) {
 		p.APIKey = "***"
 		out = append(out, p)
 	}
-	return out, nil
+	return s.EnrichOAuth(out), nil
 }
 
 func (s *Store) GetByID(id string) (*models.Provider, error) {
@@ -99,6 +99,7 @@ func (s *Store) GetByID(id string) (*models.Provider, error) {
 	if org.Valid {
 		p.OrgID = &org.String
 	}
+	s.loadOAuthMeta(&p)
 	return &p, nil
 }
 
@@ -121,6 +122,7 @@ func (s *Store) GetByName(name string) (*models.Provider, error) {
 	if org.Valid {
 		p.OrgID = &org.String
 	}
+	s.loadOAuthMeta(&p)
 	return &p, nil
 }
 
@@ -146,6 +148,7 @@ func (s *Store) GetByType(t string) (*models.Provider, error) {
 	if org.Valid {
 		p.OrgID = &org.String
 	}
+	s.loadOAuthMeta(&p)
 	return &p, nil
 }
 
@@ -169,6 +172,7 @@ func (s *Store) Default() (*models.Provider, error) {
 	if org.Valid {
 		p.OrgID = &org.String
 	}
+	s.loadOAuthMeta(&p)
 	return &p, nil
 }
 
@@ -259,14 +263,16 @@ func (s *Store) CreateWithOrg(name string, typ models.ProviderType, baseURL stri
 	if name == "" {
 		return nil, fmt.Errorf("provider name required")
 	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("api_key required")
-	}
 	// validate type
 	switch typ {
-	case models.ProviderOpenAI, models.ProviderAnthropic, models.ProviderAzure, models.ProviderOpenAICompatible:
+	case models.ProviderOpenAI, models.ProviderAnthropic, models.ProviderAzure, models.ProviderOpenAICompatible, models.ProviderAntigravity:
 	default:
 		return nil, fmt.Errorf("invalid provider type %s", typ)
+	}
+	// OAuth-backed providers (antigravity) authenticate via browser flow, not a
+	// pasted key — api_key stays empty until OAuth connects.
+	if apiKey == "" && typ != models.ProviderAntigravity {
+		return nil, fmt.Errorf("api_key required")
 	}
 	id := uuid.NewString()
 	enc, err := Encrypt([]byte(apiKey), s.masterKey)
@@ -280,6 +286,8 @@ func (s *Store) CreateWithOrg(name string, typ models.ProviderType, baseURL stri
 			baseURL = "https://api.openai.com/v1"
 		case models.ProviderAnthropic:
 			baseURL = "https://api.anthropic.com"
+		case models.ProviderAntigravity:
+			baseURL = "https://daily-cloudcode-pa.googleapis.com"
 		case models.ProviderAzure:
 			return nil, fmt.Errorf("base_url required for azure provider")
 		}
@@ -384,7 +392,7 @@ func (s *Store) ListForOrg(orgID string) ([]models.Provider, error) {
 	}
 	// Also include providers where org_id is NULL as global shared — for strict isolation, comment out next line
 	// For Phase 3 strict isolation, we filter exactly orgID; above query already includes NULL as shared.
-	return out, nil
+	return s.EnrichOAuth(out), nil
 }
 
 // ListForOrgStrict returns only providers exactly matching org_id (for RBAC gate tests)
@@ -419,7 +427,7 @@ func (s *Store) ListForOrgStrict(orgID string) ([]models.Provider, error) {
 		p.APIKey = "***"
 		out = append(out, p)
 	}
-	return out, nil
+	return s.EnrichOAuth(out), nil
 }
 
 func (s *Store) Delete(id string) error {

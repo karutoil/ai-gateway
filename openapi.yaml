@@ -944,6 +944,54 @@ paths:
                 properties:
                   discovered: { type: array, items: { type: string } }
         '404': { description: provider not found }
+  /api/oauth/providers:
+    get:
+      summary: List registered OAuth provider definitions (generic registry)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: oauth definitions }
+  /api/oauth/start:
+    post:
+      summary: Start OAuth login (returns browser auth_url + single-use state)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: auth_url + state + provider_id }
+  /api/oauth/exchange:
+    post:
+      summary: Complete paste-mode OAuth (pasted localhost callback URL)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: connected }
+  /api/oauth/callback:
+    get:
+      summary: Server-mode OAuth redirect for custom OAuth apps (public, state is the capability)
+      tags: [admin]
+      responses:
+        '302': { description: redirect to /providers }
+  /api/providers/{id}/oauth/status:
+    get:
+      summary: OAuth connection status for a provider
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: connected + email + project }
+  /api/providers/{id}/oauth/refresh:
+    post:
+      summary: Force OAuth token refresh
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: refreshed }
+  /api/providers/{id}/oauth:
+    delete:
+      summary: Disconnect OAuth (clears stored tokens)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: disconnected }
   /api/discover-all:
     post:
       summary: Run discovery across all providers (admin only, audited)
@@ -1275,12 +1323,12 @@ components:
               health_status: { type: string, nullable: true, enum: [up, down, unknown, ""] }
     CreateProvider:
       type: object
-      required: [name, type, api_key]
+      required: [name, type]
       properties:
         name: { type: string, example: openai }
-        type: { type: string, enum: [openai, anthropic, azure, openai_compatible], example: openai }
+        type: { type: string, enum: [openai, anthropic, azure, openai_compatible, antigravity], example: openai }
         base_url: { type: string, example: https://api.openai.com/v1 }
-        api_key: { type: string, example: sk-... }
+        api_key: { type: string, example: sk-... , description: 'Not required for antigravity (OAuth).'}
     CreateKey:
       type: object
       description: All fields optional except none — a key with no name gets key-<uuid8>.

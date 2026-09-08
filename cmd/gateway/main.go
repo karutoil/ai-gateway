@@ -30,6 +30,7 @@ import (
 	"ai-gateway/internal/handler"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
+	_ "ai-gateway/internal/oauth/providers"
 	"ai-gateway/internal/otel"
 	"ai-gateway/internal/passkey"
 	"ai-gateway/internal/pat"
@@ -371,6 +372,10 @@ func main() {
 		DB:       database,
 		Recorder: rec,
 	}
+	oauthHandler := &handler.OAuthHandler{
+		Providers: providerStore,
+		PublicURL: cfg.PublicURL,
+	}
 	r.Route("/api", func(r chi.Router) {
 		// CSRF origin-integrity for cookie-authenticated mutations (bearer-token
 		// API clients are unaffected).
@@ -379,6 +384,7 @@ func main() {
 		// permissions through the user store (live per request).
 		r.Use(middleware.WithPermResolver(userStore))
 		admin.Routes(r)
+		oauthHandler.PublicRoutes(r)
 		// Passkey public endpoints (no auth) — for login via passkey + recovery.
 		// Each credential-verification path gets brute-force limiting.
 		authLimiter := middleware.NewAuthRateLimiter()
@@ -414,6 +420,7 @@ func main() {
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/provider-models/{id}", discoveryHandler.Delete)
 			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/providers/{id}/discover", discoveryHandler.DiscoverProvider)
 			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/discover-all", discoveryHandler.DiscoverAll)
+			oauthHandler.Routes(r)
 			// org scaffold — admin-only, RBAC enforced
 			orgHandler.Routes(r)
 		})

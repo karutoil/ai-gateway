@@ -178,6 +178,16 @@ export const api = {
     remove: (id: string) => req(`/api/providers/${id}`, { method:'DELETE'}),
     discover: (id: string) => req(`/api/providers/${id}/discover`, { method:'POST'}),
   },
+  oauth: {
+    listDefs: (): Promise<{ id: string; name: string; scopes?: string[] }[]> => req('/api/oauth/providers'),
+    start: (def_id: string, provider_name?: string, provider_id?: string) =>
+      req('/api/oauth/start', { method:'POST', body: JSON.stringify({ def_id, provider_name, provider_id }) }) as Promise<{ auth_url: string; state: string; provider_id: string; provider_name: string; mode: string; redirect_uri: string }>,
+    exchange: (data: { state: string; provider_id?: string; callback_url?: string; code?: string }) =>
+      req('/api/oauth/exchange', { method:'POST', body: JSON.stringify(data) }) as Promise<{ ok: boolean; provider_id: string; email?: string; project_id?: string }>,
+    status: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth/status`) as Promise<{ provider_id: string; connected: boolean; def_id?: string; email?: string; project_id?: string; expires_at?: string | null }>,
+    refresh: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth/refresh`, { method:'POST' }),
+    disconnect: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth`, { method:'DELETE' }),
+  },
   lb: {
     listRules: (): Promise<LBRule[]> => req('/api/lb/rules'),
     // PUT is an upsert: replaces the member set and strategy for the model.
