@@ -431,6 +431,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) VerifyRecovery(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		Username     string `json:"username"`
 		Code         string `json:"code"`
@@ -447,7 +448,7 @@ func (h *Handler) VerifyRecovery(w http.ResponseWriter, r *http.Request) {
 	}
 	u, _, err := h.UserStore.GetByUsername(body.Username)
 	if err != nil {
-		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+		http.Error(w, `{"error":"invalid recovery code"}`, http.StatusUnauthorized)
 		return
 	}
 	ok, _ := h.UserStore.VerifyRecoveryCode(u.ID, code)

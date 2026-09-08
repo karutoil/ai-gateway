@@ -50,10 +50,14 @@ func NewRedisCacheWithClient(client *redis.Client) *RedisCache {
 	return &RedisCache{client: client}
 }
 
+func cacheKey(key string) string {
+	return "gwcache:" + key
+}
+
 func (r *RedisCache) Get(key string) ([]byte, int, http.Header, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()
-	data, err := r.client.Get(ctx, key).Bytes()
+	data, err := r.client.Get(ctx, cacheKey(key)).Bytes()
 	if err != nil {
 		if err != redis.Nil {
 			log.Debug().Err(err).Str("key", key).Msg("redis Get failed")
@@ -63,6 +67,7 @@ func (r *RedisCache) Get(key string) ([]byte, int, http.Header, bool) {
 	var e redisEntry
 	if err := json.Unmarshal(data, &e); err != nil {
 		log.Debug().Err(err).Msg("redis unmarshal failed")
+		_ = r.client.Del(ctx, cacheKey(key)).Err()
 		return nil, 0, nil, false
 	}
 	return e.Body, e.Status, e.Headers, true
@@ -80,7 +85,7 @@ func (r *RedisCache) Set(key string, body []byte, status int, headers http.Heade
 		log.Debug().Err(err).Msg("redis marshal failed")
 		return
 	}
-	if err := r.client.Set(ctx, key, data, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
+	if err := r.client.Set(ctx, cacheKey(key), data, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
 		log.Debug().Err(err).Str("key", key).Msg("redis Set failed")
 	}
 }
@@ -91,9 +96,9 @@ func (r *RedisCache) Invalidate(pattern string) {
 
 	var match string
 	if pattern == "*" {
-		match = "*"
+		match = "gwcache:*"
 	} else {
-		match = pattern + "*"
+		match = "gwcache:" + pattern + "*"
 	}
 	iter := r.client.Scan(ctx, 0, match, 100).Iterator()
 	var keys []string

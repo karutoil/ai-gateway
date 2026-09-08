@@ -50,6 +50,9 @@ func RedactHeaders(h http.Header) http.Header {
 	if out.Get("X-API-Key") != "" {
 		out.Set("X-API-Key", "[REDACTED]")
 	}
+	if out.Get("api-key") != "" {
+		out.Set("api-key", "[REDACTED]")
+	}
 	return out
 }
 
@@ -220,11 +223,13 @@ func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker
 			if len(jwtSecret) > 0 {
 				claims, err := auth.VerifyToken(jwtSecret, token)
 				if err == nil && claims != nil {
-					subject := "admin"
-					orgID := ""
-					if v, ok := claims["sub"].(string); ok && v != "" {
-						subject = v
+					sub, ok := claims["sub"].(string)
+					if !ok || sub == "" {
+						http.Error(w, `{"error":{"message":"invalid api key","type":"authentication_error"}}`, http.StatusUnauthorized)
+						return
 					}
+					subject := sub
+					orgID := ""
 					if v, ok := claims["org_id"].(string); ok {
 						orgID = v
 					}

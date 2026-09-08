@@ -1,6 +1,8 @@
 package resilience
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"math"
 	"time"
 )
@@ -40,7 +42,15 @@ func (p *DefaultRetryPolicy) Backoff(attempt int) time.Duration {
 	if d > float64(time.Second) {
 		d = float64(time.Second)
 	}
-	return time.Duration(d)
+	// Equal jitter: sleep d/2 + [0, d/2] so concurrent replicas do not
+	// retry in lockstep and amplify upstream 429/5xx episodes.
+	half := d / 2
+	var jitter float64
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		jitter = float64(binary.LittleEndian.Uint64(b[:])) / float64(^uint64(0)) * half
+	}
+	return time.Duration(half + jitter)
 }
 
 var _ RetryPolicy = (*DefaultRetryPolicy)(nil)

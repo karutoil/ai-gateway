@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-gateway/internal/db"
@@ -24,6 +25,7 @@ type Limiter interface {
 
 // MemoryLimiter is used in unit tests for quota enforcement without DB
 type MemoryLimiter struct {
+	mu              sync.Mutex
 	DailyTokenLimit int
 	tokensUsed      map[string]int
 	lastReset       map[string]time.Time
@@ -37,6 +39,8 @@ func (m *MemoryLimiter) Check(prefix string, promptTokens int) error {
 	if m.DailyTokenLimit <= 0 {
 		return nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	now := time.Now()
 	if last, ok := m.lastReset[prefix]; !ok || now.Sub(last) >= 24*time.Hour {
 		m.tokensUsed[prefix] = 0
@@ -51,6 +55,8 @@ func (m *MemoryLimiter) Check(prefix string, promptTokens int) error {
 }
 
 func (m *MemoryLimiter) RecordUsage(prefix string, tokens int, _ int, _ time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tokensUsed[prefix] += tokens
 }
 

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/pat"
 	"ai-gateway/internal/rbac"
 
 	"github.com/rs/zerolog/log"
@@ -114,7 +115,7 @@ func RequireAnyPerm(permissions ...string) func(http.Handler) http.Handler {
 				http.Error(w, `{"error":{"message":"forbidden: missing role","type":"permission_error"}}`, http.StatusForbidden)
 				return
 			}
-			if role == rbac.RoleAdmin {
+			if role == rbac.RoleAdmin && auth.PATScopes(r) == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -130,6 +131,7 @@ func RequireAnyPerm(permissions ...string) func(http.Handler) http.Handler {
 				http.Error(w, `{"error":{"message":"forbidden: permission resolution failed","type":"permission_error"}}`, http.StatusForbidden)
 				return
 			}
+			perms = pat.CheckScopes(perms, auth.PATScopes(r))
 			r = r.WithContext(auth.WithPerms(r.Context(), perms))
 			for _, p := range permissions {
 				if rbac.Has(perms, p) {
@@ -161,7 +163,7 @@ func RequirePerm(permission string) func(http.Handler) http.Handler {
 				http.Error(w, `{"error":{"message":"forbidden: missing role","type":"permission_error"}}`, http.StatusForbidden)
 				return
 			}
-			if role == rbac.RoleAdmin {
+			if role == rbac.RoleAdmin && auth.PATScopes(r) == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -177,6 +179,7 @@ func RequirePerm(permission string) func(http.Handler) http.Handler {
 				http.Error(w, `{"error":{"message":"forbidden: permission resolution failed","type":"permission_error"}}`, http.StatusForbidden)
 				return
 			}
+			perms = pat.CheckScopes(perms, auth.PATScopes(r))
 			r = r.WithContext(auth.WithPerms(r.Context(), perms))
 			if !rbac.Has(perms, permission) {
 				log.Warn().Str("perm", permission).Str("role", role).Str("path", r.URL.Path).Msg("RequirePerm: forbid")

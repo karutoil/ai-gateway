@@ -51,10 +51,12 @@ func PrefixOf(raw string) string {
 	return raw[:min(len(raw), 8)]
 }
 
-func Generate() string {
+func Generate() (string, error) {
 	b := make([]byte, 24)
-	_, _ = rand.Read(b)
-	return prefix + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(b), nil
 }
 
 // Create mints a token for the user. expiresAt nil = no expiry. scopes: ""
@@ -62,14 +64,17 @@ func Generate() string {
 // comma-separated allowlist of permission names (intersected with the
 // user's effective set — a scope can never exceed the user's rights).
 func (s *Store) Create(userID, name string, expiresAt *time.Time, scopes string) (*Token, string, error) {
-	raw := Generate()
+	raw, err := Generate()
+	if err != nil {
+		return nil, "", err
+	}
 	id := uuid.NewString()
 	now := time.Now().UTC()
 	var exp any
 	if expiresAt != nil {
 		exp = expiresAt.UTC()
 	}
-	_, err := s.db.Exec(db.Q(`INSERT INTO personal_access_tokens
+	_, err = s.db.Exec(db.Q(`INSERT INTO personal_access_tokens
 		(id, user_id, name, hash, prefix, scopes, expires_at, created_at)
 		VALUES (?,?,?,?,?,?,?,?)`),
 		id, userID, name, Hash(raw), PrefixOf(raw), strings.TrimSpace(scopes), exp, now)

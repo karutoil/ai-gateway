@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -296,7 +297,7 @@ func GatewayRateLimitWithLimits(rl Limiter, getLimits func(r *http.Request) Rate
 					prefix = r.Header.Get("X-Gateway-Key-Prefix")
 				}
 				if prefix == "" {
-					prefix = r.RemoteAddr
+					prefix = "ip:" + remoteHost(r)
 				}
 				if !rl.AllowWithLimits(prefix, limits) {
 					retry := "60"
@@ -324,7 +325,7 @@ func GatewayRateLimitWithLimits(rl Limiter, getLimits func(r *http.Request) Rate
 				}
 			}
 			if prefix == "" {
-				prefix = r.RemoteAddr
+				prefix = "ip:" + remoteHost(r)
 			}
 			limits := getLimits(r)
 			if !rl.AllowWithLimits(prefix, limits) {
@@ -341,4 +342,15 @@ func GatewayRateLimitWithLimits(rl Limiter, getLimits func(r *http.Request) Rate
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// remoteHost returns the host-only direct peer address for rate-limit
+// bucketing. Using RemoteAddr verbatim would include the ephemeral client
+// port, giving each TCP connection its own bucket and defeating limits.
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return strings.TrimSpace(r.RemoteAddr)
+	}
+	return host
 }

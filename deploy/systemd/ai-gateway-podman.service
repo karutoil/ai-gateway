@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Gateway production podman compose stack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/ai-gateway/deploy/production
+ExecStart=/usr/bin/podman compose -f podman-compose.prod.yml up -d --build
+ExecStop=/usr/bin/podman compose -f podman-compose.prod.yml down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

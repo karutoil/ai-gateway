@@ -18,10 +18,23 @@ import (
 
 const prefix = "sk-gw-"
 
-func Generate() string {
+func Generate() (string, error) {
 	b := make([]byte, 32)
-	rand.Read(b)
-	return prefix + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(b), nil
+}
+
+// MustGenerate preserves the legacy no-error signature for tests and
+// non-critical paths by panicking only on CSPRNG failure (which indicates
+// a broken host RNG and should never be silently ignored).
+func MustGenerate() string {
+	s, err := Generate()
+	if err != nil {
+		panic("apikey: crypto/rand failure: " + err.Error())
+	}
+	return s
 }
 
 func Hash(key string) string {
@@ -56,7 +69,10 @@ func (s *Store) Create(name string) (*models.GatewayKey, error) {
 // user that created it (the keys:read_own ownership anchor); empty means
 // unowned (visible only to keys:read holders and admins).
 func (s *Store) CreateWithOrg(name, orgID string, createdBy ...string) (*models.GatewayKey, error) {
-	raw := Generate()
+	raw, err := Generate()
+	if err != nil {
+		return nil, err
+	}
 	hash := Hash(raw)
 	pfx := Prefix(raw)
 	id := uuid.NewString()
@@ -65,7 +81,7 @@ func (s *Store) CreateWithOrg(name, orgID string, createdBy ...string) (*models.
 	if len(createdBy) > 0 {
 		owner = createdBy[0]
 	}
-	_, err := s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm,org_id,created_by) VALUES(?,?,?,?,?,?,?,?)`), id, name, pfx, hash, now, 60, sql.NullString{String: orgID, Valid: orgID != ""}, sql.NullString{String: owner, Valid: owner != ""})
+	_, err = s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm,org_id,created_by) VALUES(?,?,?,?,?,?,?,?)`), id, name, pfx, hash, now, 60, sql.NullString{String: orgID, Valid: orgID != ""}, sql.NullString{String: owner, Valid: owner != ""})
 	if err != nil && (strings.Contains(err.Error(), "created_by") || strings.Contains(err.Error(), "org_id")) {
 		_, err = s.db.Exec(db.Q(`INSERT INTO gateway_keys(id,name,prefix,hash,created_at,rate_limit_rpm,org_id) VALUES(?,?,?,?,?,?,?)`), id, name, pfx, hash, now, 60, sql.NullString{String: orgID, Valid: orgID != ""})
 	}
@@ -418,7 +434,10 @@ const RotationGraceWindow = 24 * time.Hour
 // (still authenticating during the grace window); the fresh secret is
 // returned raw, exactly once — only hashes are ever stored.
 func (s *Store) Rotate(id string) (*models.GatewayKey, string, error) {
-	raw := Generate()
+	raw, err := Generate()
+	if err != nil {
+		return nil, "", err
+	}
 	newHash := Hash(raw)
 	now := time.Now().UTC()
 

@@ -552,6 +552,7 @@ func (h *AdminHandler) ListAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) TestProvider(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		Type    string `json:"type"`
 		BaseURL string `json:"base_url"`
@@ -1424,6 +1425,7 @@ func (h *AdminHandler) UpdateKeyRateLimit(w http.ResponseWriter, r *http.Request
 	if !h.requireWriteTarget(w, r, "gateway_keys", id) {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		RPM *int `json:"rpm"`
 		RPH *int `json:"rph"`
@@ -1486,6 +1488,7 @@ func (h *AdminHandler) UpdateKeyLimits(w http.ResponseWriter, r *http.Request) {
 	if !h.requireWriteTarget(w, r, "gateway_keys", id) {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		RPM              *int      `json:"rpm"`
 		RPH              *int      `json:"rph"`
@@ -1577,6 +1580,7 @@ func (h *AdminHandler) UpdateKey(w http.ResponseWriter, r *http.Request) {
 	if !h.requireWriteTarget(w, r, "gateway_keys", id) {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		Name string `json:"name"`
 	}

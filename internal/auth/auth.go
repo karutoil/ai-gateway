@@ -63,7 +63,7 @@ func MakeTokenFull(secret []byte, subject, orgID, role string, tokenVersion int6
 		return "", fmt.Errorf("invalid role %q", role)
 	}
 	if subject == "" {
-		subject = "unknown"
+		return "", fmt.Errorf("empty subject")
 	}
 	claims := jwt.MapClaims{
 		"sub":    subject,

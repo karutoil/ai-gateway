@@ -188,6 +188,7 @@ func GatewayHTTPClient(transport *http.Transport) *http.Client {
 				if prev.URL.Host != req.URL.Host {
 					req.Header.Del("Authorization")
 					req.Header.Del("x-api-key")
+					req.Header.Del("api-key")
 					req.Header.Del("Cookie")
 					req.Header.Del("Cookie2")
 				}

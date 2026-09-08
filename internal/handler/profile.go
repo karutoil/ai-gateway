@@ -65,6 +65,7 @@ func (h *ProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	u, _, err := h.Store.GetByUsername(sub)
 	if err != nil {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
@@ -93,6 +94,7 @@ func (h *ProfileHandler) ChangePassword(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	u, _, err := h.Store.GetByUsername(sub)
 	if err != nil {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)

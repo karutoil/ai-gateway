@@ -8,6 +8,14 @@
 # Stop:    podman compose -f podman-compose.prod.yml down
 # Logs:    podman logs -f ai-gateway-prod
 #
+# Auto-start on reboot: install and enable deploy/systemd/ai-gateway-podman.service
+# as a user service (lingering is already on for this host). It runs
+# `compose up -d --build` at boot; `restart: unless-stopped` below is the
+# second layer via podman-restart.service.
+#   cp deploy/systemd/ai-gateway-podman.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ai-gateway-podman.service
+#
 # Point your Cloudflare Tunnel at http://localhost:8090.
 
 services:

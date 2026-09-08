@@ -458,13 +458,25 @@ func normalizeFinishReason(v interface{}) string {
 func toInt(v interface{}) int {
 	switch x := v.(type) {
 	case float64:
+		if x < 0 {
+			return 0
+		}
 		return int(x)
 	case int:
+		if x < 0 {
+			return 0
+		}
 		return x
 	case int64:
+		if x < 0 {
+			return 0
+		}
 		return int(x)
 	case json.Number:
 		i, _ := x.Int64()
+		if i < 0 {
+			return 0
+		}
 		return int(i)
 	}
 	return 0
@@ -1646,7 +1658,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 	harvest := func(frame []byte) {
 		events := parseSSEEvents(frame)
 		for _, ev := range events {
-			if sample.Cap() > 0 && sample.Len() < sampleCap {
+			if sampleCap > 0 && sample.Len() < sampleCap {
 				snapshot := make([]byte, 0, len(ev.data)+len(ev.name)+16)
 				if ev.name != "" {
 					snapshot = append(snapshot, []byte(ev.name+": ")...)
@@ -1654,7 +1666,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 				snapshot = append(snapshot, ev.data...)
 				snapshot = append(snapshot, '\n')
 				if sample.Len()+len(snapshot) > sampleCap {
-					snapshot = snapshot[:sample.Cap()-sample.Len()]
+					snapshot = snapshot[:sampleCap-sample.Len()]
 				}
 				sample.Write(snapshot)
 			}
@@ -1760,6 +1772,8 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 	for {
 		select {
 		case <-r.Context().Done():
+			resp.Body.Close()
+			drainChan(chunks)
 			return fail("gateway client disconnected", true)
 
 		case <-watchdogC:

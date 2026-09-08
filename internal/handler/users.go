@@ -231,6 +231,7 @@ func (h *UsersHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"forbidden: admin only"}`, http.StatusForbidden)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body struct {
 		Username    string `json:"username"`
 		Password    string `json:"password"`
@@ -270,6 +271,7 @@ func (h *UsersHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	id := chi.URLParam(r, "id")
 	var body struct {
 		Role        *string `json:"role"`
@@ -384,6 +386,7 @@ func (h *UsersHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	id := chi.URLParam(r, "id")
 	var body struct {
 		Password string `json:"password"`

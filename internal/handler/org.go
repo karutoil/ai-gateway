@@ -62,7 +62,7 @@ func (h *OrgHandler) CreateOrg(w http.ResponseWriter, r *http.Request) {
 	id := uuid.NewString()
 	now := time.Now().UTC()
 	if _, err := h.DB.Exec(db.Q(`INSERT INTO organizations(id,name,created_at) VALUES(?,?,?)`), id, body.Name, now); err != nil {
-		http.Error(w, `{"error":{"message":"create failed: `+err.Error()+`","type":"proxy_error"}}`, http.StatusBadRequest)
+		http.Error(w, `{"error":{"message":"create failed","type":"proxy_error"}}`, http.StatusBadRequest)
 		return
 	}
 	if h.Recorder != nil {

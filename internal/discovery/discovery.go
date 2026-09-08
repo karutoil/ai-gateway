@@ -119,7 +119,7 @@ func (s *Service) fetchOpenAI(p *models.Provider, apiKey string) []rawModel {
 			}
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 		resp.Body.Close()
 		var list rawModelList
 		if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {
@@ -166,7 +166,7 @@ func (s *Service) fetchAzure(p *models.Provider, apiKey string) []rawModel {
 			}
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 		resp.Body.Close()
 		var list rawModelList
 		if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {
@@ -215,7 +215,7 @@ func (s *Service) fetchAnthropic(p *models.Provider, apiKey string) []rawModel {
 		}
 		return nil
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 	resp.Body.Close()
 	var list rawModelList
 	if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {

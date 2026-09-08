@@ -437,6 +437,7 @@ func extractAnthropicToolUseToOpenAI(content interface{}) (interface{}, interfac
 	var textParts []string
 	var toolCalls []map[string]interface{}
 	var remaining []interface{}
+	synthIdx := 0
 	for _, item := range arr {
 		if m, ok := item.(map[string]interface{}); ok {
 			switch m["type"] {
@@ -456,7 +457,8 @@ func extractAnthropicToolUseToOpenAI(content interface{}) (interface{}, interfac
 					argStr = string(argBytes)
 				}
 				if id == "" {
-					id = "call_" + name
+					id = fmt.Sprintf("call_%s_%d", name, synthIdx)
+					synthIdx++
 				}
 				toolCalls = append(toolCalls, map[string]interface{}{
 					"id":   id,
@@ -788,7 +790,7 @@ func convertOpenAIAssistantToAnthropic(m OpenAIMessage) AnthropicMessage {
 		b, _ := json.Marshal(m.ToolCalls)
 		var tcs []map[string]interface{}
 		if json.Unmarshal(b, &tcs) == nil {
-			for _, tc := range tcs {
+			for i, tc := range tcs {
 				id, _ := tc["id"].(string)
 				fn, _ := tc["function"].(map[string]interface{})
 				if fn == nil {
@@ -812,7 +814,7 @@ func convertOpenAIAssistantToAnthropic(m OpenAIMessage) AnthropicMessage {
 					input = map[string]interface{}{}
 				}
 				if id == "" {
-					id = "toolu_" + name
+					id = fmt.Sprintf("toolu_%s_%d", name, i)
 				}
 				contentBlocks = append(contentBlocks, map[string]interface{}{
 					"type":  "tool_use",
