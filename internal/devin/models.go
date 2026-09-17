@@ -2,6 +2,7 @@ package devin
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -57,9 +58,11 @@ func FromOpenAI(openAIJSON []byte, model string) (ChatInput, error) {
 				out.Messages = append(out.Messages, WireMessage{Role: WireRoleChat, Text: t})
 			}
 		case "assistant":
-			if t := openAIText(m["content"]); strings.TrimSpace(t) != "" {
-				out.Messages = append(out.Messages, WireMessage{Role: WireRoleChat, Text: t})
-			}
+			// One OpenAI assistant turn is ONE wire prompt: text and its
+			// tool calls travel together. Splitting them (text turn + one
+			// turn per call) breaks the backend's turn tracking and the
+			// follow-up tool calls come back malformed.
+			wm := WireMessage{Role: WireRoleChat, Text: openAIText(m["content"])}
 			for _, tc := range asSlice(m["tool_calls"]) {
 				tcm, _ := tc.(map[string]any)
 				if tcm == nil {
@@ -70,6 +73,9 @@ func FromOpenAI(openAIJSON []byte, model string) (ChatInput, error) {
 					continue
 				}
 				name, _ := fn["name"].(string)
+				if strings.TrimSpace(name) == "" {
+					continue
+				}
 				args := "{}"
 				switch a := fn["arguments"].(type) {
 				case string:
@@ -82,12 +88,16 @@ func FromOpenAI(openAIJSON []byte, model string) (ChatInput, error) {
 					}
 				}
 				id, _ := tcm["id"].(string)
-				out.Messages = append(out.Messages, WireMessage{
-					Role: WireRoleChat,
-					ToolCalls: []WireToolCall{
-						{ID: id, Name: name, ArgumentsJSON: args},
-					},
-				})
+				if strings.TrimSpace(id) == "" {
+					// The backend echoes ids back to pair results; an
+					// empty id echoes as empty and breaks downstream
+					// grouping for parallel calls.
+					id = fmt.Sprintf("call_upstream_%d_%d", len(out.Messages), len(wm.ToolCalls))
+				}
+				wm.ToolCalls = append(wm.ToolCalls, WireToolCall{ID: id, Name: name, ArgumentsJSON: args})
+			}
+			if strings.TrimSpace(wm.Text) != "" || len(wm.ToolCalls) > 0 {
+				out.Messages = append(out.Messages, wm)
 			}
 		case "tool":
 			id, _ := m["tool_call_id"].(string)
@@ -115,8 +125,19 @@ func FromOpenAI(openAIJSON []byte, model string) (ChatInput, error) {
 		desc, _ := fn["description"].(string)
 		params := "{}"
 		if p := fn["parameters"]; p != nil {
-			if b, err := json.Marshal(p); err == nil {
-				params = string(b)
+			switch v := p.(type) {
+			case string:
+				// Loose SDKs send the schema pre-stringified; using it
+				// verbatim preserves the object, while re-marshaling
+				// would double-encode it into a string literal the
+				// backend cannot parse as a schema.
+				if s := strings.TrimSpace(v); s != "" && json.Valid([]byte(s)) {
+					params = s
+				}
+			default:
+				if b, err := json.Marshal(p); err == nil {
+					params = string(b)
+				}
 			}
 		}
 		out.Tools = append(out.Tools, ToolDef{Name: name, Description: desc, Parameters: params})
@@ -157,7 +178,9 @@ func openAIText(v any) string {
 				continue
 			}
 			typ, _ := m["type"].(string)
-			if typ != "text" && typ != "input_text" {
+			// Responses-normalized histories replay assistant text as
+			// output_text/refusal parts; dropping them loses the turn.
+			if typ != "text" && typ != "input_text" && typ != "output_text" && typ != "refusal" {
 				continue
 			}
 			if s, _ := m["text"].(string); s != "" {

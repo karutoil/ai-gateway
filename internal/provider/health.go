@@ -87,9 +87,17 @@ func checkAll(db *sql.DB, store *Store) {
 			// anthropic: try to ping /v1/models with x-api-key if possible, otherwise mark unknown
 			key, err := store.DecryptKey(&p)
 			if err == nil {
-				targetModels := strings.TrimRight(target, "/") + "/v1/models"
-				if strings.HasSuffix(target, "/v1/models") {
-					targetModels = target
+				baseModels := strings.TrimRight(target, "/")
+				var targetModels string
+				switch {
+				case strings.HasSuffix(baseModels, "/v1/models"):
+					targetModels = baseModels
+				case strings.Contains(baseModels, "/v1"):
+					// Base already carries a version prefix (e.g. https://ckff.dev/v1):
+					// appending another /v1 would build /v1/v1/models (404).
+					targetModels = baseModels + "/models"
+				default:
+					targetModels = baseModels + "/v1/models"
 				}
 				req, _ := http.NewRequest("GET", targetModels, nil)
 				req.Header.Set("x-api-key", key)
@@ -222,9 +230,12 @@ func checkAll(db *sql.DB, store *Store) {
 				// /v1/messages. If the OpenAI probe did not establish health,
 				// try the Anthropic dialect before declaring down.
 				if !success && isMultiProtocolBase(p.BaseURL, p.Name) {
-					anthTarget := strings.TrimRight(target, "/") + "/v1/models"
-					if strings.HasSuffix(target, "/v1/models") {
-						anthTarget = target
+					baseAnth := strings.TrimRight(target, "/")
+					anthTarget := baseAnth + "/v1/models"
+					if strings.HasSuffix(baseAnth, "/v1/models") {
+						anthTarget = baseAnth
+					} else if strings.Contains(baseAnth, "/v1") {
+						anthTarget = baseAnth + "/models"
 					}
 					if req, _ := http.NewRequest("GET", anthTarget, nil); req != nil {
 						req.Header.Set("x-api-key", key)

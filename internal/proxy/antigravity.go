@@ -630,9 +630,11 @@ func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, _ *http.Req
 // dialect. Shared by OAuth transports; costFn maps usage to USD.
 func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
 	var texts []string
+	var toolCalls []antigravity.ParsedToolCall
 	prompt, completion := 0, 0
 	for _, c := range chunks {
 		texts = append(texts, c.Texts...)
+		toolCalls = append(toolCalls, c.ToolCalls...)
 		if c.Usage.HasUsage {
 			prompt, completion = c.Usage.Input, c.Usage.Output
 		}
@@ -640,10 +642,19 @@ func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigra
 	text := strings.Join(texts, "")
 	cost := costFn(prompt, completion)
 	respID := "resp_" + uuid.NewString()
+	output := []any{map[string]any{"type": "message", "id": "msg_" + uuid.NewString()[:8], "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}, "status": "completed"}}
+	for _, tc := range toolCalls {
+		args, _ := json.Marshal(tc.Arguments)
+		output = append(output, map[string]any{
+			"type": "function_call", "id": "fc_" + uuid.NewString()[:8],
+			"call_id": tc.ID, "name": tc.Name, "arguments": string(args),
+			"status": "completed",
+		})
+	}
 	if !isStream {
 		out := map[string]any{
 			"id": respID, "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "completed",
-			"output": []any{map[string]any{"type": "message", "id": "msg_" + uuid.NewString()[:8], "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}, "status": "completed"}},
+			"output": output,
 			"usage":  map[string]any{"input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion},
 		}
 		b, _ := json.Marshal(out)
@@ -674,6 +685,18 @@ func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigra
 	}
 	emit(map[string]any{"type": "response.content_part.done", "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}}})
 	emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": itemID, "type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}, "status": "completed"}})
-	emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": respID, "model": model, "status": "completed", "usage": map[string]any{"input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion}}})
+	for i, tc := range toolCalls {
+		args, _ := json.Marshal(tc.Arguments)
+		fcID := "fc_" + uuid.NewString()[:8]
+		outIdx := i + 1
+		fcItem := map[string]any{"id": fcID, "type": "function_call", "call_id": tc.ID, "name": tc.Name, "arguments": "", "status": "in_progress"}
+		emit(map[string]any{"type": "response.output_item.added", "output_index": outIdx, "item": fcItem})
+		emit(map[string]any{"type": "response.function_call_arguments.delta", "output_index": outIdx, "item_id": fcID, "delta": string(args)})
+		emit(map[string]any{"type": "response.function_call_arguments.done", "output_index": outIdx, "item_id": fcID, "arguments": string(args)})
+		fcItem["arguments"] = string(args)
+		fcItem["status"] = "completed"
+		emit(map[string]any{"type": "response.output_item.done", "output_index": outIdx, "item": fcItem})
+	}
+	emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": respID, "model": model, "status": "completed", "output": output, "usage": map[string]any{"input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion}}})
 	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
 }

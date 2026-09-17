@@ -28,8 +28,11 @@ handler, route, migration, or UI changes.
    URL from the address bar.
 3. Paste it into the Connect modal → gateway exchanges the code for a session
    token, stores it encrypted, discovers models.
-4. Use models as `devin/swe-1-7`, `devin/swe-1-6`, etc.
+4. Use models as `devin/swe-2`, `devin/swe-1-7`, `devin/swe-1-6`, etc.
    via `/v1/chat/completions`, `/v1/messages`, or `/v1/responses`.
+   Model availability varies per account: if `swe-2` returns a backend
+   internal error, refresh the model list and use the newest model your
+   account reports (e.g. `swe-1-7`).
 
 Devin tokens are long-lived; refresh is a no-op that keeps the same
 credentials. Health probes the session with a user-JWT request. Devin bills

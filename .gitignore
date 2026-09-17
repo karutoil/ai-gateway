@@ -10,6 +10,8 @@ data/
 .env
 .env.local
 .env.*.local
+.env.bak*
+*.bak
 
 # Database backups (live snapshots; root backups/ and deploy/backups/)
 backups/

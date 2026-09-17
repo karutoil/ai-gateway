@@ -173,6 +173,265 @@ func (s *Store) GetByShortID(shortID string) (*models.CatalogModel, error) {
 	return &m, nil
 }
 
+// NormalizeModelID strips reseller channel tags and routing prefixes,
+// returning the bare upstream slug ("[aws][量] grok-4.6" -> "grok-4.6").
+// Reseller upstreams decorate every model ID with billing-channel markers
+// ("[Kiro3][正价] claude-opus-4-6 [不补]"); without stripping, no catalog
+// lookup can match and discovery records zero context, pricing and
+// capability flags. When several whitespace-separated tokens remain, the
+// last one wins: decorations lead ("[tag] slug"), never trail, unbracketed.
+func NormalizeModelID(id string) string {
+	s := strings.TrimSpace(id)
+	for {
+		changed := false
+		for strings.HasPrefix(s, "[") {
+			end := strings.Index(s, "]")
+			if end < 0 {
+				break
+			}
+			s = strings.TrimSpace(s[end+1:])
+			changed = true
+		}
+		for strings.HasSuffix(s, "]") {
+			start := strings.LastIndex(s, "[")
+			if start < 0 {
+				break
+			}
+			s = strings.TrimSpace(s[:start])
+			changed = true
+		}
+		// Gateway routing prefix ("oc1/slug", "ck-default/[aws] slug").
+		if i := strings.LastIndex(s, "/"); i >= 0 && i+1 < len(s) {
+			if tail := strings.TrimSpace(s[i+1:]); tail != "" && tail != s {
+				s = tail
+				changed = true
+			}
+		}
+		if !changed || s == "" {
+			break
+		}
+	}
+	if f := strings.Fields(s); len(f) > 1 {
+		s = f[len(f)-1]
+	}
+	return s
+}
+
+// signalsThinking reports whether a model slug names a reasoning variant.
+func signalsThinking(slug string) bool {
+	return strings.Contains(strings.ToLower(slug), "think")
+}
+
+// ensureReasoning forces the reasoning flag on a catalog row matched for a
+// thinking-named slug whose base row is not flagged (e.g. only the
+// non-thinking base exists in the snapshot).
+func ensureReasoning(m *models.CatalogModel) *models.CatalogModel {
+	if m == nil {
+		return nil
+	}
+	m.Reasoning = true
+	if m.ReasoningType == "" || m.ReasoningType == "none" {
+		m.ReasoningType = "toggle"
+		m.ReasoningLevels = `["off","on"]`
+		if m.ReasoningOutputLimits == "" {
+			m.ReasoningOutputLimits = "{}"
+		}
+	}
+	return m
+}
+
+// thinkAlternates proposes the alternate "-think"/"-thinking" spelling:
+// the catalog snapshot mixes both ("x-think" vs upstream "x-thinking").
+func thinkAlternates(slug string) []string {
+	low := strings.ToLower(slug)
+	if strings.HasSuffix(low, "-thinking") {
+		return []string{slug[:len(slug)-3]}
+	}
+	if strings.HasSuffix(low, "-think") {
+		return []string{slug + "ing"}
+	}
+	return nil
+}
+
+// cutThinkingSuffix strips a trailing "-thinking"/"-think", reporting the base.
+func cutThinkingSuffix(slug string) (string, bool) {
+	low := strings.ToLower(slug)
+	if strings.HasSuffix(low, "-thinking") {
+		return slug[:len(slug)-len("-thinking")], true
+	}
+	if strings.HasSuffix(low, "-think") {
+		return slug[:len(slug)-len("-think")], true
+	}
+	return "", false
+}
+
+// vAlternates proposes "-vN" <-> "-N" spelling variants
+// ("deepseek-3.2" vs catalog "deepseek-v3.2").
+func vAlternates(slug string) []string {
+	var out []string
+	if stripped := stripVPrefix(slug); stripped != slug {
+		out = append(out, stripped)
+	}
+	if inserted := insertVPrefix(slug); inserted != slug {
+		out = append(out, inserted)
+	}
+	return out
+}
+
+func stripVPrefix(slug string) string {
+	var b strings.Builder
+	for i := 0; i < len(slug); {
+		if slug[i] == '-' && i+2 < len(slug) && slug[i+1] == 'v' && slug[i+2] >= '0' && slug[i+2] <= '9' {
+			b.WriteByte('-')
+			i += 2
+			continue
+		}
+		b.WriteByte(slug[i])
+		i++
+	}
+	return b.String()
+}
+
+func insertVPrefix(slug string) string {
+	for i := 0; i+1 < len(slug); i++ {
+		if slug[i] == '-' && slug[i+1] >= '0' && slug[i+1] <= '9' {
+			return slug[:i+1] + "v" + slug[i+1:]
+		}
+	}
+	return slug
+}
+
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	return strings.ReplaceAll(s, `_`, `\_`)
+}
+
+// FindBestMatch resolves a (possibly reseller-tagged) model ID to the closest
+// catalog row. It returns the match kind:
+//
+//	"exact"      — verbatim or provider-suffix match, same as Get/GetByShortID
+//	"normalized" — match after stripping channel tags ("[aws] grok-4.6")
+//	"wildcard"   — approximate: think/think spelling, "-vN" variant,
+//	               thinking base, or dated-version containment
+//	               ("claude-opus-4-1" -> "…/claude-opus-4-1-20250805")
+//
+// Callers should record "wildcard" distinctly (provider_models.source =
+// "enriched-wildcard") so estimated pricing is distinguishable from exact
+// catalog data. Unknown slugs return sql.ErrNoRows.
+func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, error) {
+	if m, sub := s.trySlug(modelID, signalsThinking(modelID)); m != nil {
+		if sub == "" {
+			return m, "exact", nil
+		}
+		return m, "wildcard", nil
+	}
+	norm := NormalizeModelID(modelID)
+	if norm == "" {
+		return nil, "", sql.ErrNoRows
+	}
+	thinking := signalsThinking(norm)
+	if norm != strings.TrimSpace(modelID) {
+		if m, sub := s.trySlug(norm, thinking); m != nil {
+			if sub == "" {
+				return m, "normalized", nil
+			}
+			return m, "wildcard", nil
+		}
+	}
+	// Dated-version containment ("claude-opus-4-1" -> "…-4-1-20250805").
+	if len(norm) >= 4 {
+		if m, err := s.getByContains(norm); err == nil {
+			if thinking {
+				m = ensureReasoning(m)
+			}
+			return m, "wildcard", nil
+		}
+	}
+	// Segment backoff for suffixed variants ("gemini-3.5-flash-high" ->
+	// "gemini-3.5-flash", "glm-5.2-venice" -> "glm-5.2").
+	for cand := backoffSegment(norm); len(cand) >= 6; cand = backoffSegment(cand) {
+		if m, _ := s.trySlug(cand, thinking); m != nil {
+			if thinking {
+				m = ensureReasoning(m)
+			}
+			return m, "wildcard", nil
+		}
+	}
+	return nil, "", sql.ErrNoRows
+}
+
+// trySlug runs the per-slug match tiers: verbatim/suffix hits return
+// subkind "", approximate (think spelling, "-vN" variant, thinking base)
+// hits return "wild".
+func (s *Store) trySlug(slug string, thinking bool) (*models.CatalogModel, string) {
+	if m, err := s.Get(slug); err == nil {
+		return m, ""
+	}
+	if m, err := s.GetByShortID(slug); err == nil {
+		return m, ""
+	}
+	for _, alt := range thinkAlternates(slug) {
+		if m, err := s.GetByShortID(alt); err == nil {
+			return ensureReasoning(m), "wild"
+		}
+	}
+	for _, alt := range vAlternates(slug) {
+		if m, err := s.GetByShortID(alt); err == nil {
+			if thinking {
+				m = ensureReasoning(m)
+			}
+			return m, "wild"
+		}
+	}
+	if base, ok := cutThinkingSuffix(slug); ok && base != "" {
+		if m, err := s.GetByShortID(base); err == nil {
+			return ensureReasoning(m), "wild"
+		}
+		for _, alt := range vAlternates(base) {
+			if m, err := s.GetByShortID(alt); err == nil {
+				return ensureReasoning(m), "wild"
+			}
+		}
+		if m, err := s.getByContains(base); err == nil {
+			return ensureReasoning(m), "wild"
+		}
+	}
+	return nil, ""
+}
+
+// backoffSegment drops the last dash-separated segment
+// ("gemini-3.5-flash-high" -> "gemini-3.5-flash").
+func backoffSegment(slug string) string {
+	if i := strings.LastIndex(slug, "-"); i > 0 {
+		return slug[:i]
+	}
+	return ""
+}
+
+// getByContains matches dated or suffixed catalog variants of a slug,
+// preferring priced rows then the shortest (closest-version) ID.
+// Case-insensitive: reseller slugs do not always match snapshot casing.
+func (s *Store) getByContains(slug string) (*models.CatalogModel, error) {
+	pat := "%" + escapeLike(slug) + "%"
+	var m models.CatalogModel
+	var rt, rl, rol sql.NullString
+	err := s.db.QueryRow(db.Q(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), LENGTH(id), id LIMIT 1`), pat).Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol)
+	if err != nil {
+		return nil, err
+	}
+	if rt.Valid {
+		m.ReasoningType = rt.String
+	}
+	if rl.Valid {
+		m.ReasoningLevels = rl.String
+	}
+	if rol.Valid {
+		m.ReasoningOutputLimits = rol.String
+	}
+	return &m, nil
+}
+
 func (s *Store) FetchAndSync() (int, error) {
 	resp, err := s.client.Get(ModelsDevURL)
 	if err != nil {

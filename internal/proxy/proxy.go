@@ -2499,23 +2499,20 @@ func (h *Handler) costForModel(modelID string, prompt, completion int) float64 {
 	if h.CatalogStore == nil || (prompt == 0 && completion == 0) {
 		return 0
 	}
-	m, err := h.CatalogStore.Get(modelID)
+	m, _, err := h.CatalogStore.FindBestMatch(modelID)
 	if err != nil {
-		m, err = h.CatalogStore.GetByShortID(modelID)
-		if err != nil {
-			// Unknown model (not in the models.dev snapshot — new releases,
-			// private or aliased upstream names). Returning $0 makes real
-			// upstream spend invisible to cost budgets. Fall back to
-			// operator-configured default pricing when present:
-			//   price_fallback_input_usd_per_1m / price_fallback_output_usd_per_1m
-			// (settable via the dashboard Settings page).
-			in := h.settingFloat("price_fallback_input_usd_per_1m")
-			out := h.settingFloat("price_fallback_output_usd_per_1m")
-			if in > 0 || out > 0 {
-				return float64(prompt)/1_000_000*in + float64(completion)/1_000_000*out
-			}
-			return 0
+		// Unknown model (not in the models.dev snapshot — new releases,
+		// private or aliased upstream names). Returning $0 makes real
+		// upstream spend invisible to cost budgets. Fall back to
+		// operator-configured default pricing when present:
+		//   price_fallback_input_usd_per_1m / price_fallback_output_usd_per_1m
+		// (settable via the dashboard Settings page).
+		in := h.settingFloat("price_fallback_input_usd_per_1m")
+		out := h.settingFloat("price_fallback_output_usd_per_1m")
+		if in > 0 || out > 0 {
+			return float64(prompt)/1_000_000*in + float64(completion)/1_000_000*out
 		}
+		return 0
 	}
 	return catalog.CostFor(m, prompt, completion)
 }

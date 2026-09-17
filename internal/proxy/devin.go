@@ -163,6 +163,10 @@ func friendlyDevinMessage(status int, body string) string {
 // each; grouping strictly by id would emit each fragment as its own call
 // with invalid-JSON args ("{", "\"target_directory\": \"", ...), which
 // harnesses reject as "tool not found: tool" / missing-field errors.
+//
+// Calls that never receive a real tool name are dropped (never surfaced as
+// the literal placeholder "tool"): no such tool exists, so emitting it fails
+// every harness and poisons the agent loop into retries.
 type devinToolAccum struct {
 	order  []string
 	args   map[string]string
@@ -198,17 +202,47 @@ func (a *devinToolAccum) Add(id, name, argsJSON string) (fragment string, start 
 		a.names[id] = name
 	} else if !seen && name != "" {
 		// Keep a placeholder only when the head itself has no real name;
-		// FinalCalls/Name still fall back to "tool" for truly unnamed calls.
+		// Name still reports "" until a real name arrives, so the
+		// placeholder never leaks to harnesses.
 		if _, ok := a.names[id]; !ok {
 			a.names[id] = name
 		}
 	}
 	accumulated := argsJSON
-	if !strings.HasPrefix(argsJSON, previous) {
+	switch {
+	case !seen || previous == "":
+		accumulated = argsJSON
+	case strings.HasPrefix(argsJSON, previous):
+		// Cumulative sender: this payload already contains everything
+		// accumulated so far; the new text is the suffix.
+		accumulated = argsJSON
+	case isCompleteJSON(previous) && isCompleteJSON(argsJSON):
+		// Cumulative revision of a closed object ({"a":1} then
+		// {"a":1,"b":2}): appending would corrupt both objects into
+		// invalid JSON, which downstream degrades to {} and harnesses
+		// reject as "missing required property".
+		accumulated = argsJSON
+	default:
 		accumulated = previous + argsJSON
 	}
 	a.args[id] = accumulated
-	return accumulated[len(previous):], start, id
+	if strings.HasPrefix(accumulated, previous) {
+		return accumulated[len(previous):], start, id
+	}
+	// The revision moved backwards; there is no coherent incremental text.
+	return "", start, id
+}
+
+// isCompleteJSON reports whether s is a self-contained JSON object/array.
+func isCompleteJSON(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return false
+	}
+	if c := t[0]; c != '{' && c != '[' {
+		return false
+	}
+	return json.Valid([]byte(t))
 }
 
 // isRealToolName reports whether name identifies a real tool rather than a
@@ -220,18 +254,26 @@ func isRealToolName(name string) bool {
 	return name != "tool"
 }
 
-// Name returns the latest known tool name for a call id.
+// Name returns the latest known real tool name for a call id, or "" when
+// none arrived yet. The "" (never the literal "tool") signals the caller to
+// hold or drop the call: emitting a fake name fails every harness.
 func (a *devinToolAccum) Name(id string) string {
-	if n := a.names[id]; n != "" {
+	if n := a.names[id]; isRealToolName(n) {
 		return n
 	}
-	return "tool"
+	return ""
 }
 
 // FinalCalls returns one accumulated tool call per id, in first-seen order.
+// Calls that never received a real name are dropped rather than emitted
+// with a fake one.
 func (a *devinToolAccum) FinalCalls() []antigravity.ParsedToolCall {
 	var out []antigravity.ParsedToolCall
 	for _, id := range a.order {
+		name := a.Name(id)
+		if !isRealToolName(name) {
+			continue
+		}
 		var args map[string]any
 		if s := a.args[id]; s != "" {
 			_ = json.Unmarshal([]byte(s), &args)
@@ -239,7 +281,28 @@ func (a *devinToolAccum) FinalCalls() []antigravity.ParsedToolCall {
 		if args == nil {
 			args = map[string]any{}
 		}
-		out = append(out, antigravity.ParsedToolCall{ID: id, Name: a.Name(id), Arguments: args})
+		out = append(out, antigravity.ParsedToolCall{ID: id, Name: name, Arguments: args})
+	}
+	return out
+}
+
+// rawToolCall is one accumulated call with its byte-identical args payload.
+type rawToolCall struct {
+	ID       string
+	Name     string
+	ArgsJSON string
+}
+
+// FinalRawCalls is FinalCalls with byte-identical argument payloads (no map
+// round-trip), for streaming emission. Unnamed calls are dropped.
+func (a *devinToolAccum) FinalRawCalls() []rawToolCall {
+	var out []rawToolCall
+	for _, id := range a.order {
+		name := a.Name(id)
+		if !isRealToolName(name) {
+			continue
+		}
+		out = append(out, rawToolCall{ID: id, Name: name, ArgsJSON: a.args[id]})
 	}
 	return out
 }
@@ -310,8 +373,13 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 						st.WriteText(d.Text)
 					}
 				case "tool":
-					fragment, start, eid := tools.Add(d.ID, d.Name, d.ArgsJSON)
-					st.WriteToolCall(eid, tools.Name(eid), fragment, start)
+					// Buffer, don't stream partial args: a head frame may
+					// arrive before its real name (emitting the first
+					// chunk with a fake name locks harnesses onto
+					// "unknown tool: tool"), and cumulative revisions
+					// have no coherent incremental text. Completed
+					// calls flush after the upstream finishes.
+					_, _, _ = tools.Add(d.ID, d.Name, d.ArgsJSON)
 				case "usage":
 					st.WriteUsage(d.Input, d.Output)
 				case "stop":
@@ -324,6 +392,13 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		if readErr != nil {
 			break
 		}
+	}
+	for _, tc := range tools.FinalRawCalls() {
+		args := tc.ArgsJSON
+		if strings.TrimSpace(args) == "" {
+			args = "{}"
+		}
+		st.WriteToolCall(tc.ID, tc.Name, args, true)
 	}
 	if finishLen {
 		st.SetFinish("length")
