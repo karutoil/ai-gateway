@@ -640,6 +640,39 @@ func isOpencodeTarget(targetURL string) bool {
 	return strings.Contains(l, "opencode.ai/zen")
 }
 
+// errSnippet condenses an upstream error body to a single short log-safe
+// string: control characters stripped, capped to 200 bytes.
+func errSnippet(b []byte) string {
+	s := strings.Map(func(r rune) rune {
+		if r < 0x20 && r != '\t' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(string(b)))
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
+}
+
+// deleteResponsesKey removes a top-level key from a Responses API body,
+// returning nil when the key is absent (no re-marshal needed).
+func deleteResponsesKey(body []byte, key string) []byte {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil || m == nil {
+		return nil
+	}
+	if _, ok := m[key]; !ok {
+		return nil
+	}
+	delete(m, key)
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
 // azureAPIVersion is the default Azure OpenAI API version used for
 // deployment-style URLs.
 const azureAPIVersion = "2024-06-01"
@@ -745,6 +778,10 @@ type proxyOpts struct {
 	// request, one potential keepalive commit). Nil = direct call; the handler
 	// creates a request-local controller instead.
 	ttfb *ttfbController
+	// prevResponseID links a translated /v1/responses turn to its stored
+	// predecessor so the completed turn can extend the chain. Empty for
+	// first turns and non-responses endpoints.
+	prevResponseID string
 }
 
 // providerAttempt is one tried-and-failed-over provider in a fallback chain.
@@ -1095,6 +1132,17 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			sleepCtx(r.Context(), retryAfterDelay(resp.Header, retry.Backoff(attempt)))
 			continue
 		}
+		// Fragmented tool_calls repair (buffered responses only): some
+		// upstreams split one call's arguments across entries with empty
+		// ids, and standard harnesses parse each entry and die on the
+		// fragments. Streaming deltas are legitimately fragmented and
+		// stay verbatim for the client to accumulate.
+		if !isStream && lastStatus == 200 && len(bodyBytes) > 0 {
+			if fixed, did := mergeFragmentedToolCalls(bodyBytes); did {
+				bodyBytes = fixed
+				lastBody = fixed
+			}
+		}
 		break
 	}
 
@@ -1144,6 +1192,14 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					cost = h.costForModel(model, pt, ct)
 				}
 				outBody = converted
+				// Chain support for the next turn: remember this turn's
+				// full chat history under the issued response id.
+				// Anthropic-shaped request bodies are skipped (different
+				// message dialect than the chat history the next turn
+				// would expand).
+				if !isAnthropicUpstream {
+					h.storeTranslatedTurn(opts.prevResponseID, keyPrefix, providerID, model, body, outBody)
+				}
 			} else if lastStatus == 200 {
 				// Conversion failed (no choices[], content-filter shape, …).
 				// Relaying the raw chat JSON would hand the /v1/responses
@@ -3430,6 +3486,13 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, err.Error())
 		return
 	}
+	// stream_tool_calls is a client-side transport knob some agents put in
+	// the body; the OpenAI Responses spec has no such parameter and strict
+	// upstreams (OpenCode Go) 400 with "unknown parameter". It is never
+	// meaningful to forward, so drop it before either upstream path.
+	if stripped := deleteResponsesKey(body, "stream_tool_calls"); stripped != nil {
+		body = stripped
+	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
 	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
@@ -3625,8 +3688,28 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					h.logRequestExtended(keyPrefix, p.ID, model, "responses", http.StatusTooManyRequests, time.Since(start).Milliseconds(), 0, 0, 0, false)
 					return
 				}
-				log.Info().Str("model", model).Str("provider", p.ID).Int("status", resp.StatusCode).Msg("native responses probe rejected; falling through to translated path")
+				// muse-spark-* models exist ONLY on the /responses endpoint;
+				// the translated path upstream-500s for them, so a probe
+				// rejection that falls through surfaces as an opaque 502.
+				// Relay the upstream's real status/body so the client sees
+				// the actual reason instead. Include the upstream error in
+				// the log either way for diagnosability.
+				responsesOnly := strings.HasPrefix(strings.ToLower(stripProviderPrefix(model, p)), "muse-spark-")
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+				log.Info().Str("model", model).Str("provider", p.ID).Int("status", resp.StatusCode).Str("err", errSnippet(errBody)).Msg("native responses probe rejected; falling through to translated path")
 				resp.Body.Close()
+				if responsesOnly {
+					copyHeader(w.Header(), resp.Header)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(resp.StatusCode)
+					if len(errBody) > 0 {
+						w.Write(errBody)
+					} else {
+						w.Write([]byte(fmt.Sprintf(`{"error":{"message":"upstream rejected this request with status %d","type":"proxy_error"}}`, resp.StatusCode)))
+					}
+					h.logRequestExtended(keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, false)
+					return
+				}
 			}
 		}
 	}
@@ -3635,14 +3718,32 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "failed to translate responses to chat: "+err.Error())
 		return
 	}
-	// previous_response_id on the TRANSLATED path: the gateway stores no
-	// response history, so honoring it is impossible — and silently dropping
-	// it (the old behavior) handed clients confident answers with zero
-	// conversation context. Native-capable upstreams above already handled
-	// it; anything reaching here must refuse loudly instead of guessing.
-	if hasPreviousResponseID(body) {
-		httperr.Invalid(w, "previous_response_id is not supported for this provider (no server-side response store); send the full conversation in input instead")
-		return
+	// previous_response_id on the TRANSLATED path: native-capable upstreams
+	// above already honored it themselves. Here the upstream never saw the
+	// earlier turns, so expand the chain from the gateway's response store
+	// (written by every translated turn) back into chat messages. An
+	// unknown id — upstream-native turn, expired history, or a different
+	// key's conversation — must refuse loudly: answering without the
+	// conversation context hands clients confident, context-free guesses.
+	prevID := extractPreviousResponseID(body)
+	if prevID != "" {
+		history, herr := h.loadResponseHistory(prevID, keyPrefix)
+		if herr != nil {
+			httperr.Invalid(w, "unknown or expired previous_response_id for this provider (no stored history); send the full conversation in input instead")
+			return
+		}
+		var chatReq translate.OpenAIChatRequest
+		if jerr := json.Unmarshal(translated, &chatReq); jerr != nil {
+			httperr.Invalid(w, "failed to translate responses to chat: "+jerr.Error())
+			return
+		}
+		chatReq.Messages = mergeResponseHistory(history, chatReq.Messages)
+		merged, merr := json.Marshal(chatReq)
+		if merr != nil {
+			httperr.Invalid(w, "failed to translate responses to chat: "+merr.Error())
+			return
+		}
+		translated = merged
 	}
 	// Shared Anthropic branch for BOTH stream and non-stream: the non-stream
 	// path previously fell through, sending a chat-shaped body to
@@ -3683,10 +3784,10 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				upstreamBody = b2
 			}
 		}
-		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream, ttfb)
+		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream, ttfb, prevID)
 		return
 	}
-	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true, ttfb: ttfb})
+	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true, ttfb: ttfb, prevResponseID: prevID})
 	if !out.committed {
 		// Client-caused upstream 5xx (invalid_request / convert_request_failed
 		// semantics): relay the upstream's verdict instead of the generic

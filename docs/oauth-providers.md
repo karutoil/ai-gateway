@@ -33,8 +33,21 @@ handler, route, migration, or UI changes.
 
 Devin tokens are long-lived; refresh is a no-op that keeps the same
 credentials. Health probes the session with a user-JWT request. Devin bills
-via seat/quota, so logged token costs are zero — quota detail is not yet
-surfaced (future work).
+via seat/quota, so logged token costs are zero.
+
+## Subscription usage (Providers page)
+
+Connected OAuth rows show live usage under the email badge via
+`GET /api/providers/{id}/oauth/usage`:
+
+- Antigravity: plan type, monthly prompt-credit pool, plus per-model
+  remaining/used quota with reset times. Models sort most-used first; the card
+  previews the top 3 and `View all N models` opens the full sorted list.
+- Devin: plan name, daily/weekly used vs remaining with reset dates, plus
+  extra balance when present. Respects the plan's hide-daily/hide-weekly flags.
+
+Failures return 502 with a plain message — the card keeps its connected badge
+and shows `Usage unavailable` inline.
 
 Tokens refresh automatically on use (5-minute skew). Health shows
 `up (oauth)` when refresh works, `down` with “reconnect” when revoked.

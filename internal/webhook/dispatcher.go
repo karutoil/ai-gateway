@@ -166,6 +166,7 @@ func (h *HTTPDispatcher) Stop() {
 }
 
 func (h *HTTPDispatcher) deliver(event string, body []byte) bool {
+	body = platformBody(detectFormat(h.URL), event, body)
 	req, err := http.NewRequest(http.MethodPost, h.URL, bytes.NewReader(body))
 	if err != nil {
 		log.Error().Err(err).Str("event", event).Msg("webhook request build failed")

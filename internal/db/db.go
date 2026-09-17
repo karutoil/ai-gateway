@@ -67,6 +67,9 @@ var migration016SQL string
 //go:embed migrations/017_oauth.sql
 var migration017SQL string
 
+//go:embed migrations/018_response_store.sql
+var migration018SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -108,6 +111,73 @@ func Rebind(query string) string {
 
 // Q is helper alias for Rebind, for terse call sites: db.Q("SELECT ... WHERE id=?", id)
 func Q(query string) string { return Rebind(query) }
+
+// DateBucketExpr returns the daily bucket expression for request_logs charts.
+func DateBucketExpr(col string) string {
+	if Dialect() == "postgres" {
+		return "CAST(" + col + " AS DATE)"
+	}
+	return "date(" + col + ")"
+}
+
+// HourBucketExpr returns the hourly bucket expression for 24h charts.
+func HourBucketExpr(col string) string {
+	if Dialect() == "postgres" {
+		return `to_char(date_trunc('hour', ` + col + `), 'YYYY-MM-DD"T"HH24:00:00"Z"')`
+	}
+	return "strftime('%Y-%m-%dT%H:00:00Z', " + col + ")"
+}
+
+// pgTranslateDDL rewrites SQLite-idiom DDL for Postgres.
+func pgTranslateDDL(stmt string) string {
+	s := strings.ReplaceAll(stmt, "DATETIME", "TIMESTAMPTZ")
+	s = strings.ReplaceAll(s, "BLOB", "BYTEA")
+	s = strings.ReplaceAll(s, "BOOLEAN NOT NULL DEFAULT 0", "BOOLEAN NOT NULL DEFAULT FALSE")
+	s = strings.ReplaceAll(s, "BOOLEAN NOT NULL DEFAULT 1", "BOOLEAN NOT NULL DEFAULT TRUE")
+	s = strings.ReplaceAll(s, "BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE")
+	s = strings.ReplaceAll(s, "BOOLEAN DEFAULT 1", "BOOLEAN DEFAULT TRUE")
+	return s
+}
+
+// splitStatements splits multi-statement SQL on semicolons.
+// Line comments (--) are stripped first so commented ALTERs with trailing
+// semicolons do not produce comment-only fragments Postgres rejects.
+func splitStatements(sqlText string) []string {
+	lines := strings.Split(sqlText, "\n")
+	stripped := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "--") {
+			continue
+		}
+		if idx := strings.Index(ln, " --"); idx != -1 {
+			ln = ln[:idx]
+		}
+		stripped = append(stripped, ln)
+	}
+	joined := strings.Join(stripped, "\n")
+	parts := strings.Split(joined, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// execDDL runs DDL, translating types on Postgres and splitting batches.
+func execDDL(exec func(string) error, stmt string) error {
+	if Dialect() == "postgres" {
+		for _, part := range splitStatements(pgTranslateDDL(stmt)) {
+			if err := exec(part); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return exec(stmt)
+}
 
 // BoolLit renders a boolean literal in the active dialect.
 // SQLite BOOLEAN columns store 0/1; Postgres needs TRUE/FALSE and rejects
@@ -221,7 +291,11 @@ func Open(path string) (*sql.DB, error) {
 // idempotent Migrate fallback for DBs created before 1.6.
 func Migrate(db *sql.DB) error {
 	// Ensure version table exists first so fresh + legacy DBs both have it.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, dirty BOOLEAN NOT NULL DEFAULT 0)`); err != nil {
+	schemaMigrationsDDL := `CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, dirty BOOLEAN NOT NULL DEFAULT 0)`
+	if Dialect() == "postgres" {
+		schemaMigrationsDDL = pgTranslateDDL(schemaMigrationsDDL)
+	}
+	if _, err := db.Exec(schemaMigrationsDDL); err != nil {
 		return err
 	}
 
@@ -246,6 +320,7 @@ func Migrate(db *sql.DB) error {
 		{15, migration015SQL},
 		{16, migration016SQL},
 		{17, migration017SQL},
+		{18, migration018SQL},
 	}
 
 	for _, m := range migrations {
@@ -271,15 +346,28 @@ func Migrate(db *sql.DB) error {
 			// failure cannot leave partial DDL: SQLite supports transactional
 			// DDL; Postgres too. On failure the rollback leaves the DB at the
 			// previous version and we mark dirty for the operator.
+			// Postgres cannot run multi-statement Exec in one call, so split.
+			stmts := []string{trimmed}
+			if Dialect() == "postgres" {
+				stmts = splitStatements(pgTranslateDDL(trimmed))
+			}
 			tx, txErr := db.Begin()
 			if txErr != nil {
 				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
 				return fmt.Errorf("migration %d: begin transaction failed: %w", m.version, txErr)
 			}
-			if _, err := tx.Exec(trimmed); err != nil {
+			failed := false
+			var execErr error
+			for _, s := range stmts {
+				if _, execErr = tx.Exec(s); execErr != nil {
+					failed = true
+					break
+				}
+			}
+			if failed {
 				tx.Rollback()
 				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
-				return fmt.Errorf("migration %d failed: %w", m.version, err)
+				return fmt.Errorf("migration %d failed: %w", m.version, execErr)
 			}
 			if err := tx.Commit(); err != nil {
 				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
@@ -405,7 +493,13 @@ func Migrate(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_provider_models_provider ON provider_models(provider_id);
 	CREATE INDEX IF NOT EXISTS idx_provider_models_model ON provider_models(model_id);
 	`
-	if _, err := db.Exec(legacySchema); err != nil {
+	if Dialect() == "postgres" {
+		for _, part := range splitStatements(pgTranslateDDL(legacySchema)) {
+			if _, err := db.Exec(part); err != nil {
+				return err
+			}
+		}
+	} else if _, err := db.Exec(legacySchema); err != nil {
 		return err
 	}
 	// idempotent column additions for old DBs (including hardening budget cols + org scaffold)
@@ -479,7 +573,11 @@ func applyKeyFeaturesAlters(database *sql.DB) {
 		)`,
 	}
 	for _, s := range stmts {
-		if _, err := database.Exec(s); err != nil {
+		execStmt := s
+		if Dialect() == "postgres" {
+			execStmt = pgTranslateDDL(s)
+		}
+		if _, err := database.Exec(execStmt); err != nil {
 			log.Error().Err(err).Msg("key-features alter")
 		}
 	}
@@ -496,7 +594,11 @@ func applyKeyRotationAlters(db *sql.DB) {
 // execCreateIndexIdempotent creates an index if it does not already exist
 // (CREATE INDEX IF NOT EXISTS is itself idempotent; wrapper for symmetry).
 func execCreateIndexIdempotent(db *sql.DB, name, stmt string) {
-	if _, err := db.Exec(stmt); err != nil {
+	execStmt := stmt
+	if Dialect() == "postgres" {
+		execStmt = pgTranslateDDL(stmt)
+	}
+	if _, err := db.Exec(execStmt); err != nil {
 		log.Error().Err(err).Msg("failed to create index " + name)
 	}
 }
@@ -505,7 +607,7 @@ func execCreateIndexIdempotent(db *sql.DB, name, stmt string) {
 // for DBs created before migration 013 (legacy unversioned databases),
 // mirroring migrations/013_user_permissions.sql.
 func applyUserPermissionsAlters(db *sql.DB) {
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS user_permissions (
+	execSchemaIdempotent(db, `CREATE TABLE IF NOT EXISTS user_permissions (
 		user_id    TEXT NOT NULL REFERENCES dashboard_users(id) ON DELETE CASCADE,
 		permission TEXT NOT NULL,
 		granted    INTEGER NOT NULL DEFAULT 1,
@@ -513,13 +615,9 @@ func applyUserPermissionsAlters(db *sql.DB) {
 		updated_at DATETIME NOT NULL,
 		PRIMARY KEY (user_id, permission)
 	)`)
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_user_permissions_user ON user_permissions(user_id)`); err != nil {
-		log.Error().Err(err).Msg("failed to create idx_user_permissions_user")
-	}
+	execCreateIndexIdempotent(db, "idx_user_permissions_user", `CREATE INDEX IF NOT EXISTS idx_user_permissions_user ON user_permissions(user_id)`)
 	execAlterIdempotent(db, "ALTER TABLE gateway_keys ADD COLUMN created_by TEXT")
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_gateway_keys_created_by ON gateway_keys(created_by)`); err != nil {
-		log.Error().Err(err).Msg("failed to create idx_gateway_keys_created_by")
-	}
+	execCreateIndexIdempotent(db, "idx_gateway_keys_created_by", `CREATE INDEX IF NOT EXISTS idx_gateway_keys_created_by ON gateway_keys(created_by)`)
 }
 
 // applyKeyAnalyticsAlters adds request_logs.key_id idempotently for DBs
@@ -527,9 +625,7 @@ func applyUserPermissionsAlters(db *sql.DB) {
 // migrations/012_key_analytics.sql.
 func applyKeyAnalyticsAlters(db *sql.DB) {
 	execAlterIdempotent(db, "ALTER TABLE request_logs ADD COLUMN key_id TEXT")
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_request_logs_key_id ON request_logs(key_id)`); err != nil {
-		log.Error().Err(err).Msg("failed to create idx_request_logs_key_id")
-	}
+	execCreateIndexIdempotent(db, "idx_request_logs_key_id", `CREATE INDEX IF NOT EXISTS idx_request_logs_key_id ON request_logs(key_id)`)
 }
 
 // BackfillKeyIDs populates request_logs.key_id from gateway_keys.prefix for
@@ -568,7 +664,11 @@ func applyRoutingAlters(db *sql.DB) {
 // hid genuine failures (disk full, permissions, locks) that only surfaced
 // later as runtime query errors.
 func execAlterIdempotent(db *sql.DB, stmt string) {
-	if _, err := db.Exec(stmt); err != nil {
+	execStmt := stmt
+	if Dialect() == "postgres" {
+		execStmt = pgTranslateDDL(stmt)
+	}
+	if _, err := db.Exec(execStmt); err != nil {
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "duplicate column") || // sqlite
 			strings.Contains(msg, "already exists") || // postgres 42710
@@ -576,6 +676,17 @@ func execAlterIdempotent(db *sql.DB, stmt string) {
 			return
 		}
 		log.Error().Err(err).Str("stmt", stmt).Msg("schema ALTER failed (non-duplicate)")
+	}
+}
+
+// execSchemaIdempotent runs CREATE TABLE/INDEX, translating types on Postgres.
+func execSchemaIdempotent(db *sql.DB, stmt string) {
+	execStmt := stmt
+	if Dialect() == "postgres" {
+		execStmt = pgTranslateDDL(stmt)
+	}
+	if _, err := db.Exec(execStmt); err != nil {
+		log.Error().Err(err).Msg("schema exec failed")
 	}
 }
 
@@ -655,23 +766,23 @@ func applyHardeningAlters(db *sql.DB) {
 // Additive, idempotent, and nullable so existing rows keep org_id=NULL ("global").
 // Documented as follow-up to 002_hardening.sql per ARCHITECTURE.md Phase 2.5.
 func applyOrgScaffold(db *sql.DB) {
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS organizations(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at DATETIME NOT NULL)`)
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS memberships(id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, user_id TEXT NOT NULL, role TEXT NOT NULL, created_at DATETIME NOT NULL)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(org_id)`)
-	_, _ = db.Exec(`ALTER TABLE providers ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
-	_, _ = db.Exec(`ALTER TABLE gateway_keys ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_providers_org ON providers(org_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_gateway_keys_org ON gateway_keys(org_id)`)
+	execSchemaIdempotent(db, `CREATE TABLE IF NOT EXISTS organizations(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at DATETIME NOT NULL)`)
+	execSchemaIdempotent(db, `CREATE TABLE IF NOT EXISTS memberships(id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, user_id TEXT NOT NULL, role TEXT NOT NULL, created_at DATETIME NOT NULL)`)
+	execSchemaIdempotent(db, `CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(org_id)`)
+	execAlterIdempotent(db, `ALTER TABLE providers ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
+	execAlterIdempotent(db, `ALTER TABLE gateway_keys ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
+	execSchemaIdempotent(db, `CREATE INDEX IF NOT EXISTS idx_providers_org ON providers(org_id)`)
+	execSchemaIdempotent(db, `CREATE INDEX IF NOT EXISTS idx_gateway_keys_org ON gateway_keys(org_id)`)
 }
 
 func applyTTFTAlters(db *sql.DB) {
-	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT 0`)
-	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN response_ms INTEGER DEFAULT 0`)
+	execAlterIdempotent(db, `ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT 0`)
+	execAlterIdempotent(db, `ALTER TABLE request_logs ADD COLUMN response_ms INTEGER DEFAULT 0`)
 }
 func applyErrorAlters(db *sql.DB) {
-	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN error TEXT`)
-	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN request_body TEXT`)
-	_, _ = db.Exec(`ALTER TABLE request_logs ADD COLUMN response_body TEXT`)
+	execAlterIdempotent(db, `ALTER TABLE request_logs ADD COLUMN error TEXT`)
+	execAlterIdempotent(db, `ALTER TABLE request_logs ADD COLUMN request_body TEXT`)
+	execAlterIdempotent(db, `ALTER TABLE request_logs ADD COLUMN response_body TEXT`)
 }
 
 // applyUsageLoggingAlters adds the per-request usage-metadata columns
@@ -691,10 +802,10 @@ func applyUsageLoggingAlters(db *sql.DB) {
 }
 
 func applyGatewayKeyLimitsAlters(db *sql.DB) {
-	_, _ = db.Exec(`ALTER TABLE gateway_keys ADD COLUMN allowed_models TEXT`)
-	_, _ = db.Exec(`ALTER TABLE gateway_keys ADD COLUMN rate_limit_rph INTEGER DEFAULT 0`)
-	_, _ = db.Exec(`ALTER TABLE gateway_keys ADD COLUMN rate_limit_rpd INTEGER DEFAULT 0`)
-	_, _ = db.Exec(`ALTER TABLE gateway_keys ADD COLUMN rate_limit_tpm INTEGER DEFAULT 0`)
+	execAlterIdempotent(db, `ALTER TABLE gateway_keys ADD COLUMN allowed_models TEXT`)
+	execAlterIdempotent(db, `ALTER TABLE gateway_keys ADD COLUMN rate_limit_rph INTEGER DEFAULT 0`)
+	execAlterIdempotent(db, `ALTER TABLE gateway_keys ADD COLUMN rate_limit_rpd INTEGER DEFAULT 0`)
+	execAlterIdempotent(db, `ALTER TABLE gateway_keys ADD COLUMN rate_limit_tpm INTEGER DEFAULT 0`)
 }
 
 func isURI(s string) bool {

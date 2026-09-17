@@ -360,10 +360,11 @@ export default function Keys({ role = 'admin' }: { role?: string }){
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="Govern · Credentials"
         title="API Keys"
         description={restrictedToOwn
           ? "Your keys — credentials you created. Ask an admin if you need access to more."
-          : "Virtual sk-gw-* credentials that authenticate requests to the /v1/* gateway endpoints."}
+          : "Virtual sk-gw-* credentials for /v1/* — with rate limits, model allowlists, spend caps and rotation."}
         actions={
           <>
             <Badge tone="neutral">{list.length} {list.length === 1 ? 'key' : 'keys'}</Badge>
@@ -399,15 +400,15 @@ export default function Keys({ role = 'admin' }: { role?: string }){
 
       {/* show-once secret — unmissable, secure-feeling */}
       {newKey && (
-        <div className="rounded-xl border border-teal/30 bg-teal/10 p-4">
+        <div className="rounded-xl border border-accent/30 bg-accent/10 p-5">
           <div className="flex items-start gap-3">
-            <div className="w-9 h-9 rounded-lg bg-teal/15 text-teal flex items-center justify-center shrink-0">
+            <div className="w-9 h-9 rounded-lg bg-accent/15 text-accent flex items-center justify-center shrink-0">
               <Icon name="lock" size={17} />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-semibold text-teal">New key created — copy it now</div>
+              <div className="text-sm font-semibold text-accent">New key created — copy it now</div>
               <div className="text-xs text-muted mt-0.5">Store it now — shown only once. We never display the full secret again.</div>
-              <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-teal/30 bg-graphite/60 px-3 py-2">
+              <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-accent/30 bg-graphite/60 px-3 py-2">
                 <code className="font-mono text-sm text-paper break-all min-w-0 flex-1">{newKey}</code>
                 <CopyButton value={newKey} label="Copy key" />
               </div>
@@ -439,7 +440,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
             <tr>
               <Th className="w-10">
                 <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll}
-                  className="w-4 h-4 accent-teal cursor-pointer rounded" aria-label="Select all keys" />
+                  className="w-4 h-4 accent-accent cursor-pointer rounded" aria-label="Select all keys" />
               </Th>
               <Th>Name</Th>
               <Th>Prefix</Th>
@@ -454,10 +455,10 @@ export default function Keys({ role = 'admin' }: { role?: string }){
           ) : (
             <tbody>
               {list.map(k=> (
-                <tr key={k.id} className={`${isSelectMode && selected.has(k.id) ? 'bg-teal/5' : ''} hover:bg-stone/20 transition-colors`}>
+                <tr key={k.id} className={`${isSelectMode && selected.has(k.id) ? 'bg-accent/5' : ''} hover:bg-stone/20 transition-colors`}>
                   <Td className="text-center">
                     <input type="checkbox" checked={selected.has(k.id)} onChange={()=>toggleSelect(k.id)}
-                      className="w-4 h-4 accent-teal cursor-pointer rounded" aria-label={`Select ${k.name}`} />
+                      className="w-4 h-4 accent-accent cursor-pointer rounded" aria-label={`Select ${k.name}`} />
                   </Td>
                   <Td>
                     <div className="group flex items-center gap-1.5 max-w-[220px]">
@@ -465,7 +466,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
                   {keyBadges(k) && <div className="flex gap-1 mt-0.5">{keyBadges(k)}</div>}
                       {canUpdate && !isSelectMode && (
                         <button onClick={()=>startEdit(k)} title="Rename"
-                          className="shrink-0 text-muted hover:text-paper transition-colors focus-visible:text-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal/50 rounded">
+                          className="shrink-0 text-muted hover:text-paper transition-colors focus-visible:text-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded">
                           <Icon name="pencil" size={13} />
                         </button>
                       )}
@@ -666,7 +667,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
                 <select
                   value={editModal.owner}
                   onChange={e=> setEditModal(prev=> prev ? {...prev, owner: e.target.value} : prev)}
-                  className="w-full bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60"
+                  className="w-full bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-accent/60"
                 >
                   <option value="">Unowned (admins &amp; keys:read holders only)</option>
                   {users.map(u => (
@@ -755,9 +756,9 @@ export default function Keys({ role = 'admin' }: { role?: string }){
       <Modal open={!!rotateResult} onClose={()=>setRotateResult(null)} title="New key secret" width="max-w-md">
         {rotateResult && (
           <>
-            <div className="rounded-lg border border-teal/40 bg-teal/5 p-3">
+            <div className="rounded-lg border border-accent/40 bg-accent/5 p-3">
               <div className="text-xs text-muted mb-1.5 uppercase tracking-wide">New secret — shown only once</div>
-              <code className="block font-mono text-sm break-all select-all text-teal">{rotateResult.secret}</code>
+              <code className="block font-mono text-sm break-all select-all text-accent">{rotateResult.secret}</code>
             </div>
             <div className="mt-3 flex items-center justify-between">
               <span className="text-xs text-muted">Old secret works for {rotateResult.grace}.</span>

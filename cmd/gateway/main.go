@@ -631,7 +631,7 @@ func runLogRetention(database *sql.DB, days int) {
 		} else {
 			bound = cutoff.Format("2006-01-02 15:04:05.999999999+00:00")
 		}
-		res, err := database.Exec(`DELETE FROM request_logs WHERE created_at < ?`, bound)
+		res, err := database.Exec(db.Q(`DELETE FROM request_logs WHERE created_at < ?`), bound)
 		if err != nil {
 			log.Warn().Err(err).Msg("log retention purge failed")
 			return

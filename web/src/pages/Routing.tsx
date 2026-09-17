@@ -217,9 +217,10 @@ export default function Routing({ role = 'admin' }: { role?: string }){
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Model Routing"
+        eyebrow="Connect · Traffic shaping"
+        title="Routing"
         description={
-          'Bare model names are routed through their provider group using the group\u2019s strategy — round robin, random, weighted, or failover. Qualified IDs like openai/gpt-4o or an X-Provider header pin one provider and bypass these groups.'
+          'Bare model names fan out through provider groups — round robin, random, weighted, or failover. Pin with openai/gpt-4o or X-Provider to bypass.'
         }
         actions={
           <div className="flex items-center gap-2">
@@ -312,11 +313,11 @@ export default function Routing({ role = 'admin' }: { role?: string }){
 
       {/* Builder / editor */}
       <div ref={builderRef} className="scroll-mt-24">
-        <Card className={editing ? 'border-teal/40' : ''}>
+        <Card className={editing ? 'border-accent' : ''}>
           <div className="flex items-start justify-between gap-3 mb-4">
             <div>
               <h2 className="font-semibold tracking-tight flex items-center gap-2">
-                <Icon name="route" size={16} className="text-teal"/>
+                <Icon name="route" size={16} className="text-accent"/>
                 {editing ? <>Edit <span className="font-mono">"{editing}"</span></> : 'New route group'}
               </h2>
               <div className="font-mono text-xs text-muted mt-1">{activeStrategy?.hint}</div>
@@ -363,8 +364,8 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                 {providers.map(p=> {
                   const checked = members.some(m=> m.provider_id === p.id)
                   return (
-                    <label key={p.id} className={`flex items-center gap-2.5 border rounded-lg px-3 py-2 cursor-pointer transition-colors focus-within:ring-2 focus-within:ring-teal/30 ${checked ? 'border-teal/50 bg-teal/5' : 'border-stone hover:bg-app/60'}`}>
-                      <input type="checkbox" checked={checked} onChange={()=> checked ? removeMember(p.id) : addProvider(p.id)} className="accent-teal rounded shrink-0"/>
+                    <label key={p.id} className={`flex items-center gap-2.5 border rounded-lg px-3 py-2 cursor-pointer transition-colors focus-within:ring-2 focus-within:ring-accent/30 ${checked ? 'border-accent/50 bg-accent/5' : 'border-stone hover:bg-app/60'}`}>
+                      <input type="checkbox" checked={checked} onChange={()=> checked ? removeMember(p.id) : addProvider(p.id)} className="accent-accent rounded shrink-0"/>
                       <HealthDot health={p.health_status} />
                       <span className="truncate text-sm flex-1 min-w-0">{p.name}</span>
                       {p.type && <Badge tone="neutral">{p.type}</Badge>}

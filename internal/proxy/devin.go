@@ -13,6 +13,8 @@ import (
 	"ai-gateway/internal/devin"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/models"
+
+	"github.com/google/uuid"
 )
 
 // isDevin reports whether a provider speaks the Devin Connect-proto transport.
@@ -156,34 +158,66 @@ func friendlyDevinMessage(status int, body string) string {
 
 // devinToolAccum accumulates streamed tool-argument fragments per call,
 // mirroring the reference client (cumulative payloads replace, deltas append).
+// swe-2 streams one logical call as a head frame (id+name+partial args)
+// followed by continuation frames with no id/name and one args fragment
+// each; grouping strictly by id would emit each fragment as its own call
+// with invalid-JSON args ("{", "\"target_directory\": \"", ...), which
+// harnesses reject as "tool not found: tool" / missing-field errors.
 type devinToolAccum struct {
-	order []string
-	args  map[string]string
-	names map[string]string
+	order  []string
+	args   map[string]string
+	names  map[string]string
+	lastID string
 }
 
 func newDevinToolAccum() *devinToolAccum {
 	return &devinToolAccum{args: map[string]string{}, names: map[string]string{}}
 }
 
-// Add folds one tool delta in and returns the new text fragment to emit plus
-// whether this is the first frame for the call.
-func (a *devinToolAccum) Add(id, name, argsJSON string) (fragment string, start bool) {
+// Add folds one tool delta in and returns the new text fragment to emit,
+// whether this is the first frame for the call, and the effective call id
+// to emit under (continuation fragments map to their head's id).
+func (a *devinToolAccum) Add(id, name, argsJSON string) (fragment string, start bool, effectiveID string) {
+	if strings.TrimSpace(id) == "" {
+		if a.lastID != "" {
+			id = a.lastID
+		} else {
+			id = "call_" + uuid.NewString()[:8]
+		}
+	}
 	previous, seen := a.args[id]
 	if !seen {
 		a.order = append(a.order, id)
 		previous = ""
 		start = true
+		a.lastID = id
+	} else {
+		a.lastID = id
 	}
-	if name != "" {
+	if isRealToolName(name) {
 		a.names[id] = name
+	} else if !seen && name != "" {
+		// Keep a placeholder only when the head itself has no real name;
+		// FinalCalls/Name still fall back to "tool" for truly unnamed calls.
+		if _, ok := a.names[id]; !ok {
+			a.names[id] = name
+		}
 	}
 	accumulated := argsJSON
 	if !strings.HasPrefix(argsJSON, previous) {
 		accumulated = previous + argsJSON
 	}
 	a.args[id] = accumulated
-	return accumulated[len(previous):], start
+	return accumulated[len(previous):], start, id
+}
+
+// isRealToolName reports whether name identifies a real tool rather than a
+// missing-name placeholder from the wire decoder.
+func isRealToolName(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	return name != "tool"
 }
 
 // Name returns the latest known tool name for a call id.
@@ -276,8 +310,8 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 						st.WriteText(d.Text)
 					}
 				case "tool":
-					fragment, start := tools.Add(d.ID, d.Name, d.ArgsJSON)
-					st.WriteToolCall(d.ID, tools.Name(d.ID), fragment, start)
+					fragment, start, eid := tools.Add(d.ID, d.Name, d.ArgsJSON)
+					st.WriteToolCall(eid, tools.Name(eid), fragment, start)
 				case "usage":
 					st.WriteUsage(d.Input, d.Output)
 				case "stop":
@@ -368,7 +402,7 @@ func devinDeltasToChunks(deltas []devin.Delta) []antigravity.ParsedChunk {
 			cur.HasData = true
 		case "tool":
 			commit()
-			tools.Add(d.ID, d.Name, d.ArgsJSON)
+			_, _, _ = tools.Add(d.ID, d.Name, d.ArgsJSON)
 		case "usage":
 			cur.Usage = antigravity.Usage{
 				Input: d.Input, Output: d.Output,

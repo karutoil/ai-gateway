@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"ai-gateway/internal/db"
@@ -137,9 +138,26 @@ func (s *Store) GetByShortID(shortID string) (*models.CatalogModel, error) {
 	if m, err := s.Get(shortID); err == nil {
 		return m, nil
 	}
+	// Gateway-qualified IDs carry the *gateway provider* prefix
+	// ("oc1/muse-spark-1.3-contributor"), which never matches catalog IDs
+	// (keyed by models.dev provider namespace). Strip to the suffix before
+	// the suffix match, otherwise every cost lookup misses and bills $0.
+	trimmed := strings.TrimSpace(shortID)
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 && i+1 < len(trimmed) {
+		if m, err := s.Get(trimmed[i+1:]); err == nil {
+			return m, nil
+		}
+		trimmed = trimmed[i+1:]
+	}
+	if trimmed == "" {
+		return nil, sql.ErrNoRows
+	}
 	var m models.CatalogModel
 	var rt, rl, rol sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE id LIKE ? LIMIT 1`), "%/"+shortID).Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol)
+	// Prefer a priced row: the suffix match can hit many providers and an
+	// arbitrary LIMIT 1 may return a zero-price mirror (e.g. ollama-cloud),
+	// which again bills $0 despite priced rows existing.
+	err := s.db.QueryRow(db.Q(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE id LIKE ? ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), id LIMIT 1`), "%/"+trimmed).Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol)
 	if err != nil {
 		return nil, err
 	}

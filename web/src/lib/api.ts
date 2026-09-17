@@ -185,6 +185,7 @@ export const api = {
     exchange: (data: { state: string; provider_id?: string; callback_url?: string; code?: string }) =>
       req('/api/oauth/exchange', { method:'POST', body: JSON.stringify(data) }) as Promise<{ ok: boolean; provider_id: string; email?: string; project_id?: string }>,
     status: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth/status`) as Promise<{ provider_id: string; connected: boolean; def_id?: string; email?: string; project_id?: string; expires_at?: string | null }>,
+    usage: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth/usage`) as Promise<any>,
     refresh: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth/refresh`, { method:'POST' }),
     disconnect: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth`, { method:'DELETE' }),
   },

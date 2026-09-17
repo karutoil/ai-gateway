@@ -846,22 +846,7 @@ func normalizeContentInputTextToText(content interface{}) interface{} {
 	if json.Unmarshal(b, &arr) == nil {
 		for i, item := range arr {
 			if m, ok := item.(map[string]interface{}); ok {
-				if m["type"] == "input_text" {
-					m["type"] = "text"
-					arr[i] = m
-				} else if m["type"] == "image_url" || m["type"] == "input_image" {
-					// normalize image block
-					if m["type"] == "input_image" {
-						// Responses input_image -> openai image_url
-						if iu, ok := m["image_url"]; ok {
-							arr[i] = map[string]interface{}{"type": "image_url", "image_url": iu}
-						} else {
-							m["type"] = "image_url"
-							arr[i] = m
-						}
-					}
-				}
-				// Also handle text field is already text, keep
+				arr[i] = normalizeChatContentPart(m)
 			}
 		}
 		return arr
@@ -869,19 +854,38 @@ func normalizeContentInputTextToText(content interface{}) interface{} {
 	// Single block object
 	var m map[string]interface{}
 	if json.Unmarshal(b, &m) == nil {
-		if m["type"] == "input_text" {
-			m["type"] = "text"
-			return m
-		}
-		if m["type"] == "input_image" {
-			if iu, ok := m["image_url"]; ok {
-				return map[string]interface{}{"type": "image_url", "image_url": iu}
-			}
-			m["type"] = "image_url"
-			return m
-		}
+		return normalizeChatContentPart(m)
 	}
 	return content
+}
+
+// normalizeChatContentPart maps one Responses-API content part onto its chat
+// counterpart. Multi-turn histories replay assistant turns as message items
+// whose parts are output_text/refusal, not input_text: forwarding those
+// verbatim hands strict chat upstreams an unknown part type (400 or silently
+// dropped context). Rebuild them as plain text parts — annotations have no
+// chat equivalent and unknown keys trip strict validators.
+func normalizeChatContentPart(m map[string]interface{}) interface{} {
+	switch m["type"] {
+	case "input_text":
+		m["type"] = "text"
+		return m
+	case "output_text":
+		text, _ := m["text"].(string)
+		return map[string]interface{}{"type": "text", "text": text}
+	case "refusal":
+		refusal, _ := m["refusal"].(string)
+		return map[string]interface{}{"type": "text", "text": refusal}
+	case "input_image":
+		// Responses input_image -> openai image_url
+		if iu, ok := m["image_url"]; ok {
+			return map[string]interface{}{"type": "image_url", "image_url": iu}
+		}
+		m["type"] = "image_url"
+		return m
+	default:
+		return m
+	}
 }
 
 func budgetToEffort(budget int) string {
@@ -1088,27 +1092,43 @@ func ResponsesToChat(body []byte) ([]byte, string, error) {
 				case "function_call":
 					name, _ := m["name"].(string)
 					if name == "" {
-						continue
+						// A nameless call still has a call_id pairing it
+						// with its function_call_output. Dropping the call
+						// orphans the output (strict upstreams 400 orphan
+						// tool messages); a placeholder name preserves the
+						// pair and the tool result still reaches the model.
+						name = "unknown_function"
 					}
-					// Arguments may arrive as a JSON string (spec) or as an
-					// already-parsed object (loose SDKs); stringifying the
-					// latter beats silently dropping the real arguments.
-					var args string
-					if s, ok := m["arguments"].(string); ok {
-						args = s
-					} else if m["arguments"] != nil {
-						if b, err := json.Marshal(m["arguments"]); err == nil {
-							args = string(b)
-						}
-					}
-					if args == "" {
-						args = "{}"
-					}
-					callID, _ := m["call_id"].(string)
 					messages = append(messages, OpenAIMessage{
 						Role: "assistant",
 						ToolCalls: []map[string]interface{}{{
-							"id":       callID,
+							"id":       callIDOf(m),
+							"type":     "function",
+							"function": map[string]interface{}{"name": name, "arguments": argumentsOf(m)},
+						}},
+					})
+					continue
+				case "custom_tool_call":
+					// Custom function tools surface as custom_tool_call
+					// with a stringified input (not arguments). Map onto a
+					// chat tool_call so the paired function_call_output
+					// still lines up by call_id.
+					name, _ := m["name"].(string)
+					if name == "" {
+						name = "unknown_function"
+					}
+					args, _ := m["input"].(string)
+					if args == "" {
+						if b, err := json.Marshal(m["input"]); err == nil && string(b) != "null" && string(b) != "" {
+							args = string(b)
+						} else {
+							args = "{}"
+						}
+					}
+					messages = append(messages, OpenAIMessage{
+						Role: "assistant",
+						ToolCalls: []map[string]interface{}{{
+							"id":       callIDOf(m),
 							"type":     "function",
 							"function": map[string]interface{}{"name": name, "arguments": args},
 						}},
@@ -1122,9 +1142,20 @@ func ResponsesToChat(body []byte) ([]byte, string, error) {
 						Content:    functionOutputToText(m["output"]),
 					})
 					continue
-				case "reasoning", "item_reference":
-					// No chat-format counterpart; forwarding them as user
-					// messages injected null-content turns into the convo.
+				case "reasoning", "item_reference",
+					"web_search_call", "file_search_call",
+					"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response",
+					"code_interpreter_call", "computer_call",
+					"image_generation_call",
+					"local_shell_call", "shell_call", "apply_patch_call":
+					// Server-side tool items with no chat counterpart.
+					// Forwarding them as user messages injected
+					// null-content turns into the conversation, which
+					// strict upstreams reject — dropping them keeps
+					// multi-turn agent loops alive.
+					continue
+				}
+				if isServerToolItem(m) {
 					continue
 				}
 				role, _ := m["role"].(string)
@@ -1291,6 +1322,49 @@ func responsesToolToChat(t json.RawMessage) (json.RawMessage, bool) {
 	return mustJSON(map[string]interface{}{"type": "function", "function": fn}), true
 }
 
+// callIDOf extracts the call_id pairing a tool-call item with its output.
+func callIDOf(m map[string]interface{}) string {
+	callID, _ := m["call_id"].(string)
+	if callID == "" {
+		callID, _ = m["id"].(string)
+	}
+	return callID
+}
+
+// argumentsOf extracts stringified arguments from a function_call item.
+// Arguments may arrive as a JSON string (spec) or as an already-parsed
+// object (loose SDKs); stringifying the latter beats silently dropping
+// the real arguments.
+func argumentsOf(m map[string]interface{}) string {
+	if s, ok := m["arguments"].(string); ok && s != "" {
+		return s
+	}
+	if m["arguments"] != nil {
+		if b, err := json.Marshal(m["arguments"]); err == nil && string(b) != "null" {
+			return string(b)
+		}
+	}
+	return "{}"
+}
+
+// isServerToolItem reports whether a role-less, content-less Responses item
+// is a server-side tool invocation with no chat counterpart (future tool
+// types beyond the explicit skip list). Such items must be dropped, not
+// defaulted to null-content user messages that strict upstreams reject.
+func isServerToolItem(m map[string]interface{}) bool {
+	if _, hasRole := m["role"]; hasRole {
+		return false
+	}
+	if c, hasContent := m["content"]; hasContent && c != nil {
+		return false
+	}
+	t, _ := m["type"].(string)
+	if t == "" || t == "message" || t == "text" {
+		return false
+	}
+	return strings.HasSuffix(t, "_call") || strings.HasSuffix(t, "_response") || strings.HasSuffix(t, "_result")
+}
+
 // functionOutputToText flattens a function_call_output's output value into
 // chat tool-message content: strings pass through; arrays of output_text
 // parts are joined; anything else is preserved as its JSON encoding so no
@@ -1326,6 +1400,16 @@ func functionOutputToText(v interface{}) string {
 		}
 		return string(b)
 	default:
+		// A single output part object (not wrapped in an array) carries
+		// the text under .text — unwrap it instead of forwarding the
+		// JSON envelope as the tool result.
+		if pm, ok := v.(map[string]interface{}); ok {
+			if pt, _ := pm["type"].(string); pt == "output_text" || pt == "input_text" || pt == "text" {
+				if txt, ok := pm["text"].(string); ok {
+					return txt
+				}
+			}
+		}
 		b, err := json.Marshal(t)
 		if err != nil {
 			return ""

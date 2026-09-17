@@ -31,13 +31,62 @@ services:
       - .env
     environment:
       PORT: 8090
-      DATABASE_URL: /data/gateway.db
+      # Postgres primary lives in this stack (host port 5434, container 5432).
+      # Flip from SQLite by setting DATABASE_URL in .env to the postgres DSN.
+      DATABASE_URL: ${DATABASE_URL:-/data/gateway.db}
+      REDIS_URL: ${REDIS_URL:-}
     volumes:
       # Migrated copy of the dev database + auto-generated key files live here.
       - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     # No built-in healthcheck: the image ships without curl/wget. Probe
     # GET /health or /ready from your orchestrator/monitoring instead.
     restart: unless-stopped
 
-# Single-replica prod: SQLite is the single writer. Add Redis (REDIS_URL) or
-# move to Postgres before running more than one replica.
+  # Postgres primary for production + failover replica source.
+  # Host port 5434 avoids the native 17/main cluster on 5433.
+  # Standby connects to <main-ipv6>:5434 as user replicator.
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    container_name: ai-gateway-postgres
+    ports:
+      - "5434:5432"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/production/.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - listen_addresses=*
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: ai-gateway-redis-prod
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redis-data:

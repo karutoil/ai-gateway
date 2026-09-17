@@ -61,9 +61,9 @@ const fmtUsd = (n: number) => n === 0 ? '$0' : n < 0.01 ? '<$0.01' : `$${n.toFix
 
 function KPI({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="rounded-lg border border-stone bg-app px-3 py-2.5">
-      <div className="text-[11px] text-muted uppercase tracking-wide">{label}</div>
-      <div className="text-lg font-semibold tabular-nums mt-0.5 truncate">{value}</div>
+    <div className="rounded-xl border border-stone/60 bg-app/60 px-3.5 py-3">
+      <div className="text-[10px] font-bold text-muted uppercase tracking-[0.12em]">{label}</div>
+      <div className="font-display text-xl font-bold tabular-nums mt-1 truncate">{value}</div>
     </div>
   )
 }
@@ -80,7 +80,7 @@ function MiniBars({ daily, extract, tip }: { daily: KeyDaily[]; extract: (d: Key
           <div key={d.day} title={tip(d)} className="flex-1 min-w-[14px] flex flex-col items-center gap-1 group cursor-default">
             <div className="w-full h-20 flex items-end">
               <div
-                className={`w-full rounded-t-sm transition-opacity ${v > 0 ? 'bg-teal opacity-80 group-hover:opacity-100' : 'bg-stone/60'}`}
+                className={`w-full rounded-t-sm transition-opacity ${v > 0 ? 'bg-accent opacity-80 group-hover:opacity-100' : 'bg-stone/60'}`}
                 style={{ height: `${pct}%` }}
               />
             </div>
@@ -107,7 +107,7 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
   }, [keyId, range])
 
   return (
-    <Modal open={keyId !== null} onClose={onClose} title="Key analytics" width="max-w-2xl">
+    <Modal open={keyId !== null} onClose={onClose} title="Key performance" width="max-w-3xl">
       {error && (
         <EmptyState icon="alert" title="Could not load analytics" hint={error}
           action={<Button variant="secondary" size="sm" onClick={() => setRange(r => r)}><Icon name="refresh" size={14} />Retry</Button>} />

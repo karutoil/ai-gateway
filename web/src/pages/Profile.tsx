@@ -145,20 +145,20 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
   )
 
   return (
-    <div className="space-y-6 max-w-4xl">
-      <PageHeader title="Profile" description="Your account, security and recent gateway activity." />
+    <div className="space-y-6 max-w-5xl">
+      <PageHeader eyebrow="Account · Security" title="Profile" description="Your identity, passkeys, tokens and recent activity across the gateway." />
 
       {/* show-once recovery code — explicit acknowledgment, no bare dismiss */}
       {recovery && (
-        <div className="rounded-xl border border-teal/30 bg-teal/10 p-4">
+        <div className="rounded-xl border border-accent/30 bg-accent/10 p-4">
           <div className="flex items-start gap-3">
-            <div className="w-9 h-9 rounded-lg bg-teal/15 text-teal flex items-center justify-center shrink-0">
+            <div className="w-9 h-9 rounded-lg bg-accent/15 text-accent flex items-center justify-center shrink-0">
               <Icon name="lock" size={17} />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-semibold text-teal">Recovery code</div>
+              <div className="text-sm font-semibold text-accent">Recovery code</div>
               <div className="text-xs text-muted mt-0.5">Store it now — shown only once. Required if your passkey is lost.</div>
-              <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-teal/30 bg-graphite/60 px-3 py-2">
+              <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-accent/30 bg-graphite/60 px-3 py-2">
                 <code className="font-mono text-sm text-paper break-all min-w-0 flex-1">{recovery}</code>
                 <CopyButton value={recovery} label="Copy recovery code" />
               </div>
@@ -172,11 +172,11 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         </div>
       )}
 
-      <div className="grid md:grid-cols-3 gap-4">
+      <div className="grid md:grid-cols-[320px_minmax(0,1fr)] gap-4">
         {/* identity card */}
-        <Card className="md:col-span-1">
+        <Card>
           <div className="flex flex-col items-center text-center pb-4 border-b border-stone">
-            <span className="w-16 h-16 rounded-full bg-gradient-to-br from-amber to-teal flex items-center justify-center text-ink font-bold text-2xl select-none">
+            <span className="w-16 h-16 rounded-xl bg-accent flex items-center justify-center text-onaccent font-display font-semibold text-2xl select-none">
               {me.username[0]?.toUpperCase()}
             </span>
             <div className="font-semibold mt-3">{me.username}</div>
@@ -197,9 +197,9 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         </Card>
 
         {/* change password card */}
-        <Card className="md:col-span-2">
+        <Card>
           <div className="flex items-center gap-2 mb-4">
-            <Icon name="lock" size={15} className="text-teal" />
+            <Icon name="lock" size={15} className="text-accent" />
             <h3 className="font-semibold text-sm">Change password</h3>
           </div>
           {pwError && <div className="mb-3"><ErrorNote message={pwError} /></div>}
@@ -221,12 +221,12 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         </Card>
       </div>
 
-      <div className="grid md:grid-cols-3 gap-4">
+      <div className="grid md:grid-cols-2 gap-4">
         {/* passkeys card */}
-        <Card>
+        <Card className="hover:border-accent/25 transition-colors">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
-              <Icon name="shield" size={15} className={me.passkey_enabled ? 'text-teal' : 'text-muted'} />
+              <Icon name="shield" size={15} className={me.passkey_enabled ? 'text-accent' : 'text-muted'} />
               <h3 className="font-semibold text-sm">Passkeys</h3>
             </div>
             <Badge tone={me.passkey_enabled ? 'good' : 'neutral'} dot={me.passkey_enabled}>
@@ -271,10 +271,10 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         </Card>
 
         {/* activity timeline card */}
-        <Card className="md:col-span-2">
+        <Card>
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              <Icon name="pulse" size={15} className="text-teal" />
+              <Icon name="pulse" size={15} className="text-accent" />
               <h3 className="font-semibold text-sm">Recent activity</h3>
             </div>
             <Badge tone="neutral"><span className="tabular-nums">{activity.length}</span> events</Badge>
@@ -288,7 +288,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
               <div className="absolute left-[5px] top-2 bottom-2 w-px bg-stone" aria-hidden />
               {activity.map((a:any)=>(
                 <li key={a.id} className="relative pl-6 pb-4 last:pb-0">
-                  <span className="absolute left-0 top-1 w-[11px] h-[11px] rounded-full bg-teal ring-4 ring-surface" aria-hidden />
+                  <span className="absolute left-0 top-1 w-[11px] h-[11px] rounded-full bg-accent ring-4 ring-surface" aria-hidden />
                   <div className="flex flex-wrap items-baseline justify-between gap-x-3">
                     <span className="text-sm font-medium">{a.action}</span>
                     <span className="text-xs text-muted whitespace-nowrap">{ago(a.created_at)}</span>
@@ -307,7 +307,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
       {logins && (
         <Card>
           <div className="flex items-center gap-2 mb-4">
-            <Icon name="logout" size={15} className="text-teal" />
+            <Icon name="logout" size={15} className="text-accent" />
             <h3 className="font-semibold text-sm">Logins</h3>
           </div>
           <div className="grid grid-cols-3 gap-3">

@@ -92,7 +92,7 @@ export default function UserPermissionsModal({ userId, onClose, onSaved }: {
   const denyCount = Object.values(states).filter(s => s === 'deny').length
 
   return (
-    <Modal open={userId !== null} onClose={onClose} title="User permissions" width="max-w-2xl">
+    <Modal open={userId !== null} onClose={onClose} title="Fine-grained permissions" width="max-w-2xl">
       {error && <div className="text-sm text-red-400">{error}</div>}
       {loading && !data && <div className="py-8 text-center text-sm text-muted">Loading…</div>}
       {data && (
@@ -106,7 +106,7 @@ export default function UserPermissionsModal({ userId, onClose, onSaved }: {
               )}
             </div>
             <div className="text-xs text-muted">
-              {allowCount > 0 && <span className="text-teal">{allowCount} granted </span>}
+              {allowCount > 0 && <span className="text-accent">{allowCount} granted </span>}
               {denyCount > 0 && <span className="text-amber">{denyCount} denied </span>}
               {(allowCount === 0 && denyCount === 0) && 'following role defaults'}
             </div>
@@ -133,7 +133,7 @@ export default function UserPermissionsModal({ userId, onClose, onSaved }: {
                 Changes apply immediately, no re-login needed.
               </p>
               {PERM_GROUPS.map(g => (
-                <div key={g.resource} className="rounded-lg border border-stone overflow-hidden">
+                <div key={g.resource} className="rounded-xl border border-stone/60 overflow-hidden bg-app/40">
                   <div className="px-3 py-2 bg-raised text-xs font-medium uppercase tracking-wide text-muted">{g.label}</div>
                   <div className="divide-y divide-stone">
                     {g.perms.map(p => {
@@ -141,7 +141,7 @@ export default function UserPermissionsModal({ userId, onClose, onSaved }: {
                       const eff = effectiveSet.has(p.perm)
                       return (
                         <button key={p.perm} onClick={() => cycle(p.perm)}
-                          className="w-full text-left px-3 py-2 flex items-center justify-between gap-3 hover:bg-raised/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-teal/50">
+                          className="w-full text-left px-3 py-2 flex items-center justify-between gap-3 hover:bg-raised/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50">
                           <span className="min-w-0">
                             <span className="text-sm block">{p.label}</span>
                             {p.hint && <span className="text-xs text-muted block">{p.hint}</span>}

@@ -596,6 +596,20 @@ func emitToolCallAdded(em *sseEventWriter, acc *respToolCall) {
 type responsesPumpResult struct {
 	midStreamFailure bool
 	clientGone       bool
+	// History capture for previous_response_id chaining: the issued
+	// response id plus the assistant's streamed text and tool calls.
+	// Populated only on the clean finalizeSuccess path.
+	respID    string
+	text      string
+	toolCalls []streamedHistoryCall
+}
+
+// streamedHistoryCall is one accumulated streaming tool call, reduced to
+// the fields needed to replay it as chat history on the next turn.
+type streamedHistoryCall struct {
+	ID   string
+	Name string
+	Args string
 }
 
 // streamTranslatedResponses serves streaming /v1/responses when the selected
@@ -610,7 +624,7 @@ type responsesPumpResult struct {
 //   - every terminal pre-commit failure writes one clean
 //     `event: response.failed` frame instead of an HTTP-shaped JSON blob;
 //   - after commit there are no retries, ever.
-func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, upstreamBody []byte, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool, ttfb *ttfbController) {
+func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, upstreamBody []byte, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool, ttfb *ttfbController, prevID string) {
 	retry := h.retryOrDefault()
 
 	ctx := r.Context()
@@ -685,7 +699,13 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 		}
 
 		// Usable 200 + text/event-stream: hand over to the translation pump.
-		h.pumpResponsesFromStream(w, r, resp, model, keyPrefix, providerID, start, isAnthropicUpstream, ttfb)
+		res := h.pumpResponsesFromStream(w, r, resp, model, keyPrefix, providerID, start, isAnthropicUpstream, ttfb)
+		// Chain support for the next turn (chat-shaped upstreams only —
+		// see the non-streaming storeTranslatedTurn for why anthropic
+		// bodies are skipped).
+		if !res.midStreamFailure && !res.clientGone && !isAnthropicUpstream {
+			h.storeStreamedTurn(prevID, keyPrefix, providerID, model, upstreamBody, res)
+		}
 		return
 	}
 }
@@ -954,6 +974,20 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		robj["usage"] = usage
 		robj["output"] = outputArr
 		em.emit(terminalEvent, map[string]interface{}{"response": robj})
+
+		// History capture for the next chained turn: only complete
+		// responses are chainable (an incomplete/truncated turn still
+		// records what the model actually produced).
+		res.respID = respID
+		res.text = full
+		for _, key := range fcOrder {
+			acc := toolCalls[key]
+			id := acc.callID
+			if id == "" {
+				id = acc.itemID
+			}
+			res.toolCalls = append(res.toolCalls, streamedHistoryCall{ID: id, Name: acc.name, Args: acc.args.String()})
+		}
 
 		cost := h.costForModel(model, promptTok, completeTok)
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)

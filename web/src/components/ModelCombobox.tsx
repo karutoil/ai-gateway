@@ -12,13 +12,9 @@ type Props = {
   loading?: boolean
 }
 
-// normalizeOptions accepts plain strings (label = value, no group) and
-// richer {value,label,group} objects; grouping is presentation-only.
 function normalizeOptions(options: Option[]): { value: string; label: string; group: string }[] {
   return options.map(o =>
-    typeof o === 'string'
-      ? { value: o, label: o, group: '' }
-      : { value: o.value, label: o.label || o.value, group: o.group || '' }
+    typeof o === 'string' ? { value: o, label: o, group: '' } : { value: o.value, label: o.label || o.value, group: o.group || '' }
   )
 }
 
@@ -49,9 +45,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
 
   const selectedSet = new Set(value)
 
-  const updateRect = () => {
-    if (rootRef.current) setRect(rootRef.current.getBoundingClientRect())
-  }
+  const updateRect = () => { if (rootRef.current) setRect(rootRef.current.getBoundingClientRect()) }
   useEffect(() => {
     if (!open) return
     updateRect()
@@ -59,10 +53,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
     const onResize = () => updateRect()
     window.addEventListener('scroll', onScroll, true)
     window.addEventListener('resize', onResize)
-    return () => {
-      window.removeEventListener('scroll', onScroll, true)
-      window.removeEventListener('resize', onResize)
-    }
+    return () => { window.removeEventListener('scroll', onScroll, true); window.removeEventListener('resize', onResize) }
   }, [open, query, value.length])
 
   useEffect(() => {
@@ -76,26 +67,17 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
     return () => document.removeEventListener('mousedown', onDown)
   }, [])
 
-  useEffect(() => {
-    if (highlight >= rows.length) setHighlight(rows.length ? rows.length - 1 : 0)
-  }, [rows.length, highlight])
+  useEffect(() => { if (highlight >= rows.length) setHighlight(rows.length ? rows.length - 1 : 0) }, [rows.length, highlight])
 
   const add = (v: string) => {
     const t = v.trim()
     if (!t || value.includes(t)) return
     onChange([...value, t])
-    setQuery('')
-    setOpen(true)
-    setHighlight(0)
+    setQuery(''); setOpen(true); setHighlight(0)
     requestAnimationFrame(() => inputRef.current?.focus())
   }
-  const remove = (v: string) => {
-    onChange(value.filter(x => x !== v))
-  }
-  const toggle = (v: string) => {
-    if (selectedSet.has(v)) remove(v)
-    else add(v)
-  }
+  const remove = (v: string) => { onChange(value.filter(x => x !== v)) }
+  const toggle = (v: string) => { if (selectedSet.has(v)) remove(v); else add(v) }
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'ArrowDown') {
@@ -107,10 +89,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
       setHighlight(h => Math.max(h - 1, 0))
     } else if (e.key === 'Enter') {
       if (!open) {
-        if (trimmed && !value.includes(trimmed)) {
-          e.preventDefault()
-          add(trimmed)
-        }
+        if (trimmed && !value.includes(trimmed)) { e.preventDefault(); add(trimmed) }
         return
       }
       if (rows.length === 0) return
@@ -120,12 +99,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
       if (cur.kind === 'add') add(cur.value)
       else toggle(cur.value)
     } else if (e.key === 'Escape') {
-      if (open) {
-        e.preventDefault()
-        e.stopPropagation()
-        setOpen(false)
-        return
-      }
+      if (open) { e.preventDefault(); e.stopPropagation(); setOpen(false); return }
     } else if (e.key === 'Backspace' && !query && value.length) {
       remove(value[value.length - 1])
     }
@@ -136,34 +110,17 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
     const spaceBelow = window.innerHeight - rect.bottom - 8
     const spaceAbove = rect.top - 8
     let top: number
-    if (spaceBelow < dropdownHeight && spaceAbove > spaceBelow) {
-      top = Math.max(8, rect.top - dropdownHeight - 8)
-    } else {
-      top = rect.bottom + 8
-      if (top + dropdownHeight > window.innerHeight - 8) {
-        top = Math.max(8, window.innerHeight - dropdownHeight - 8)
-      }
-    }
+    if (spaceBelow < dropdownHeight && spaceAbove > spaceBelow) top = Math.max(8, rect.top - dropdownHeight - 8)
+    else { top = rect.bottom + 8; if (top + dropdownHeight > window.innerHeight - 8) top = Math.max(8, window.innerHeight - dropdownHeight - 8) }
     let left = rect.left
     let width = rect.width
-    if (left + width > window.innerWidth - 8) {
-      left = Math.max(8, window.innerWidth - width - 8)
-    }
+    if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - width - 8)
     return (
-      <div
-        ref={dropdownRef}
-        style={{
-          position: 'fixed',
-          top,
-          left,
-          width,
-          zIndex: 60,
-        }}
-        className="bg-surface border border-stone rounded-xl shadow-xl overflow-hidden"
-      >
-        <div className="max-h-[260px] overflow-auto py-1">
+      <div ref={dropdownRef} style={{ position: 'fixed', top, left, width, zIndex: 60 }}
+        className="bg-surface border border-stone/70 rounded-xl shadow-pop overflow-hidden backdrop-blur-xl">
+        <div className="max-h-[260px] overflow-auto py-1.5">
           {rows.length === 0 ? (
-            <div className="px-3 py-3 text-xs text-muted text-center">
+            <div className="px-3 py-4 text-xs text-muted text-center">
               {loading ? 'Loading models…' : query ? 'No matches — press Enter to add as wildcard' : 'No models found'}
             </div>
           ) : (
@@ -171,50 +128,43 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
               const isAdd = r.kind === 'add'
               const isSelected = !isAdd && selectedSet.has(r.value)
               const isActive = idx === highlight
-              // Group header when this row starts a new provider group.
               const prev = idx > 0 ? rows[idx - 1] : null
               const showGroup = !isAdd && !!r.group && (!prev || prev.kind === 'add' || prev.group !== r.group)
               return (
                 <div key={`${r.kind}-${r.value}-${idx}`}>
                   {showGroup && (
-                    <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-amber/80 bg-graphite/40 border-t border-stone/40 first:border-t-0">
+                    <div className="px-3 pt-2.5 pb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-accent bg-raised/40 border-y border-stone/40 first:border-t-0">
                       {r.group}
                     </div>
                   )}
-                <button
-                  type="button"
-                  onMouseEnter={() => setHighlight(idx)}
-                  onMouseDown={e => { e.preventDefault(); if (isAdd) add(r.value); else toggle(r.value) }}
-                  className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 text-sm ${isActive ? 'bg-amber/15' : 'hover:bg-graphite/60'} font-mono text-xs`}
-                >
-                  <span className="flex items-center gap-2 min-w-0">
-                    {isAdd ? (
-                      <>
-                        <span className="w-5 h-5 rounded-full border border-amber/40 bg-amber/10 flex items-center justify-center text-[10px] text-amber">+</span>
-                        <span className="truncate">Add <span className="text-amber font-semibold">"{r.value}"</span></span>
-                        <span className="hidden sm:inline font-mono text-[10px] text-muted ml-1">(wildcard allowed)</span>
-                      </>
-                    ) : (
-                      <>
-                        <span className={`w-5 h-5 rounded-md border flex items-center justify-center text-[10px] leading-none shrink-0 ${isSelected ? 'bg-teal border-teal text-ink' : 'border-stone bg-graphite text-transparent'}`}>
-                          {isSelected ? '✓' : ''}
-                        </span>
-                        <span className="truncate" title={r.value}>{r.label}</span>
-                      </>
-                    )}
-                  </span>
-                  {isAdd ? (
-                    <span className="font-mono text-[10px] text-muted shrink-0">Enter</span>
-                  ) : isSelected ? (
-                    <span className="font-mono text-[10px] text-teal shrink-0">selected</span>
-                  ) : null}
-                </button>
+                  <button type="button" onMouseEnter={() => setHighlight(idx)}
+                    onMouseDown={e => { e.preventDefault(); if (isAdd) add(r.value); else toggle(r.value) }}
+                    className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 text-sm ${isActive ? 'bg-accent/10' : ''} font-mono text-xs transition-colors`}>
+                    <span className="flex items-center gap-2 min-w-0">
+                      {isAdd ? (
+                        <>
+                          <span className="w-5 h-5 rounded-full border border-accent/40 bg-accent/10 flex items-center justify-center text-[11px] text-accent">+</span>
+                          <span className="truncate">Add <span className="text-accent font-semibold">"{r.value}"</span></span>
+                          <span className="hidden sm:inline font-mono text-[10px] text-muted ml-1">(wildcard allowed)</span>
+                        </>
+                      ) : (
+                        <>
+                          <span className={`w-5 h-5 rounded-lg border flex items-center justify-center text-[10px] leading-none shrink-0 transition-all ${isSelected ? 'bg-accent border-transparent text-onaccent' : 'border-stone bg-app text-transparent'}`}>
+                            {isSelected ? '✓' : ''}
+                          </span>
+                          <span className="truncate" title={r.value}>{r.label}</span>
+                        </>
+                      )}
+                    </span>
+                    {isAdd ? <span className="font-mono text-[10px] text-muted shrink-0">Enter</span>
+                      : isSelected ? <span className="font-mono text-[10px] text-accent shrink-0">selected</span> : null}
+                  </button>
                 </div>
               )
             })
           )}
         </div>
-        <div className="border-t border-stone/50 px-3 py-2 flex items-center justify-between">
+        <div className="border-t border-stone/60 px-3 py-2 flex items-center justify-between bg-raised/30">
           <span className="font-mono text-[10px] text-muted">{value.length === 0 ? 'Empty = all models allowed' : `${value.length} model${value.length===1?'':'s'} restricted`}</span>
           {value.length > 0 && (
             <button type="button" onMouseDown={e=>{e.preventDefault(); onChange([])}} className="font-mono text-[10px] text-muted hover:text-paper underline">Clear all</button>
@@ -226,39 +176,25 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
 
   return (
     <div ref={rootRef} className="relative">
-      <div
-        onClick={() => inputRef.current?.focus()}
-        className={`flex flex-wrap items-center gap-1.5 min-h-[42px] bg-graphite border rounded-xl px-2 py-2 cursor-text transition-colors ${open ? 'border-amber/50 ring-1 ring-amber/20' : 'border-stone hover:border-stone'} ${disabled ? 'opacity-60 pointer-events-none' : ''}`}
-      >
+      <div onClick={() => inputRef.current?.focus()}
+        className={`flex flex-wrap items-center gap-1.5 min-h-[44px] bg-app/70 border rounded-xl px-2.5 py-2 cursor-text transition-all ${open ? 'border-accent/50 ring-2 ring-accent/20' : 'border-stone/70 hover:border-stone'} ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
         {value.map(v => (
-          <span key={v} className="inline-flex items-center gap-1 bg-surface border border-stone rounded-full pl-2.5 pr-1 py-1 text-xs font-mono">
+          <span key={v} className="inline-flex items-center gap-1 bg-raised border border-accent/25 rounded-full pl-2.5 pr-1 py-1 text-xs font-mono text-paper">
             <span className="max-w-[180px] truncate" title={v}>{v}</span>
-            <button
-              type="button"
-              onClick={e => { e.stopPropagation(); remove(v) }}
-              className="ml-0.5 w-5 h-5 flex items-center justify-center rounded-full hover:bg-stone text-muted hover:text-paper leading-none"
-              aria-label={`Remove ${v}`}
-            >
-              ×
-            </button>
+            <button type="button" onClick={e => { e.stopPropagation(); remove(v) }}
+              className="ml-0.5 w-5 h-5 flex items-center justify-center rounded-full hover:bg-stone text-muted hover:text-paper leading-none" aria-label={`Remove ${v}`}>×</button>
           </span>
         ))}
-        <input
-          ref={inputRef}
-          value={query}
+        <input ref={inputRef} value={query}
           onChange={e => { setQuery(e.target.value); setOpen(true); setHighlight(0) }}
           onFocus={() => { setOpen(true); updateRect() }}
           onKeyDown={onKeyDown}
           placeholder={value.length === 0 ? placeholder : 'Add model...'}
-          className="flex-1 min-w-[140px] bg-transparent outline-none text-sm placeholder:text-muted/60 px-1 py-0.5"
-          disabled={disabled}
-          autoComplete="off"
-          spellCheck={false}
-        />
+          className="flex-1 min-w-[140px] bg-transparent outline-none text-sm placeholder:text-muted/50 px-1 py-0.5"
+          disabled={disabled} autoComplete="off" spellCheck={false} />
         {loading && <span className="font-mono text-[10px] text-muted px-1">loading…</span>}
         {!loading && <span className="ml-auto text-muted text-xs px-1 select-none pointer-events-none">{open ? '▴' : '▾'}</span>}
       </div>
-
       {dropdown ? createPortal(dropdown, document.body) : null}
     </div>
   )

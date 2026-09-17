@@ -168,6 +168,25 @@ func TestTrailerError(t *testing.T) {
 	}
 }
 
+func TestDecodeToolCallPreservesEmptyForContinuations(t *testing.T) {
+	// Continuation fragments carry only args; empty ID/Name must survive so
+	// the accumulator can group them under the head's call.
+	payload := message(6, stringField(3, `{"a":`))
+	deltas, err := DecodeChatResponse(payload)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(deltas) != 1 || deltas[0].Type != "tool" {
+		t.Fatalf("deltas = %+v", deltas)
+	}
+	if deltas[0].ID != "" {
+		t.Fatalf("continuation ID must stay empty, got %q", deltas[0].ID)
+	}
+	if deltas[0].Name != "" {
+		t.Fatalf("continuation Name must stay empty, got %q", deltas[0].Name)
+	}
+}
+
 func TestDecodeModels(t *testing.T) {
 	cfg := func(id, name string, disabled uint64, ctx uint64) []byte {
 		return concat(

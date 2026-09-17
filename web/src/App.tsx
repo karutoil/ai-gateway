@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Routes, Route, Link, NavLink, useLocation, Navigate } from 'react-router-dom'
+import { Routes, Route, Link, NavLink, useLocation, useNavigate, Navigate } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Providers from './pages/Providers'
 import Routing from './pages/Routing'
@@ -18,19 +18,15 @@ import { authenticatePasskey } from './lib/webauthn'
 import { extractApiError } from './lib/api'
 import { setCurrentPermissions, can, type Perm } from './lib/permissions'
 import {
-  Icon, Button, Input, Card, ErrorNote, SegmentedControl,
+  Icon, Button, Input, Card, ErrorNote, SegmentedControl, Badge, Avatar,
   useClickOutside, useToastStore, Toaster, type IconName,
 } from './components/ui'
 
 type SessionUser = { username: string; role: string; permissions?: string[] }
 
 function useAuth() {
-  // Identity lives in React state only. Authentication rides on the HttpOnly
-  // "gw_token" session cookie — the JWT is never stored client-side.
   const [user, setUser] = useState<SessionUser|null>(null)
   const [checking, setChecking] = useState(true)
-  // One-line message shown above the login form (e.g. after a password change
-  // revoked the session, or after a 401 mid-session).
   const [notice, setNotice] = useState('')
   const isAuthed = !!user
 
@@ -42,7 +38,6 @@ function useAuth() {
         if (res.ok && !cancelled) {
           const me = await res.json()
           setUser({ username: me.username || '', role: me.role || '', permissions: me.permissions })
-          // Feed the permission module (can()/canSeeKeys() helpers).
           setCurrentPermissions((me.permissions as Perm[] | undefined) ?? null, me.role || '')
         }
       } catch {}
@@ -51,15 +46,8 @@ function useAuth() {
     return () => { cancelled = true }
   }, [])
 
-  // api.ts dispatches "gw:unauthorized" whenever any request comes back 401
-  // (expired/revoked session cookie). Clear identity so the login screen
-  // renders — previously this event had no listener and pages kept failing
-  // silently behind a stale "signed-in" shell.
   useEffect(() => {
-    const onUnauthorized = () => {
-      setUser(null)
-      setCurrentPermissions(null, '')
-    }
+    const onUnauthorized = () => { setUser(null); setCurrentPermissions(null, '') }
     window.addEventListener('gw:unauthorized', onUnauthorized)
     return () => window.removeEventListener('gw:unauthorized', onUnauthorized)
   }, [])
@@ -73,10 +61,7 @@ function useAuth() {
     const body:any = { password: pw }
     if (username) body.username = username
     const res = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify(body)})
-    if (!res.ok) {
-      const t = await res.text()
-      throw new Error(extractApiError(t, 'login failed'))
-    }
+    if (!res.ok) throw new Error(extractApiError(await res.text(), 'login failed'))
     const data = await res.json()
     try {
       const meRes = await fetch('/api/admin/users/me', { credentials: 'same-origin' })
@@ -102,9 +87,7 @@ function useAuth() {
     setUser(null)
     setNotice(message || '')
   }
-
   const clearNotice = () => setNotice('')
-
   return { isAuthed, checking, login, loginWithToken, logout, clearNotice, notice, role: user?.role||'', username: user?.username||'' }
 }
 
@@ -113,8 +96,8 @@ function useTheme() {
     try {
       const saved = localStorage.getItem('gw_theme')
       if (saved === 'light' || saved === 'dark') return saved
-      return 'dark'
-    } catch { return 'dark' }
+      return 'light'
+    } catch { return 'light' }
   })
   useEffect(() => {
     document.documentElement.classList.toggle('light', theme === 'light')
@@ -124,45 +107,42 @@ function useTheme() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Navigation model                                                    */
+/* Navigation model — ordered by operator flow                         */
 /* ------------------------------------------------------------------ */
 
-type NavItem = { to: string; label: string; icon: IconName; adminOnly?: boolean; perm?: Perm; permAny?: Perm[] }
-const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
+type NavItem = { to: string; label: string; icon: IconName; hint: string; adminOnly?: boolean; perm?: Perm; permAny?: Perm[] }
+const NAV_GROUPS: { title: string; caption: string; items: NavItem[] }[] = [
   {
-    title: 'Overview',
+    title: 'Operate', caption: 'Daily traffic',
     items: [
-      // Dashboard/Analytics show SCOPED stats for keys:read_own-only users
-      // (the backend narrows /api/stats to their keys' traffic), so any of
-      // these perms grants access.
-      { to: '/', label: 'Dashboard', icon: 'pulse', permAny: ['logs:read', 'keys:read_own'] },
-      { to: '/analytics', label: 'Analytics', icon: 'chart', permAny: ['analytics:read', 'keys:read_own'] },
+      { to: '/', label: 'Overview', icon: 'pulse', hint: 'Health, spend, onboarding', permAny: ['logs:read', 'keys:read_own'] },
+      { to: '/playground', label: 'Playground', icon: 'play', hint: 'Live test calls' },
+      { to: '/logs', label: 'Requests', icon: 'logs', hint: 'Every proxied call', permAny: ['logs:read', 'keys:read_own'] },
     ],
   },
   {
-    title: 'Control',
+    title: 'Connect', caption: 'Upstream supply',
     items: [
-      { to: '/providers', label: 'Providers', icon: 'server', perm: 'providers:read' },
-      { to: '/models', label: 'Models', icon: 'box', perm: 'catalog:read' },
-      { to: '/routing', label: 'Routing', icon: 'route', perm: 'routing:read' },
+      { to: '/providers', label: 'Providers', icon: 'server', hint: 'Endpoints & health', perm: 'providers:read' },
+      { to: '/models', label: 'Models', icon: 'box', hint: 'Catalog & pricing', perm: 'catalog:read' },
+      { to: '/routing', label: 'Routing', icon: 'route', hint: 'Failover & balancing', perm: 'routing:read' },
     ],
   },
   {
-    title: 'Access',
+    title: 'Govern', caption: 'Access & trust',
     items: [
-      { to: '/keys', label: 'API Keys', icon: 'key', perm: 'keys:read_own' },
-      { to: '/teams', label: 'Teams', icon: 'users', permAny: ['orgs:read', 'orgs:write'] as Perm[] },
-      { to: '/users', label: 'Users', icon: 'userCog', perm: 'users:read' },
-      { to: '/webhooks', label: 'Webhooks', icon: 'zap', perm: 'settings:write' },
-			{ to: '/audit', label: 'Audit', icon: 'shield', perm: 'audit:read' },
+      { to: '/keys', label: 'API Keys', icon: 'key', hint: 'Virtual credentials', perm: 'keys:read_own' },
+      { to: '/teams', label: 'Teams', icon: 'users', hint: 'Orgs & members', permAny: ['orgs:read', 'orgs:write'] as Perm[] },
+      { to: '/users', label: 'Users', icon: 'userCog', hint: 'Roles & passkeys', perm: 'users:read' },
+      { to: '/webhooks', label: 'Webhooks', icon: 'zap', hint: 'Event delivery', perm: 'settings:write' },
+      { to: '/audit', label: 'Audit', icon: 'shield', hint: 'Privileged trail', perm: 'audit:read' },
     ],
   },
   {
-    title: 'System',
+    title: 'Optimize', caption: 'Spend & tuning',
     items: [
-      { to: '/playground', label: 'Playground', icon: 'play' },
-      { to: '/logs', label: 'Request Logs', icon: 'logs', permAny: ['logs:read', 'keys:read_own'] },
-      { to: '/settings', label: 'Settings', icon: 'cog' },
+      { to: '/analytics', label: 'Analytics', icon: 'chart', hint: 'Usage & cost trends', permAny: ['analytics:read', 'keys:read_own'] },
+      { to: '/settings', label: 'Settings', icon: 'cog', hint: 'Catalog & pricing' },
     ],
   },
 ]
@@ -173,9 +153,6 @@ function visibleGroups(role: string) {
       ...g,
       items: g.items.filter((i) => {
         if (i.adminOnly && role !== 'admin') return false
-        // Permission-gated entries: hide when the perm is absent. permAny =
-        // visible when ANY listed perm holds (e.g. Dashboard for org-wide
-        // readers and for keys:read_own users alike).
         if (i.permAny && !i.permAny.some((p) => can(p as Perm))) return false
         if (i.perm && !can(i.perm)) return false
         return true
@@ -184,14 +161,10 @@ function visibleGroups(role: string) {
     .filter((g) => g.items.length > 0)
 }
 
-function pageTitle(pathname: string): string {
-  for (const g of NAV_GROUPS) {
-    for (const i of g.items) {
-      if (i.to === pathname) return i.label
-    }
-  }
-  if (pathname === '/profile') return 'Profile'
-  return 'Dashboard'
+function pageMeta(pathname: string): { label: string; icon: IconName; group: string } {
+  for (const g of NAV_GROUPS) for (const i of g.items) if (i.to === pathname) return { label: i.label, icon: i.icon, group: g.title }
+  if (pathname === '/profile') return { label: 'Profile', icon: 'shield', group: 'Account' }
+  return { label: 'Overview', icon: 'pulse', group: 'Operate' }
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,20 +174,27 @@ function pageTitle(pathname: string): string {
 function SidebarLink({ item, collapsed, active, onNavigate }: {
   item: NavItem; collapsed: boolean; active: boolean; onNavigate?: () => void
 }) {
+  if (collapsed) {
+    return (
+      <NavLink to={item.to} onClick={onNavigate} title={`${item.label} — ${item.hint}`}
+        className={`group relative flex items-center justify-center h-11 w-11 mx-auto rounded-lg transition-colors duration-150 ${
+          active ? 'bg-accent text-onaccent' : 'text-muted hover:text-paper hover:bg-raised'}`}>
+        <Icon name={item.icon} size={18} />
+      </NavLink>
+    )
+  }
   return (
-    <NavLink
-      to={item.to}
-      onClick={onNavigate}
-      title={collapsed ? item.label : undefined}
-      className={`group relative flex items-center rounded-lg text-sm font-medium transition-colors duration-150 outline-none focus-visible:ring-2 focus-visible:ring-teal/50 ${
-        collapsed ? 'justify-center h-10 w-10 mx-auto' : 'gap-3 px-3 h-9'
-      } ${active ? 'bg-raised text-paper' : 'text-muted hover:text-paper hover:bg-stone/40'}`}
-    >
-      <span className={`absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-teal transition-all duration-200 ${
-        active ? 'opacity-100 scale-y-100' : 'opacity-0 scale-y-50'
-      }`} />
-      <Icon name={item.icon} size={17} className={active ? 'text-teal' : 'group-hover:text-paper transition-colors'} />
-      {!collapsed && <span className="truncate">{item.label}</span>}
+    <NavLink to={item.to} onClick={onNavigate}
+      className={`group flex items-center gap-3 px-2.5 py-2 rounded-lg text-sm transition-colors duration-150 border ${
+        active ? 'bg-raised border-stone text-paper' : 'border-transparent text-muted hover:text-paper hover:bg-raised/60'}`}>
+      <span className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 transition-colors ${active ? 'bg-accent text-onaccent' : 'bg-raised text-muted group-hover:text-paper border border-stone'}`}>
+        <Icon name={item.icon} size={16} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className={`block leading-none ${active ? 'font-semibold' : 'font-medium'}`}>{item.label}</span>
+        <span className="block text-[11px] text-muted/80 mt-1 leading-none truncate">{item.hint}</span>
+      </span>
+      {active && <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />}
     </NavLink>
   )
 }
@@ -223,15 +203,16 @@ function SidebarBody({ role, pathname, collapsed, onNavigate }: {
   role: string; pathname: string; collapsed: boolean; onNavigate?: () => void
 }) {
   return (
-    <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+    <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-6">
       {visibleGroups(role).map((g) => (
         <div key={g.title}>
           {!collapsed && (
-            <div className="px-3 mb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted/70">
-              {g.title}
+            <div className="px-2 mb-2 flex items-baseline justify-between">
+              <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted/70">{g.title}</span>
+              <span className="text-[10px] text-muted/50">{g.caption}</span>
             </div>
           )}
-          <div className={collapsed ? 'space-y-1' : 'space-y-0.5'}>
+          <div className={collapsed ? 'space-y-1.5' : 'space-y-1'}>
             {g.items.map((i) => (
               <SidebarLink key={i.to} item={i} collapsed={collapsed} active={pathname === i.to} onNavigate={onNavigate} />
             ))}
@@ -244,14 +225,14 @@ function SidebarBody({ role, pathname, collapsed, onNavigate }: {
 
 function BrandMark({ collapsed }: { collapsed?: boolean }) {
   return (
-    <div className={`flex items-center gap-2.5 ${collapsed ? 'justify-center' : 'px-1'}`}>
-      <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-teal to-amber flex items-center justify-center shrink-0 shadow-glow">
-        <Icon name="zap" size={16} className="text-graphite" />
+    <div className={`flex items-center gap-2.5 ${collapsed ? 'justify-center' : ''}`}>
+      <div className="w-9 h-9 rounded-lg bg-accent flex items-center justify-center shrink-0">
+        <Icon name="zap" size={17} className="text-onaccent" />
       </div>
       {!collapsed && (
-        <div className="leading-tight">
-          <div className="font-semibold tracking-tight">Gateway</div>
-          <div className="text-[10px] uppercase tracking-[0.14em] text-muted">Unified LLM</div>
+        <div className="leading-tight min-w-0">
+          <div className="font-display font-semibold text-[17px]">AI Gateway</div>
+          <div className="text-[9px] font-semibold uppercase tracking-[0.22em] text-muted">Control plane</div>
         </div>
       )}
     </div>
@@ -266,26 +247,27 @@ export default function App() {
   const { isAuthed, checking, login, loginWithToken, logout, clearNotice, notice, role, username: accountName } = useAuth()
   const { theme, toggle } = useTheme()
   const loc = useLocation()
-  const [sidebarOpen, setSidebarOpen] = useState(false)     // mobile drawer
+  const navigate = useNavigate()
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [railCollapsed, setRailCollapsed] = useState(() => {
     try { return localStorage.getItem('gw_rail') === '1' } catch { return false }
   })
+  const [navFilter, setNavFilter] = useState('')
 
   useEffect(() => {
     try { localStorage.setItem('gw_rail', railCollapsed ? '1' : '0') } catch {}
   }, [railCollapsed])
   useEffect(() => { setSidebarOpen(false) }, [loc.pathname])
 
-  /* ---------------- Loading / Login screens ---------------- */
-
   if (checking) {
     return (
       <div className="min-h-screen grid place-items-center bg-app">
         <div className="flex flex-col items-center gap-4">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-teal to-amber flex items-center justify-center shadow-glow animate-pulse-soft">
-            <Icon name="zap" size={20} className="text-graphite" />
+          <div className="w-12 h-12 rounded-xl bg-accent flex items-center justify-center animate-pulse-soft">
+            <Icon name="zap" size={22} className="text-onaccent" />
           </div>
-          <div className="text-muted text-xs tracking-widest uppercase">Restoring session</div>
+          <div className="font-display text-lg font-semibold">AI Gateway</div>
+          <div className="text-muted text-[11px] tracking-[0.2em] uppercase">Restoring session</div>
         </div>
       </div>
     )
@@ -294,66 +276,69 @@ export default function App() {
   if (!isAuthed) {
     return (
       <>
-        <LoginScreen
-          theme={theme} toggle={toggle} login={login} loginWithToken={loginWithToken}
-          notice={notice} onNoticeConsumed={clearNotice}
-        />
-        {/* Mounted outside the auth branch so login-screen toasts are visible. */}
+        <LoginScreen theme={theme} toggle={toggle} login={login} loginWithToken={loginWithToken} notice={notice} onNoticeConsumed={clearNotice} />
         <Toaster />
       </>
     )
   }
 
-  /* ---------------- Authenticated shell ---------------- */
-
   const collapsed = railCollapsed
-
-  const userMenu = (
-    <UserMenu accountName={accountName} role={role} onLogout={logout} />
-  )
+  const meta = pageMeta(loc.pathname)
 
   return (
     <div className="min-h-screen bg-app">
-      {/* Desktop sidebar */}
-      <aside className={`hidden lg:flex fixed inset-y-0 left-0 z-30 flex-col border-r border-stone bg-app transition-all duration-200 ${
-        collapsed ? 'w-[68px]' : 'w-60'
-      }`}>
-        <div className={`h-14 flex items-center border-b border-stone shrink-0 ${collapsed ? 'justify-center px-0' : 'px-4'}`}>
+      <aside className={`hidden lg:flex fixed inset-y-0 left-0 z-30 flex-col border-r border-stone bg-surface transition-all duration-200 ${collapsed ? 'w-[76px]' : 'w-[272px]'}`}>
+        <div className={`h-16 flex items-center border-b border-stone shrink-0 ${collapsed ? 'justify-center px-0' : 'px-4'}`}>
           <BrandMark collapsed={collapsed} />
         </div>
-        <SidebarBody role={role} pathname={loc.pathname} collapsed={collapsed} />
-        <div className="border-t border-stone p-2">
-          <button
-            onClick={() => setRailCollapsed(c => !c)}
-            className="w-full h-9 rounded-lg flex items-center justify-center gap-2 text-muted hover:text-paper hover:bg-stone/40 transition-colors text-xs"
-            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
+        {!collapsed && (
+          <div className="px-3 pt-3 shrink-0">
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={14} /></span>
+              <input value={navFilter} onChange={e => setNavFilter(e.target.value)} placeholder="Jump to…"
+                className="w-full bg-app border border-stone rounded-lg pl-9 pr-8 h-9 text-[13px] placeholder:text-muted/50 focus:outline-none focus:border-accent/60 focus:ring-2 focus:ring-accent/15" />
+              <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] font-mono text-muted/60 border border-stone rounded px-1.5 py-0.5">/</span>
+            </div>
+          </div>
+        )}
+        <div className="flex-1 min-h-0 flex flex-col">
+          <FilteredSidebar role={role} pathname={loc.pathname} collapsed={collapsed} filter={navFilter} />
+        </div>
+        <div className="border-t border-stone p-2.5 space-y-2 shrink-0">
+          {!collapsed && (
+            <button onClick={() => navigate('/playground')}
+              className="w-full rounded-lg bg-accent text-onaccent text-[13px] font-semibold h-9 flex items-center justify-center gap-2 hover:bg-accent/90 transition-colors">
+              <Icon name="play" size={14} /> New test call
+            </button>
+          )}
+          <button onClick={() => setRailCollapsed(c => !c)}
+            className="w-full h-9 rounded-lg flex items-center justify-center gap-2 text-muted hover:text-paper hover:bg-raised transition-colors text-xs font-medium"
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
             <Icon name={collapsed ? 'chevronRight' : 'chevronLeft'} size={15} />
             {!collapsed && <span>Collapse</span>}
           </button>
         </div>
       </aside>
 
-      {/* Mobile drawer */}
       {sidebarOpen && (
         <div className="lg:hidden fixed inset-0 z-40" role="dialog" aria-modal="true">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm animate-fade" onClick={() => setSidebarOpen(false)} />
-          <div className="absolute inset-y-0 left-0 w-64 bg-app border-r border-stone shadow-pop flex flex-col animate-sidebar">
-            <div className="h-14 flex items-center justify-between px-4 border-b border-stone">
+          <div className="absolute inset-0 bg-black/60 animate-fade" onClick={() => setSidebarOpen(false)} />
+          <div className="absolute inset-y-0 left-0 w-[300px] bg-surface border-r border-stone shadow-pop flex flex-col animate-sidebar">
+            <div className="h-16 flex items-center justify-between px-4 border-b border-stone">
               <BrandMark />
               <button onClick={() => setSidebarOpen(false)} aria-label="Close menu"
-                className="w-8 h-8 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-stone/50">
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-raised">
                 <Icon name="x" size={16} />
               </button>
             </div>
             <SidebarBody role={role} pathname={loc.pathname} collapsed={false} onNavigate={() => setSidebarOpen(false)} />
-            <div className="border-t border-stone p-3">
+            <div className="border-t border-stone p-3 space-y-1">
               <Link to="/profile" onClick={() => setSidebarOpen(false)}
-                className="flex items-center gap-3 px-2 py-2 rounded-lg text-sm text-muted hover:text-paper hover:bg-stone/40">
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-muted hover:text-paper hover:bg-raised">
                 <Icon name="shield" size={16} /> Profile
               </Link>
               <button onClick={() => logout()}
-                className="w-full flex items-center gap-3 px-2 py-2 rounded-lg text-sm text-muted hover:text-paper hover:bg-stone/40">
+                className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-muted hover:text-paper hover:bg-raised">
                 <Icon name="logout" size={16} /> Log out
               </button>
             </div>
@@ -361,34 +346,46 @@ export default function App() {
         </div>
       )}
 
-      {/* Main column */}
-      <div className={`transition-[padding] duration-200 ${collapsed ? 'lg:pl-[68px]' : 'lg:pl-60'}`}>
-        {/* Topbar */}
-        <header className="sticky top-0 z-20 h-14 border-b border-stone bg-app/90 backdrop-blur flex items-center gap-3 px-4 lg:px-6">
+      <div className={`transition-[padding] duration-200 ${collapsed ? 'lg:pl-[76px]' : 'lg:pl-[272px]'}`}>
+        <header className="sticky top-0 z-20 h-16 border-b border-stone bg-surface flex items-center gap-3 px-4 lg:px-6">
           <button onClick={() => setSidebarOpen(true)}
-            className="lg:hidden w-9 h-9 -ml-1 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-stone/40"
-            aria-label="Open menu">
+            className="lg:hidden w-9 h-9 -ml-1 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-raised" aria-label="Open menu">
             <Icon name="menu" size={18} />
           </button>
-
-          <div className="min-w-0 flex items-center gap-2 text-sm">
-            <span className="hidden sm:inline text-muted/70">Gateway</span>
-            <span className="hidden sm:inline text-muted/40">/</span>
-            <span className="font-medium truncate">{pageTitle(loc.pathname)}</span>
+          <div className="min-w-0 flex items-center gap-2.5">
+            <span className="w-8 h-8 rounded-md bg-raised border border-stone hidden sm:flex items-center justify-center text-accent">
+              <Icon name={meta.icon} size={16} />
+            </span>
+            <div className="min-w-0 leading-tight">
+              <div className="flex items-center gap-2 text-[13px]">
+                <span className="text-muted/60">{meta.group}</span>
+                <Icon name="chevronRight" size={12} className="text-muted/40" />
+                <span className="font-semibold truncate">{meta.label}</span>
+              </div>
+              <div className="hidden md:flex items-center gap-2 mt-0.5">
+                <span className="flex items-center gap-1.5 text-[11px] text-accent font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse-soft" /> Live
+                </span>
+                <span className="text-[11px] text-muted/60 font-mono">{loc.pathname}</span>
+              </div>
+            </div>
           </div>
-
           <div className="ml-auto flex items-center gap-1.5">
+            <button onClick={() => navigate('/logs')} title="Search requests"
+              className="hidden md:flex items-center gap-2 h-9 pl-3 pr-2 rounded-lg border border-stone bg-app text-muted hover:text-paper hover:border-muted/60 text-[13px] transition-colors">
+              <Icon name="search" size={14} /><span className="text-muted/70">Search requests…</span>
+              <span className="font-mono text-[10px] border border-stone rounded px-1.5 py-0.5">⌘K</span>
+            </button>
             <button onClick={toggle}
-              className="w-9 h-9 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-stone/40 transition-colors"
+              className="w-9 h-9 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-raised transition-colors"
               aria-label="Toggle theme" title={theme === 'dark' ? 'Switch to light' : 'Switch to dark'}>
               <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={16} />
             </button>
-            {userMenu}
+            <UserMenu accountName={accountName} role={role} onLogout={logout} />
           </div>
         </header>
 
-        {/* Page content with route transition */}
-        <main key={loc.pathname} className="max-w-[1240px] mx-auto px-4 lg:px-6 py-6 lg:py-8 animate-page min-h-[calc(100vh-56px)]">
+        <main key={loc.pathname} className="max-w-[1280px] mx-auto px-4 lg:px-8 py-6 lg:py-8 animate-page min-h-[calc(100vh-64px)]">
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/providers" element={<Providers role={role} />} />
@@ -401,16 +398,41 @@ export default function App() {
             <Route path="/settings" element={<Settings role={role} />} />
             <Route path="/teams" element={<Teams role={role} />} />
             <Route path="/webhooks" element={<WebhooksPage />} />
-			<Route path="/users" element={role==='admin' ? <Users /> : <Navigate to="/" replace />} />
+            <Route path="/users" element={role==='admin' ? <Users /> : <Navigate to="/" replace />} />
             <Route path="/audit" element={role==='admin' ? <Audit /> : <Navigate to="/" replace />} />
             <Route path="/profile" element={<Profile onSessionRevoked={() => logout('Password changed — please sign in again')} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          <footer className="mt-10 pt-5 border-t border-stone flex flex-wrap items-center gap-3 text-[11px] text-muted/70">
+            <span className="flex items-center gap-1.5"><span className="w-5 h-5 rounded bg-accent flex items-center justify-center"><Icon name="zap" size={11} className="text-onaccent" /></span> AI Gateway control plane</span>
+            <span className="font-mono">OpenAI · Anthropic · Responses compatible</span>
+            <span className="ml-auto font-mono">Go core · {role || 'session'}</span>
+          </footer>
         </main>
       </div>
-
       <Toaster />
     </div>
+  )
+}
+
+function FilteredSidebar({ role, pathname, collapsed, filter }: { role: string; pathname: string; collapsed: boolean; filter: string }) {
+  const q = filter.trim().toLowerCase()
+  if (!q || collapsed) return <SidebarBody role={role} pathname={pathname} collapsed={collapsed} />
+  const groups = visibleGroups(role)
+    .map(g => ({ ...g, items: g.items.filter(i => i.label.toLowerCase().includes(q) || i.hint.toLowerCase().includes(q)) }))
+    .filter(g => g.items.length > 0)
+  if (groups.length === 0) return <div className="p-4 text-sm text-muted">No matches for “{filter}”.</div>
+  return (
+    <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
+      {groups.map(g => (
+        <div key={g.title}>
+          <div className="px-2 mb-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-muted/70">{g.title}</div>
+          <div className="space-y-1">
+            {g.items.map(i => <SidebarLink key={i.to} item={i} collapsed={false} active={pathname === i.to} />)}
+          </div>
+        </div>
+      ))}
+    </nav>
   )
 }
 
@@ -430,45 +452,37 @@ function UserMenu({ accountName, role, onLogout }: { accountName: string; role: 
   return (
     <div className="relative" ref={ref}>
       <button onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-2 h-9 pl-1 pr-2 rounded-lg hover:bg-stone/40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal/50"
+        className="flex items-center gap-2 h-10 pl-1.5 pr-2.5 rounded-lg border border-stone bg-app hover:border-muted/60 transition-colors"
         aria-haspopup="menu" aria-expanded={open}>
-        <Avatar name={accountName} />
-        <span className="hidden md:block text-sm max-w-[120px] truncate">{accountName || 'admin'}</span>
+        <Avatar name={accountName} size={7} />
+        <span className="hidden md:block text-sm font-medium max-w-[120px] truncate">{accountName || 'admin'}</span>
+        <span className="hidden md:inline-flex text-[10px] font-bold uppercase tracking-wider text-accent bg-accent/10 border border-accent/25 rounded-full px-2 py-0.5">{role || 'admin'}</span>
         <Icon name="chevronDown" size={13} className={`text-muted transition-transform duration-150 ${open ? 'rotate-180' : ''}`} />
       </button>
       {open && (
-        <div role="menu" className="absolute right-0 top-full mt-2 w-56 rounded-xl border border-stone bg-surface shadow-pop p-1.5 animate-modal origin-top-right">
-          <div className="px-3 py-2.5 border-b border-stone mb-1.5">
-            <div className="text-sm font-medium truncate">{accountName || 'admin'}</div>
-            <div className="flex items-center gap-1.5 mt-0.5">
-              <span className="inline-flex items-center gap-1 text-[11px] text-teal">
-                <Icon name="shield" size={11} />{role || 'admin'}
-              </span>
+        <div role="menu" className="absolute right-0 top-full mt-2 w-60 rounded-xl border border-stone bg-surface shadow-pop p-2 animate-modal origin-top-right">
+          <div className="px-3 py-3 border-b border-stone mb-1.5 flex items-center gap-2.5">
+            <Avatar name={accountName} size={9} />
+            <div className="min-w-0">
+              <div className="text-sm font-semibold truncate">{accountName || 'admin'}</div>
+              <div className="text-[11px] text-muted capitalize">{role || 'admin'} access</div>
             </div>
           </div>
           <Link to="/profile" onClick={() => setOpen(false)} role="menuitem"
-            className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-muted hover:text-paper hover:bg-stone/40 transition-colors">
+            className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm text-muted hover:text-paper hover:bg-raised transition-colors">
             <Icon name="shield" size={15} /> Profile & security
           </Link>
+          <Link to="/settings" onClick={() => setOpen(false)} role="menuitem"
+            className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm text-muted hover:text-paper hover:bg-raised transition-colors">
+            <Icon name="cog" size={15} /> Workspace settings
+          </Link>
           <button onClick={() => { setOpen(false); onLogout() }} role="menuitem"
-            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm text-muted hover:text-paper hover:bg-stone/40 transition-colors text-left">
+            className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm text-muted hover:text-paper hover:bg-raised transition-colors text-left">
             <Icon name="logout" size={15} /> Log out
           </button>
         </div>
       )}
     </div>
-  )
-}
-
-function Avatar({ name, size = 7 }: { name: string; size?: number }) {
-  const letter = (name || 'A')[0].toUpperCase()
-  return (
-    <span
-      style={{ width: `${size * 4}px`, height: `${size * 4}px` }}
-      className="rounded-lg bg-gradient-to-br from-teal/80 to-amber/80 flex items-center justify-center text-graphite text-xs font-bold select-none"
-    >
-      {letter}
-    </span>
   )
 }
 
@@ -525,63 +539,64 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
   }
 
   return (
-    <div className="min-h-screen grid lg:grid-cols-[1fr_1.1fr] bg-app bg-grid">
-      {/* Left: brand story */}
-      <div className="hidden lg:flex flex-col justify-between p-12 border-r border-stone/60">
+    <div className="min-h-screen grid lg:grid-cols-[1.1fr_1fr] bg-app">
+      {/* Left: ink ledger panel */}
+      <div className="hidden lg:flex flex-col justify-between p-12 bg-ink text-cream">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-teal to-amber flex items-center justify-center shadow-glow">
-            <Icon name="zap" size={18} className="text-graphite" />
+          <div className="w-10 h-10 rounded-lg bg-accent flex items-center justify-center">
+            <Icon name="zap" size={19} className="text-onaccent" />
           </div>
           <div className="leading-tight">
-            <div className="font-semibold tracking-tight">AI Gateway</div>
-            <div className="text-[10px] uppercase tracking-[0.16em] text-muted">One domain · every model</div>
+            <div className="font-display font-semibold text-[17px]">AI Gateway</div>
+            <div className="text-[10px] font-semibold uppercase tracking-[0.22em] opacity-60">LLM control plane</div>
           </div>
         </div>
-        <div className="max-w-md">
-          <h1 className="text-3xl font-semibold tracking-tight leading-snug">
-            Route, observe and govern<br/>every LLM call — <span className="text-teal">in one place.</span>
+        <div className="max-w-lg">
+          <div className="font-mono text-[11px] uppercase tracking-[0.2em] text-accent">Ledger · Vol. I</div>
+          <h1 className="font-display text-[52px] leading-[1.02] font-semibold mt-3">
+            Every model,<br />one bill,<br />no surprises.
           </h1>
-          <p className="text-muted mt-4 leading-relaxed text-sm">
-            OpenAI &amp; Anthropic compatible APIs, curated provider routing with load balancing,
-            virtual keys, budgets, caching and full request observability.
+          <p className="opacity-70 mt-4 leading-relaxed text-[15px]">
+            Route bare model names across providers with failover, enforce
+            budgets on virtual keys, and account for every token.
           </p>
-          <div className="mt-6 flex flex-wrap gap-2">
-            {['Routing', 'Budgets', 'Caching', 'Observability'].map((f) => (
-              <span key={f} className="text-xs text-muted border border-stone rounded-full px-2.5 py-1">{f}</span>
+          <dl className="mt-8 border-t border-cream/15">
+            {[
+              ['01', 'Routing', 'Round-robin, weighted, failover'],
+              ['02', 'Budgets', 'Per-key caps, rotation, allowlists'],
+              ['03', 'Ledger', 'TTFT, tokens and cost per call'],
+            ].map(([n, t, d]) => (
+              <div key={n} className="flex items-baseline gap-4 py-3.5 border-b border-cream/15">
+                <span className="font-mono text-xs text-accent">{n}</span>
+                <span className="font-semibold text-[15px] w-24">{t}</span>
+                <span className="text-sm opacity-60">{d}</span>
+              </div>
             ))}
-          </div>
+          </dl>
         </div>
-        <div className="text-xs text-muted">Fast Go core · OpenAI / Anthropic / Responses compatible</div>
+        <div className="font-mono text-[11px] opacity-50">Fast Go core · OpenAI / Anthropic / Responses</div>
       </div>
 
-      {/* Right: sign-in card */}
+      {/* Right: sign-in form */}
       <div className="flex items-center justify-center p-6">
         <Card className="w-full max-w-md animate-page">
           <div className="mb-6">
             <div className="lg:hidden flex items-center gap-2 mb-5">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-teal to-amber flex items-center justify-center">
-                <Icon name="zap" size={15} className="text-graphite" />
+              <div className="w-9 h-9 rounded-lg bg-accent flex items-center justify-center">
+                <Icon name="zap" size={16} className="text-onaccent" />
               </div>
-              <span className="font-semibold tracking-tight">AI Gateway</span>
+              <div className="font-display font-semibold">AI Gateway</div>
             </div>
-            <h2 className="text-xl font-semibold tracking-tight">Sign in</h2>
-            <p className="text-muted text-sm mt-1">Manage providers, routing, keys and spend.</p>
+            <h2 className="font-display text-3xl font-semibold">Welcome back</h2>
+            <p className="text-muted text-sm mt-1">Sign in to open the ledger.</p>
           </div>
 
-          <SegmentedControl
-            value={mode}
-            onChange={setMode}
-            options={[
-              { value: 'password', label: 'Password' },
-              { value: 'passkey', label: 'Passkey' },
-              { value: 'recovery', label: 'Recovery' },
-            ]}
-          />
+          <SegmentedControl value={mode} onChange={setMode}
+            options={[{ value: 'password', label: 'Password' }, { value: 'passkey', label: 'Passkey' }, { value: 'recovery', label: 'Recovery' }]} />
 
           {notice && (
-            <div className="mt-4 flex items-start gap-2 rounded-lg border border-teal/30 bg-teal/10 px-3 py-2.5 text-sm text-teal">
-              <Icon name="check" size={15} className="mt-0.5 shrink-0" />
-              <span>{notice}</span>
+            <div className="mt-4 flex items-start gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3.5 py-3 text-sm text-accent">
+              <Icon name="check" size={15} className="mt-0.5 shrink-0" /><span>{notice}</span>
             </div>
           )}
 
@@ -592,22 +607,20 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
                 <Input placeholder="Password" type="password" value={pw} onChange={e=>setPw(e.target.value)}
                   autoComplete="current-password" onKeyDown={e=>{ if(e.key==='Enter') doLogin() }} />
                 <ErrorNote message={err} />
-                <Button variant="primary" disabled={busy} onClick={doLogin} className="w-full">
-                  {busy ? 'Signing in…' : 'Sign in'}
+                <Button variant="primary" size="lg" disabled={busy} onClick={doLogin} className="w-full">
+                  {busy ? 'Signing in…' : <>Sign in <Icon name="arrowRight" size={15} /></>}
                 </Button>
               </>
             )}
             {mode==='passkey' && (
               <>
                 <ErrorNote message={err} />
-                <Button variant="primary" disabled={busy} onClick={doPasskeyLogin} className="w-full">
+                <Button variant="primary" size="lg" disabled={busy} onClick={doPasskeyLogin} className="w-full">
                   {busy ? 'Waiting for authenticator…' : 'Continue with passkey'}
                 </Button>
                 <p className="text-xs text-muted text-center">
                   Requires passkey enrollment.{' '}
-                  <button onClick={()=>setMode('recovery')} className="text-teal underline underline-offset-2 hover:brightness-110">
-                    Lost passkey? Use recovery code
-                  </button>
+                  <button onClick={()=>setMode('recovery')} className="text-accent underline underline-offset-2">Lost passkey? Use recovery code</button>
                 </p>
               </>
             )}
@@ -617,19 +630,18 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
                 <Input placeholder="Recovery code (XXXX-XXXX-XXXX-XXXX)" value={recoveryCode}
                   onChange={e=>setRecoveryCode(e.target.value)} className="font-mono" />
                 <ErrorNote message={err} />
-                <Button variant="primary" disabled={busy} onClick={doRecovery} className="w-full">
+                <Button variant="primary" size="lg" disabled={busy} onClick={doRecovery} className="w-full">
                   {busy ? 'Verifying…' : 'Verify recovery code'}
                 </Button>
-                <p className="text-xs text-muted text-center">
-                  Shown once when a passkey is enabled.
-                </p>
+                <p className="text-xs text-muted text-center">Shown once when a passkey is enabled.</p>
               </>
             )}
           </div>
 
-          <div className="mt-6 pt-4 border-t border-stone flex items-center justify-end">
+          <div className="mt-6 pt-4 border-t border-stone flex items-center justify-between">
+            <span className="text-[11px] text-muted font-mono">HttpOnly session · no token in storage</span>
             <button onClick={toggle} aria-label="Toggle theme"
-              className="w-8 h-8 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-stone/40">
+              className="w-8 h-8 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-raised">
               <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={15} />
             </button>
           </div>

@@ -1,0 +1,11 @@
+[Unit]
+Description=AI Gateway failover watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/ai-gateway/watchdog.env
+ExecStart=/opt/ai-gateway/deploy/failover/watchdog.sh
+User=gateway
+Group=gateway

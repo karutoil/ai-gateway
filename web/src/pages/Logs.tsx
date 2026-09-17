@@ -9,8 +9,9 @@ import {
 } from '../components/ui'
 
 function tpsFor(l:any){
-  if(!l.total_tokens || !l.latency_ms) return 0
-  return l.total_tokens / (l.latency_ms/1000)
+  if(!l.completion_tokens || !l.latency_ms) return 0
+  if(l.ttft_ms && l.latency_ms > l.ttft_ms) return l.completion_tokens / ((l.latency_ms - l.ttft_ms)/1000)
+  return l.completion_tokens / (l.latency_ms/1000)
 }
 function ttftFor(l:any){
   return l.ttft_ms || 0
@@ -150,8 +151,8 @@ function MessageView({ m }: { m: ChatMessage }) {
       )}
       {m.text && <pre className="mt-1.5 text-xs whitespace-pre-wrap break-words font-sans">{m.text.length > 4000 ? m.text.slice(0, 4000) + '…' : m.text}</pre>}
       {m.toolCalls.map((tc, i)=>(
-        <div key={i} className="mt-2 rounded-md border border-teal/30 bg-teal/5 p-2">
-          <div className="flex items-center gap-2 text-[11px] font-mono text-teal">
+        <div key={i} className="mt-2 rounded-md border border-accent/30 bg-accent/5 p-2">
+          <div className="flex items-center gap-2 text-[11px] font-mono text-accent">
             <Icon name="route" size={12}/> {tc.name || 'tool_call'}
             {tc.id && <span className="text-muted">{tc.id}</span>}
           </div>
@@ -174,7 +175,7 @@ function MessagePanes({ requestBody, responseBody }: { requestBody?: string; res
   return (
     <div className="grid md:grid-cols-2 gap-3">
       {reqMsgs.length > 0 && (
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="flex items-center justify-between mb-2">
             <div className="text-xs text-muted">Request messages</div>
             <CopyButton value={requestBody || ''} label="Copy raw"/>
@@ -185,7 +186,7 @@ function MessagePanes({ requestBody, responseBody }: { requestBody?: string; res
         </div>
       )}
       {respMsgs.length > 0 && (
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="flex items-center justify-between mb-2">
             <div className="text-xs text-muted">Response messages</div>
             <CopyButton value={responseBody || ''} label="Copy raw"/>
@@ -209,35 +210,35 @@ function DetailBody({ detail, selected, keyMap }: {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Status</div>
           <div className="mt-1"><Badge tone={stat} dot>{detail.log?.status ?? selected.status}</Badge></div>
           {(detail.log?.error || detail.error || selected.error) && (
             <div className="mt-2 text-xs text-red-400 break-all line-clamp-3">{errMsg.slice(0,200)}</div>
           )}
         </div>
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Latency</div>
           <div className="font-mono text-sm mt-1 tabular-nums">{(detail.log?.latency_ms ?? selected.latency_ms)}ms</div>
           <div className="text-xs text-muted tabular-nums">TTFT {((detail.log?.ttft_ms ?? selected.ttft_ms) || '—')}ms</div>
         </div>
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">TPS</div>
-          <div className="font-mono text-sm mt-1 tabular-nums">{detail.tps ? Number(detail.tps).toFixed(1) : tpsFor(detail.log||selected).toFixed(1)}</div>
+          <div className="font-mono text-sm mt-1 tabular-nums">{detail.tps ? Number(detail.tps).toFixed(1) : tpsFor(detail.log||selected).toFixed(1)} tok/s</div>
           <div className="text-xs text-muted tabular-nums">{detail.log?.total_tokens ?? selected.total_tokens} tokens</div>
         </div>
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Provider</div>
           <div className="text-sm mt-1 truncate" title={String(detail.provider_name || detail.log?.provider_id || selected.provider_id || '')}>
             {detail.provider_name || detail.log?.provider_id || selected.provider_id || '—'}
           </div>
         </div>
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Key</div>
           <div className="font-mono text-xs mt-1">{detail.key_name ? `${detail.log?.key_prefix} · ${detail.key_name}` : detail.log?.key_prefix || selected.key_prefix}</div>
           {keyMap[selected.key_prefix] && <div className="text-xs text-muted">{keyMap[selected.key_prefix]}</div>}
         </div>
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Endpoint</div>
           <div className="text-xs mt-1 break-all">{detail.log?.endpoint || selected.endpoint}</div>
           <div className="text-xs text-muted font-mono truncate">{detail.log?.model || selected.model}</div>
@@ -245,7 +246,7 @@ function DetailBody({ detail, selected, keyMap }: {
       </div>
 
       <div className="grid md:grid-cols-2 gap-3">
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Tokens</div>
           <div className="mt-2 font-mono text-xs space-y-1 tabular-nums">
             <div>prompt: {detail.log?.prompt_tokens ?? selected.prompt_tokens}</div>
@@ -254,7 +255,7 @@ function DetailBody({ detail, selected, keyMap }: {
             <div>cost: ${Number((detail.log?.cost_usd ?? selected.cost_usd) ?? 0).toFixed(6)}</div>
           </div>
         </div>
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted">Timing</div>
           <div className="mt-2 font-mono text-xs space-y-1 tabular-nums">
             <div>latency: {detail.log?.latency_ms ?? selected.latency_ms}ms</div>
@@ -269,7 +270,7 @@ function DetailBody({ detail, selected, keyMap }: {
 
       {/* Usage metadata: finish reason + cache/reasoning token split */}
       {((detail.log?.finish_reason ?? (detail as any).finish_reason) || (detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) || (detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens) || (detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens)) && (
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted mb-2">Usage metadata</div>
           <div className="flex flex-wrap gap-2">
             {(detail.log?.finish_reason ?? (detail as any).finish_reason) && (
@@ -323,12 +324,12 @@ function DetailBody({ detail, selected, keyMap }: {
         </div>
       )}
 
-      <div className="rounded-xl border border-stone bg-raised p-3">
+      <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
         <div className="text-xs text-muted mb-2">Raw log</div>
         <pre className="bg-app border border-stone rounded-lg p-3 font-mono text-xs overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(detail.log || selected, null, 2)}</pre>
       </div>
       {detail.log && detail.log !== selected && (
-        <div className="rounded-xl border border-stone bg-raised p-3">
+        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted mb-2">Enriched detail</div>
           <pre className="bg-app border border-stone rounded-lg p-3 font-mono text-xs overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(detail, null, 2)}</pre>
         </div>
@@ -420,6 +421,24 @@ export default function Logs(){
   const [groupBy, setGroupBy] = useState<string>('model')
   const [groupRows, setGroupRows] = useState<GroupRowT[]>([])
   const [groupLoading, setGroupLoading] = useState(false)
+
+  // Wider-window probe: when the current view is empty, check whether the
+  // same filters match anything in the last 30 days. If they do, the window
+  // — not the filters — is the cause, and the empty state says so with a
+  // one-click widen action. Fires only on empty results, never in a loop
+  // (it writes widerTotal, which is not a dep).
+  const [widerTotal, setWiderTotal] = useState<number | null>(null)
+  const filterSig = JSON.stringify(filters)
+  useEffect(() => {
+    setWiderTotal(null)
+    if (loading || loadError || logs.length > 0 || filters.since === '30d') return
+    let cancelled = false
+    api.logsQuery({ ...apiParams(), since: '30d', limit: 1, offset: 0 } as any)
+      .then(({ total: t }) => { if (!cancelled) setWiderTotal(t) })
+      .catch(() => { if (!cancelled) setWiderTotal(null) })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, loadError, logs.length, filterSig])
 
   // Debounced search: q updates the URL 300ms after typing stops.
   const [qInput, setQInput] = useState(filters.q)
@@ -538,10 +557,11 @@ export default function Logs(){
   const rawJson = detail ? JSON.stringify(detail || selected, null, 2) : ''
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <PageHeader
-        title="Request Logs"
-        description="Every proxied call with status, latency, tokens and cost."
+        eyebrow="Operate · Traffic"
+        title="Requests"
+        description="Every proxied call with status, latency, TTFT, tokens and cost. Filters are server-side and shareable via URL."
         actions={
           <>
             <Button variant="secondary" onClick={doExport}>
@@ -554,14 +574,14 @@ export default function Logs(){
         }
       />
 
-      {exportNote && <div className="text-xs text-teal">{exportNote}</div>}
+      {exportNote && <div className="text-xs text-accent">{exportNote}</div>}
 
       {/* Saved views chips */}
       {savedViews.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5 -mt-1">
           <span className="text-xs text-muted uppercase tracking-wide mr-1">Saved views</span>
           {savedViews.map(v => (
-            <span key={v.id} className="inline-flex items-center gap-1 rounded-full border border-stone bg-raised px-2.5 py-1 text-xs group hover:border-teal/50 transition-colors">
+            <span key={v.id} className="inline-flex items-center gap-1 rounded-full border border-stone bg-raised px-2.5 py-1 text-xs group hover:border-accent/50 transition-colors">
               <button onClick={()=>applySavedView(v)} title={describeViewParams(v.params)} className="focus:outline-none">
                 <span className="font-medium">{v.name}</span>
                 <span className="text-muted ml-1.5">{describeViewParams(v.params)}</span>
@@ -575,37 +595,41 @@ export default function Logs(){
       )}
 
       {/* Totals strip — aggregates cover the currently loaded rows only */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted font-mono tabular-nums -mt-2">
-        <span>{logs.length} loaded{total != null ? ` of ${total.toLocaleString()} matching` : ''}</span>
-        <span title="Sum over the currently loaded rows">{logs.reduce((a,l)=>a+(l.total_tokens||0),0).toLocaleString()} tokens (loaded)</span>
-        <span title="Sum over the currently loaded rows">${logs.reduce((a,l)=>a+(l.cost_usd||0),0).toFixed(4)} (loaded)</span>
-        <span>avg TTFT {logs.length ? Math.round(logs.reduce((a,l)=>a+(l.ttft_ms||0),0)/logs.length) : 0}ms</span>
+      <div className="flex flex-wrap items-center gap-2 -mt-1">
+        {[
+          `${logs.length} loaded${total != null ? ` of ${total.toLocaleString()} matching` : ''}`,
+          `${logs.reduce((a,l)=>a+(l.total_tokens||0),0).toLocaleString()} tokens`,
+          `$${logs.reduce((a,l)=>a+(l.cost_usd||0),0).toFixed(4)} spend`,
+          `avg TTFT ${logs.length ? Math.round(logs.reduce((a,l)=>a+(l.ttft_ms||0),0)/logs.length) : 0}ms`,
+        ].map((t, i) => (
+          <span key={i} className="text-[11px] font-mono tabular-nums text-muted bg-raised/60 border border-stone/60 rounded-full px-3 py-1">{t}</span>
+        ))}
       </div>
 
       {/* Filter bar — every control is server-side and URL-synced */}
-      <Card className="!p-3 space-y-2.5">
+      <Card className="!p-4 space-y-3 !rounded-xl">
         <div className="flex flex-col sm:flex-row sm:items-center gap-2">
           <div className="relative flex-1 min-w-[180px]">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
             <Input value={qInput} onChange={e=>setQInput(e.target.value)} placeholder="Search model, endpoint, error text…" className="pl-9"/>
           </div>
           <select value={filters.status} onChange={e=>applyFilter({ status: e.target.value })}
-            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60">
+            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm focus:outline-none focus:border-accent/60">
             <option value="">Any status</option>
             <option value="failed">Failed only</option>
           </select>
           <select value={filters.key_id} onChange={e=>applyFilter({ key_id: e.target.value })}
-            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm max-w-[150px] focus:outline-none focus:border-teal/60">
+            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm max-w-[150px] focus:outline-none focus:border-accent/60">
             <option value="">Any key</option>
             {Object.entries(keyIdMap).map(([id,name]) => <option key={id} value={id}>{name}</option>)}
           </select>
           <select value={filters.provider_id} onChange={e=>applyFilter({ provider_id: e.target.value })}
-            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm max-w-[150px] focus:outline-none focus:border-teal/60">
+            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm max-w-[150px] focus:outline-none focus:border-accent/60">
             <option value="">Any provider</option>
             {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
           <select value={filters.since} onChange={e=>applyFilter({ since: e.target.value })}
-            className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60">
+            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm focus:outline-none focus:border-accent/60">
             {SINCE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
@@ -616,12 +640,12 @@ export default function Logs(){
           />
           <label className="flex items-center gap-1.5 text-xs text-muted cursor-pointer select-none">
             <input type="checkbox" checked={filters.has_error==='true'} onChange={e=>applyFilter({ has_error: e.target.checked ? 'true' : '' })}
-              className="w-3.5 h-3.5 accent-teal rounded"/>
+              className="w-3.5 h-3.5 accent-accent rounded"/>
             Has error
           </label>
           <label className="flex items-center gap-1.5 text-xs text-muted cursor-pointer select-none">
             <input type="checkbox" checked={filters.search_bodies==='true'} onChange={e=>applyFilter({ search_bodies: e.target.checked ? 'true' : '' })}
-              className="w-3.5 h-3.5 accent-teal rounded"/>
+              className="w-3.5 h-3.5 accent-accent rounded"/>
             Search bodies
           </label>
           <button onClick={()=>setShowAdvanced(s=>!s)} className="text-xs text-muted hover:text-paper transition-colors flex items-center gap-1 focus:outline-none">
@@ -661,9 +685,9 @@ export default function Logs(){
       )}
 
       {/* Reports (group-by) panel */}
-      <Card className="!p-3">
+      <Card className="!p-4 !rounded-xl">
         <button onClick={()=>setShowReports(s=>!s)} className="w-full flex items-center justify-between text-sm font-medium focus:outline-none">
-          <span className="flex items-center gap-2"><Icon name="chart" size={15} className="text-teal"/>Reports</span>
+          <span className="flex items-center gap-2"><Icon name="chart" size={15} className="text-accent"/>Reports</span>
           <Icon name="chevronDown" size={15} className={`text-muted transition-transform ${showReports?'rotate-180':''}`}/>
         </button>
         {showReports && (
@@ -757,12 +781,19 @@ export default function Logs(){
               <tr><td colSpan={7}>
                 <EmptyState
                   icon="logs"
-                  title={offset > 0 ? 'No requests on this page' : 'No requests match these filters'}
+                  title={offset > 0 ? 'No requests on this page' : widerTotal != null && widerTotal > 0 ? 'No requests in this time window' : 'No requests match these filters'}
                   hint={offset > 0
                     ? 'Go back a page, or widen the time range / clear filters.'
-                    : 'Adjust the filters, or send your first call from the Playground.'}
+                    : widerTotal != null && widerTotal > 0
+                      ? `${widerTotal.toLocaleString()} request(s) with these filters exist in the last 30 days — the filters are fine, this window is just empty.`
+                      : 'Adjust the filters, or send your first call from the Playground.'}
                   action={logs.length===0 && offset === 0
-                    ? <Button variant="secondary" onClick={()=>setFilters({...FILTER_DEFAULTS})}>Clear filters</Button>
+                    ? <div className="flex items-center justify-center gap-2 flex-wrap">
+                        {widerTotal != null && widerTotal > 0 && (
+                          <Button variant="primary" onClick={()=>applyFilter({ since: '30d' })}>Show last 30 days</Button>
+                        )}
+                        <Button variant="secondary" onClick={()=>setFilters({...FILTER_DEFAULTS})}>Clear filters</Button>
+                      </div>
                     : undefined}
                 />
               </td></tr>

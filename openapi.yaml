@@ -985,6 +985,22 @@ paths:
       security: [{ bearerAuth: [] }]
       responses:
         '200': { description: refreshed }
+  /api/providers/{id}/oauth/usage:
+    get:
+      summary: OAuth subscription usage/limits for a connected provider
+      description: Antigravity returns plan_type, prompt_credits and per-model remaining quota; Devin returns plan plus daily/weekly used/remaining and extra balance.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: usage snapshot (shape varies by provider) }
+        '400': { description: oauth not connected or unsupported provider }
+        '404': { description: provider not found }
+        '502': { description: upstream quota fetch failed }
   /api/providers/{id}/oauth:
     delete:
       summary: Disconnect OAuth (clears stored tokens)

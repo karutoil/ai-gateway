@@ -5,7 +5,6 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Aliases to the ORIGINAL tokens kept so pages migrate gradually.
         graphite: "rgb(var(--c-graphite) / <alpha-value>)",
         paper: "rgb(var(--c-paper) / <alpha-value>)",
         stone: "rgb(var(--c-stone) / <alpha-value>)",
@@ -13,25 +12,24 @@ export default {
         surface: "rgb(var(--c-surface) / <alpha-value>)",
         app: "rgb(var(--c-graphite) / <alpha-value>)",
         raised: "rgb(var(--c-raised) / <alpha-value>)",
-        // Legacy palette (pages not yet migrated still compile).
-        // teal/amber resolve to CSS vars so light mode can soften them;
-        // dark mode keeps the original neon values.
         amber: "rgb(var(--c-amber) / <alpha-value>)",
-        teal: "rgb(var(--c-teal) / <alpha-value>)",
-        cream: "#FDFBF7",
+        accent: "rgb(var(--c-accent) / <alpha-value>)",
+        onaccent: "rgb(var(--c-onaccent) / <alpha-value>)",
+        ink: "rgb(var(--c-ink) / <alpha-value>)",
+        cream: "rgb(var(--c-cream) / <alpha-value>)",
+        danger: "rgb(var(--c-danger) / <alpha-value>)",
+        creamx: "#FDFBF7",
         sand: "#F5F0E6",
         clay: "#E8E0D1",
-        ink: "#1E2422",
-        danger: "var(--c-danger)",
       },
       fontFamily: {
         sans: ["Inter", "system-ui", "-apple-system", "sans-serif"],
-        mono: ["IBM Plex Mono", "ui-monospace", "monospace"],
+        display: ["Fraunces", "Georgia", "serif"],
+        mono: ["JetBrains Mono", "IBM Plex Mono", "ui-monospace", "monospace"],
       },
       boxShadow: {
-        card: 'var(--shadow-card, 0 1px 2px rgb(0 0 0 / 0.18), 0 1px 3px rgb(0 0 0 / 0.10))',
-        pop: 'var(--shadow-pop, 0 10px 30px rgb(0 0 0 / 0.35), 0 2px 8px rgb(0 0 0 / 0.25))',
-        glow: 'var(--shadow-glow, 0 0 6px rgb(44 217 163 / 0.55))',
+        card: 'var(--shadow-card, 0 1px 2px rgb(0 0 0 / 0.08))',
+        pop: 'var(--shadow-pop, 0 16px 40px -12px rgb(0 0 0 / 0.25))',
       },
       keyframes: {
         pageIn: {
@@ -40,12 +38,12 @@ export default {
         },
         fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
         toastIn: {
-          '0%': { opacity: '0', transform: 'translateY(8px) scale(0.98)' },
-          '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
+          '0%': { opacity: '0', transform: 'translateY(8px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         modalIn: {
-          '0%': { opacity: '0', transform: 'scale(0.97)' },
-          '100%': { opacity: '1', transform: 'scale(1)' },
+          '0%': { opacity: '0', transform: 'translateY(8px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         shimmer: {
           '0%, 100%': { opacity: '0.45' },
@@ -53,7 +51,7 @@ export default {
         },
         pulseSoft: {
           '0%, 100%': { opacity: '1' },
-          '50%': { opacity: '0.4' },
+          '50%': { opacity: '0.35' },
         },
         sidebarIn: {
           '0%': { transform: 'translateX(-16px)', opacity: '0' },
@@ -61,13 +59,13 @@ export default {
         },
       },
       animation: {
-        page: 'pageIn 0.28s cubic-bezier(0.22,1,0.36,1)',
+        page: 'pageIn 0.25s ease-out',
         fade: 'fadeIn 0.15s ease',
-        toast: 'toastIn 0.22s cubic-bezier(0.22,1,0.36,1)',
-        modal: 'modalIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        toast: 'toastIn 0.2s ease-out',
+        modal: 'modalIn 0.18s ease-out',
         shimmer: 'shimmer 1.6s ease-in-out infinite',
         'pulse-soft': 'pulseSoft 2s ease-in-out infinite',
-        sidebar: 'sidebarIn 0.25s cubic-bezier(0.22,1,0.36,1)',
+        sidebar: 'sidebarIn 0.2s ease-out',
       },
     },
   },

@@ -442,9 +442,13 @@ func DecodeChatResponse(payload []byte) ([]Delta, error) {
 func decodeToolCall(payload []byte) Delta {
 	fields, err := parseFields(payload)
 	if err != nil {
-		return Delta{Type: "tool", Name: "tool"}
+		return Delta{Type: "tool"}
 	}
-	d := Delta{Type: "tool", Name: "tool", ID: uuid.NewString()}
+	// Preserve empty ID/Name so the accumulator can distinguish a
+	// continuation fragment (no ID) from a new call. Synthesizing a UUID
+	// or the "tool" fallback here would split one logical call into many
+	// physical calls, each with fragment args that harnesses reject.
+	d := Delta{Type: "tool"}
 	for _, f := range fields {
 		if f.wire != 2 {
 			continue
@@ -457,12 +461,6 @@ func decodeToolCall(payload []byte) Delta {
 		case 3:
 			d.ArgsJSON = string(f.value)
 		}
-	}
-	if d.ID == "" {
-		d.ID = uuid.NewString()
-	}
-	if d.Name == "" {
-		d.Name = "tool"
 	}
 	return d
 }

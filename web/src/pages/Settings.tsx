@@ -89,8 +89,9 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="Optimize · Tuning"
         title="Settings"
-        description="Key–value configuration consumed by the model catalog and routing layer."
+        description="Catalog pricing fallbacks and routing configuration. Removals apply instantly; edits apply on save."
         actions={
           <>
             <Button variant="secondary" onClick={load} disabled={saving}><Icon name="refresh" size={14} /> Reload</Button>
@@ -137,7 +138,7 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
               {isAdmin && (
               <div className="p-5 pb-4">
                 <div className="flex items-center gap-2 mb-3">
-                  <Icon name="plus" size={15} className="text-teal" />
+                  <Icon name="plus" size={15} className="text-accent" />
                   <h3 className="font-semibold text-sm">Add entry</h3>
                   <Badge tone="neutral"><span className="tabular-nums">{Object.keys(draft).length}</span> / 50</Badge>
                 </div>
@@ -202,7 +203,7 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
             <Card pad={false}>
               <div className="p-5">
                 <div className="flex items-center gap-2 mb-3">
-                  <Icon name="logs" size={15} className="text-teal" />
+                  <Icon name="logs" size={15} className="text-accent" />
                   <h3 className="font-semibold text-sm">Raw JSON</h3>
                 </div>
                 <Textarea value={jsonText} onChange={e=>setJsonText(e.target.value)} rows={16} className="min-h-[320px]" spellCheck={false} disabled={!isAdmin} />

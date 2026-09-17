@@ -955,9 +955,9 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	// daily buckets GROUP BY day — hourly (strftime bucket) for 24h so the
 	// chart isn't a single bar, daily otherwise. Hour bucket keys carry a
 	// "T…Z" ISO fragment so clients can label them distinctly.
-	bucketExpr := "date(created_at)"
+	bucketExpr := db.DateBucketExpr("created_at")
 	if rng == "24h" {
-		bucketExpr = `strftime('%Y-%m-%dT%H:00:00Z', created_at)`
+		bucketExpr = db.HourBucketExpr("created_at")
 	}
 	type daily struct {
 		Day      string  `json:"day"`
@@ -1064,11 +1064,14 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE created_at >= ? AND status < 400`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&successful)
 	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs WHERE created_at >= ? AND status >= 400`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&failed)
 
-	// TTFT and TPS aggregates for range
+	// TTFT and TPS aggregates for range. TPS is output speed:
+	// completion tokens per second of generation time
+	// ((latency-ttft) for streaming, latency otherwise), not total
+	// tokens over wall time — prompt tokens would inflate it 100x.
 	var avgTTFT sql.NullFloat64
 	var avgTPS sql.NullFloat64
 	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(ttft_ms),0) FROM request_logs WHERE created_at >= ? AND ttft_ms > 0`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&avgTTFT)
-	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(CASE WHEN latency_ms>0 THEN total_tokens*1000.0/latency_ms ELSE 0 END),0) FROM request_logs WHERE created_at >= ? AND total_tokens>0`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&avgTPS)
+	h.DB.QueryRow(db.Q(`SELECT COALESCE(AVG(CASE WHEN completion_tokens>0 AND COALESCE(ttft_ms,0)>0 AND latency_ms>COALESCE(ttft_ms,0) THEN completion_tokens*1000.0/(latency_ms-COALESCE(ttft_ms,0)) WHEN completion_tokens>0 AND latency_ms>0 THEN completion_tokens*1000.0/latency_ms ELSE 0 END),0) FROM request_logs WHERE created_at >= ? AND completion_tokens>0`+orgFilter), append([]any{start}, orgArgs...)...).Scan(&avgTPS)
 
 	// overall success/failure
 	var totalSuccessful, totalFailed int
@@ -1149,6 +1152,19 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		"cache_hit_rate":    cacheRate,
 		"cache_read_tokens": cacheReadSum.Int64,
 	})
+}
+
+// tpsForLog is output speed: completion tokens per second of generation
+// time ((latency-ttft) when TTFT is known, latency otherwise). Prompt
+// tokens are excluded — counting them inflated TPS 100x on large prompts.
+func tpsForLog(latencyMs, ttftMs int64, completionTokens int) float64 {
+	if completionTokens <= 0 || latencyMs <= 0 {
+		return 0
+	}
+	if ttftMs > 0 && latencyMs > ttftMs {
+		return float64(completionTokens) / (float64(latencyMs-ttftMs) / 1000.0)
+	}
+	return float64(completionTokens) / (float64(latencyMs) / 1000.0)
 }
 
 func percentile(sorted []int64, p int) int64 {
@@ -1412,8 +1428,8 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 		"cache_write_tokens": l.CacheWriteTokens,
 		"reasoning_tokens":   l.ReasoningTokens,
 	}
-	if l.LatencyMs > 0 && l.TotalTokens > 0 {
-		extra["tps"] = float64(l.TotalTokens) / (float64(l.LatencyMs) / 1000.0)
+	if tps := tpsForLog(l.LatencyMs, l.TTFTMs, l.CompletionTokens); tps > 0 {
+		extra["tps"] = tps
 	}
 	if l.TTFTMs > 0 && l.CompletionTokens > 0 {
 		remaining := l.LatencyMs - l.TTFTMs

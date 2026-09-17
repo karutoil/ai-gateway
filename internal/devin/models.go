@@ -16,6 +16,7 @@ type FallbackModel struct {
 
 // PublicModels is the seed catalog for discovery.
 var PublicModels = []FallbackModel{
+	{ID: "swe-2", Name: "SWE-2", ContextWindow: 200000, MaxTokens: 64000},
 	{ID: "swe-1-7", Name: "SWE-1.7", ContextWindow: 200000, MaxTokens: 64000},
 	{ID: "swe-1-6", Name: "SWE-1.6", ContextWindow: 200000, MaxTokens: 64000},
 }

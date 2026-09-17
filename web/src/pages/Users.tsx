@@ -45,7 +45,7 @@ const ROLE_OPTIONS = (
 
 function Avatar({ user }: { user: DashboardUser }) {
   return (
-    <span className="w-8 h-8 rounded-full bg-gradient-to-br from-amber to-teal flex items-center justify-center text-ink text-sm font-bold shrink-0 select-none">
+    <span className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center text-onaccent text-sm font-bold shrink-0 select-none">
       {(user.display_name || user.username)[0]?.toUpperCase()}
     </span>
   )
@@ -201,8 +201,9 @@ export default function Users(){
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="Govern · Identity"
         title="Users"
-        description={canManage ? 'Admins can create admins and support accounts, manage roles, reset passwords and manage passkeys.' : 'View users and roles.'}
+        description={canManage ? 'Create support and admin accounts, manage roles, reset passwords and passkeys.' : 'Directory of gateway accounts and roles.'}
         actions={<Badge tone="neutral"><span className="tabular-nums">{list.length}</span> users</Badge>}
       />
 
@@ -212,15 +213,15 @@ export default function Users(){
       {Object.entries(recoveryCodes).map(([uid, code]) => {
         const u = list.find(x=>x.id===uid)
         return (
-          <div key={uid} className="rounded-xl border border-teal/30 bg-teal/10 p-4">
+          <div key={uid} className="rounded-xl border border-accent/30 bg-accent/10 p-4">
             <div className="flex items-start gap-3">
-              <div className="w-9 h-9 rounded-lg bg-teal/15 text-teal flex items-center justify-center shrink-0">
+              <div className="w-9 h-9 rounded-lg bg-accent/15 text-accent flex items-center justify-center shrink-0">
                 <Icon name="lock" size={17} />
               </div>
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold text-teal">Recovery code for {u?.username || 'user'}</div>
+                <div className="text-sm font-semibold text-accent">Recovery code for {u?.username || 'user'}</div>
                 <div className="text-xs text-muted mt-0.5">Store it now — shown only once. Required if the passkey is lost.</div>
-                <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-teal/30 bg-graphite/60 px-3 py-2">
+                <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-accent/30 bg-graphite/60 px-3 py-2">
                   <code className="font-mono text-sm text-paper break-all min-w-0 flex-1">{code}</code>
                   <CopyButton value={code} label="Copy recovery code" />
                 </div>
@@ -236,7 +237,7 @@ export default function Users(){
       {canManage && (
         <Card>
           <div className="flex items-center gap-2 mb-4">
-            <Icon name="plus" size={15} className="text-teal" />
+            <Icon name="plus" size={15} className="text-accent" />
             <h3 className="font-semibold text-sm">Create user</h3>
           </div>
           {createError && <div className="mb-3"><ErrorNote message={createError} /></div>}
@@ -289,7 +290,7 @@ export default function Users(){
                         <div className="flex items-center gap-1.5">
                           <span className="font-semibold truncate">{u.username}</span>
                           {u.id===me?.id && (
-                            <span className="text-[10px] font-semibold uppercase tracking-wide bg-teal/15 text-teal px-1.5 py-0.5 rounded-full shrink-0">you</span>
+                            <span className="text-[10px] font-semibold uppercase tracking-wide bg-accent/15 text-accent px-1.5 py-0.5 rounded-full shrink-0">you</span>
                           )}
                           {u.disabled && <Badge tone="bad">disabled</Badge>}
                         </div>
@@ -306,11 +307,11 @@ export default function Users(){
                       <span className="text-xs text-muted">all keys</span>
                     ) : (
                       <button
-                        className="inline-flex items-center gap-1.5 hover:text-teal transition-colors focus:outline-none"
+                        className="inline-flex items-center gap-1.5 hover:text-accent transition-colors focus:outline-none"
                         title={`${u.key_count ?? 0} key(s) assigned \u2014 click to view in API Keys`}
                         onClick={() => navigate(`/keys?key_id=${u.id}`)}
                       >
-                        <Icon name="key" size={13} className={(u.key_count ?? 0) > 0 ? 'text-teal' : 'text-muted/40'} />
+                        <Icon name="key" size={13} className={(u.key_count ?? 0) > 0 ? 'text-accent' : 'text-muted/40'} />
                         <span className="tabular-nums text-xs">{u.key_count ?? 0}</span>
                       </button>
                     )}
@@ -318,7 +319,7 @@ export default function Users(){
                   <Td>
                     <div className="flex flex-col items-start gap-1.5">
                       <span className="inline-flex items-center gap-1.5" title={u.passkey_enabled ? `${u.passkey_count} passkey(s) enrolled` : 'no passkey'}>
-                        <Icon name="shield" size={15} className={u.passkey_enabled ? 'text-teal' : 'text-muted/40'} />
+                        <Icon name="shield" size={15} className={u.passkey_enabled ? 'text-accent' : 'text-muted/40'} />
                         {u.passkey_enabled
                           ? <span className="text-xs text-muted tabular-nums">{u.passkey_count} enrolled</span>
                           : <span className="text-xs text-muted/60">none</span>}
@@ -411,7 +412,7 @@ export default function Users(){
           )}
         </table>
         <div className="px-4 py-3 border-t border-stone bg-app/60 text-[11px] text-muted leading-relaxed">
-          RBAC: <span className="text-amber font-medium">admin</span> = full access · <span className="text-teal font-medium">support / member</span> = providers &amp; keys · readonly = view only.
+          RBAC: <span className="text-amber font-medium">admin</span> = full access · <span className="text-accent font-medium">support / member</span> = providers &amp; keys · readonly = view only.
           Use <span className="text-paper">Perms</span> for fine-grained overrides (e.g. let a user see only their own keys) — changes apply immediately.
           Passkeys use WebAuthn — the private key stays on device; a recovery code is required if the passkey is lost.
         </div>
@@ -419,7 +420,7 @@ export default function Users(){
 
       <Card>
         <div className="flex items-center gap-2">
-          <Icon name="zap" size={15} className="text-teal" />
+          <Icon name="zap" size={15} className="text-accent" />
           <h3 className="font-semibold text-sm">Passkey quick test</h3>
         </div>
         <p className="text-xs text-muted mt-1.5 max-w-2xl">Try passkey login for your own account — requires enrollment above and browser support. The public key stays on device; the recovery code bypasses it if lost.</p>
@@ -454,7 +455,7 @@ export default function Users(){
             onKeyDown={e=>{ if(e.key==='Enter' && resetPwValue.length >= 8) resetPwSubmit() }} />
         </Field>
         {resetPwValue.length > 0 && (
-          <p className={`text-xs mt-2 ${resetPwValue.length >= 8 ? 'text-teal' : 'text-amber'}`}>
+          <p className={`text-xs mt-2 ${resetPwValue.length >= 8 ? 'text-accent' : 'text-amber'}`}>
             {resetPwValue.length >= 8 ? 'Strong enough — 8+ characters.' : 'Too short — 8 characters minimum.'}
           </p>
         )}

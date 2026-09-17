@@ -119,8 +119,9 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="Govern · Collaboration"
         title="Teams"
-        description="Organizations, members and their roles across the gateway."
+        description="Organizations with role-scoped members. Invite from the user directory — duplicates are rejected."
         actions={isAdmin ? (
           <Button variant="primary" onClick={openCreate} disabled={loading}>
             <Icon name="plus" size={15}/>New organization
@@ -153,15 +154,15 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
           action={isAdmin ? <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15}/>New organization</Button> : undefined}
         />
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-4 items-start">
+        <div className="grid grid-cols-1 lg:grid-cols-[320px_minmax(0,1fr)] gap-4 items-start">
           {/* Organization selector cards */}
-          <div className="flex lg:flex-col gap-2 overflow-x-auto pb-1">
+          <div className="flex lg:flex-col gap-2.5 overflow-x-auto pb-1">
             {orgs.map(o=>{
               const isActive = o.id === active?.id
               return (
                 <button key={o.id} onClick={()=>setActiveId(o.id)}
-                  className={`shrink-0 lg:w-full min-w-[200px] text-left rounded-xl border px-4 py-3 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal/50 ${
-                    isActive ? 'border-teal/60 bg-teal/10' : 'border-stone bg-raised/40 hover:border-paper/30 hover:bg-raised'
+                  className={`shrink-0 lg:w-full min-w-[220px] text-left rounded-xl border px-4 py-3.5 transition-all duration-150 ${
+                    isActive ? 'border-accent/50 bg-accent/10' : 'border-stone/60 bg-surface/80 hover:border-stone hover:bg-raised/60'
                   }`}>
                   <div className="flex items-center justify-between gap-3">
                     <div className="min-w-0">
@@ -172,7 +173,7 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
                           : o.created_at ? `since ${new Date(o.created_at).toLocaleDateString()}` : 'organization'}
                       </div>
                     </div>
-                    {isActive && <Icon name="check" size={15} className="text-teal shrink-0"/>}
+                    {isActive && <Icon name="check" size={15} className="text-accent shrink-0"/>}
                   </div>
                 </button>
               )

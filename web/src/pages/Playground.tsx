@@ -218,13 +218,14 @@ export default function Playground(){
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="Operate · Live test"
         title="Playground"
-        description="Send live requests through the gateway across OpenAI, Anthropic, and Responses APIs."
+        description="Send live requests through the gateway across OpenAI, Anthropic, and Responses APIs — with streaming, headers and cost intact."
       />
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+      <div className="grid grid-cols-1 lg:grid-cols-[380px_minmax(0,1fr)] gap-4 items-start">
         {/* Left pane: request settings */}
-        <div className="lg:col-span-1 space-y-4">
+        <div className="space-y-4">
           <Card>
             <div>
               <span className={captionCls}>API</span>
@@ -257,13 +258,13 @@ export default function Playground(){
             {catalogInfo && (
               <div className="mt-3 rounded-lg border border-stone bg-app/50 p-3 text-xs space-y-1.5">
                 <div className="font-semibold text-sm">{catalogInfo.display_name || catalogInfo.model_id}</div>
-                <div className="font-mono text-xs text-muted truncate">{catalogInfo.model_id} · via <span className="text-teal">{catalogInfo.provider_name}</span></div>
+                <div className="font-mono text-xs text-muted truncate">{catalogInfo.model_id} · via <span className="text-accent">{catalogInfo.provider_name}</span></div>
                 <div className="flex gap-1.5 flex-wrap pt-0.5">
                   {catalogInfo.context_window > 0 && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">ctx {(catalogInfo.context_window/1000).toFixed(0)}k</span>}
                   {catalogInfo.max_output > 0 && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">out {(catalogInfo.max_output/1000).toFixed(0)}k</span>}
                   {catalogInfo.reasoning && <Badge tone="warn">reasoning: {catalogInfo.reasoning_type||'effort'} {reasoningLevels.join('/')}</Badge>}
                   {catalogInfo.tool_call && <Badge tone="good">tools</Badge>}
-                  {(catalogInfo.input_cost>0||catalogInfo.output_cost>0) && <span className="font-mono tabular-nums border border-teal/30 text-teal rounded-full px-2 py-0.5">${catalogInfo.input_cost}/${catalogInfo.output_cost}/1M</span>}
+                  {(catalogInfo.input_cost>0||catalogInfo.output_cost>0) && <span className="font-mono tabular-nums border border-accent/30 text-accent rounded-full px-2 py-0.5">${catalogInfo.input_cost}/${catalogInfo.output_cost}/1M</span>}
                 </div>
               </div>
             )}
@@ -289,7 +290,7 @@ export default function Playground(){
 
             {/* Telemetry strip — status dot + real response headers only. */}
             <div className="mt-3 rounded-lg border border-stone bg-app/50 px-2.5 py-2 flex items-center gap-2 font-mono text-xs">
-              <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-teal animate-pulse-soft shadow-glow' : 'bg-stone'}`} />
+              <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-accent animate-pulse-soft' : 'bg-stone'}`} />
               <span className="text-muted shrink-0">{running ? 'streaming' : 'idle'}</span>
               {cacheStatus && (cacheStatus==='HIT'
                 ? <Badge tone="good">cached</Badge>
@@ -326,7 +327,7 @@ export default function Playground(){
                     placeholder={usingSession ? 'optional — using admin session' : 'sk-gw-... (create in API Keys tab)'}/>
                 </Field>
                 {usingSession && (
-                  <div className="-mt-2 text-xs text-teal font-mono">Using logged-in session cookie for /v1/*</div>
+                  <div className="-mt-2 text-xs text-accent font-mono">Using logged-in session cookie for /v1/*</div>
                 )}
                 {availableKeys.length>0 && (
                   <div className="-mt-1 flex flex-wrap gap-1 items-center">
@@ -355,8 +356,8 @@ export default function Playground(){
         </div>
 
         {/* Right pane: conversation */}
-        <Card pad={false} className="lg:col-span-2 flex flex-col lg:h-[680px] overflow-hidden">
-          <div className="px-4 py-3 border-b border-stone flex items-center justify-between gap-2">
+        <Card pad={false} className="lg:sticky lg:top-20 flex flex-col lg:h-[720px] overflow-hidden !rounded-xl">
+          <div className="px-5 py-3.5 border-b border-stone/60 bg-raised/30 flex items-center justify-between gap-2">
             <span className="text-xs font-semibold uppercase tracking-wider text-muted">Conversation</span>
             <div className="flex items-center gap-1.5">
               <Badge tone="neutral">{mode}</Badge>
@@ -371,7 +372,7 @@ export default function Playground(){
               </div>
             )}
             <div className="max-w-full">
-              <div className="mr-auto border-l-2 border-teal/70 bg-app/50 rounded-r-xl px-3 py-2 font-mono text-sm whitespace-pre-wrap break-words min-h-[42px]">
+              <div className="mr-auto border-l-2 border-accent/70 bg-app/50 rounded-r-xl px-3 py-2 font-mono text-sm whitespace-pre-wrap break-words min-h-[42px]">
                 {out || <span className="text-muted">Output will appear here.</span>}
               </div>
             </div>

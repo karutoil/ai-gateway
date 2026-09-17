@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 
+	"ai-gateway/internal/antigravity"
+	"ai-gateway/internal/devin"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
@@ -31,6 +33,7 @@ func (h *OAuthHandler) Routes(r chi.Router) {
 	// Readable with providers:read so the UI can show connect badges.
 	r.With(middleware.RequireAnyPerm(rbac.PermProvidersWrite, rbac.PermProvidersTest)).Get("/oauth/providers", h.ListDefs)
 	r.With(middleware.RequireAnyPerm(rbac.PermProvidersWrite, rbac.PermProvidersTest)).Get("/providers/{id}/oauth/status", h.Status)
+	r.With(middleware.RequireAnyPerm(rbac.PermProvidersWrite, rbac.PermProvidersTest)).Get("/providers/{id}/oauth/usage", h.Usage)
 }
 
 // PublicRoutes holds the server-side redirect for custom OAuth apps.
@@ -288,4 +291,73 @@ func (h *OAuthHandler) Disconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Usage returns the subscription usage/limits snapshot for a connected OAuth
+// provider: per-model remaining quota for Antigravity, plan + daily/weekly
+// usage for Devin. Failures are 502 with a plain message — the UI keeps the
+// connected badge and shows the error inline.
+func (h *OAuthHandler) Usage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	p, err := h.Providers.GetByID(id)
+	if err != nil {
+		httperr.NotFound(w, "provider not found")
+		return
+	}
+	h.Providers.EnrichOAuthOne(p)
+	tok, defID, terr := h.Providers.OAuthTokens(p)
+	if terr != nil || tok == nil || tok.Refresh == "" {
+		httperr.Invalid(w, "oauth not connected")
+		return
+	}
+	defID = firstNonEmpty(p.OAuthDefID, defID, string(p.Type))
+	switch defID {
+	case "antigravity":
+		access, project, _, err := h.Providers.EnsureFreshAccess(r.Context(), p, nil)
+		if err != nil || access == "" {
+			httperr.Write(w, http.StatusBadGateway, "oauth refresh failed: reconnect in Providers", httperr.TypeProxy)
+			return
+		}
+		q, err := antigravity.FetchQuota(access, project, p.BaseURL, nil)
+		if err != nil {
+			httperr.Write(w, http.StatusBadGateway, "quota unavailable: "+err.Error(), httperr.TypeProxy)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"provider_id": id, "def_id": "antigravity", "ok": true,
+			"plan_type": q.PlanType, "prompt_credits": q.PromptCredits, "models": q.Models,
+		})
+	case "devin":
+		access, _, _, err := h.Providers.EnsureFreshAccess(r.Context(), p, nil)
+		if err != nil || access == "" {
+			httperr.Write(w, http.StatusBadGateway, "oauth refresh failed: reconnect in Providers", httperr.TypeProxy)
+			return
+		}
+		q, err := devin.FetchQuota(access, p.BaseURL, nil)
+		if err != nil {
+			httperr.Write(w, http.StatusBadGateway, "quota unavailable: "+err.Error(), httperr.TypeProxy)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"provider_id": id, "def_id": "devin", "ok": true,
+			"plan": q.Plan, "daily_remaining": q.DailyRemaining, "daily_used": q.DailyUsed,
+			"daily_reset_at": q.DailyResetAt, "weekly_remaining": q.WeeklyRemaining,
+			"weekly_used": q.WeeklyUsed, "weekly_reset_at": q.WeeklyResetAt,
+			"hide_daily": q.HideDaily, "hide_weekly": q.HideWeekly,
+			"extra_balance_usd": q.ExtraBalanceUSD,
+		})
+	default:
+		httperr.Invalid(w, "usage not supported for provider "+defID)
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

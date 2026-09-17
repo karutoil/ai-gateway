@@ -60,10 +60,11 @@ export default function Audit(){
   const hasNext = total != null ? offset + rows.length < total : rows.length === limit
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <PageHeader
-        title="Audit"
-        description="Admin-side trail of privileged actions — who did what, to which target, and when."
+        eyebrow="Govern · Trust"
+        title="Audit trail"
+        description="Who did what, to which target, and when — paginated, filterable by actor, admin-only."
         actions={
           <Button variant="primary" onClick={()=>load()} disabled={loading}>
             <Icon name="refresh" size={15}/>Refresh
@@ -85,7 +86,7 @@ export default function Audit(){
       {!loadError && (
         <>
           {/* Filters + pagination controls */}
-          <Card className="!p-3 flex flex-col sm:flex-row sm:items-center gap-2">
+          <Card className="!p-3.5 flex flex-col sm:flex-row sm:items-center gap-2 !rounded-xl">
             <form
               className="relative flex-1 min-w-[180px]"
               onSubmit={(e)=>{ e.preventDefault(); setActor(actorInput.trim()) }}
@@ -98,7 +99,7 @@ export default function Audit(){
               <select
                 value={limit}
                 onChange={e=>setLimit(Number(e.target.value))}
-                className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-teal/60"
+                className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-accent/60"
               >
                 {PAGE_SIZES.map(n=> <option key={n} value={n}>{n}</option>)}
               </select>

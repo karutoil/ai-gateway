@@ -144,8 +144,9 @@ export default function Models({ role = 'admin' }: { role?: string }){
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="Connect · Catalog"
         title="Models"
-        description="Catalog and per-provider models. Search, enrich specs, add manual entries, and manage aliases."
+        description="Catalog and per-provider models with context windows, pricing and live traffic. Search, enrich, and alias." 
         actions={
           isAdmin ? (
             <>
@@ -179,10 +180,10 @@ export default function Models({ role = 'admin' }: { role?: string }){
       )}
 
       {/* Search / filter row */}
-      <Card className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2">
+      <Card className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2 !rounded-xl !p-3">
         {isAdmin && (
           <label className="flex items-center gap-1.5 text-xs text-muted shrink-0 px-1 cursor-pointer">
-            <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll} aria-label="Select all models" className="accent-teal rounded"/>
+            <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll} aria-label="Select all models" className="accent-accent rounded"/>
             All
           </label>
         )}
@@ -243,11 +244,11 @@ export default function Models({ role = 'admin' }: { role?: string }){
           const isSelected = selected.has(m.id)
           const fullId = m.provider_name ? `${m.provider_name}/${m.model_id}` : m.model_id
           return (
-            <Card key={m.id} pad={false} className={`p-4 flex flex-col ${isSelected && !isEdit ? 'border-amber/40 bg-amber/5' : ''}`}>
+            <Card key={m.id} pad={false} className={`p-4 flex flex-col transition-colors hover:border-muted/60 ${isSelected && !isEdit ? 'border-amber/40 bg-amber/5' : ''}`}>
               {/* Head */}
               <div className="flex items-start gap-2">
                 {isAdmin && (
-                  <input type="checkbox" checked={isSelected} onChange={()=>toggleSelect(m.id)} aria-label={`Select ${fullId}`} className="mt-1 accent-teal rounded shrink-0"/>
+                  <input type="checkbox" checked={isSelected} onChange={()=>toggleSelect(m.id)} aria-label={`Select ${fullId}`} className="mt-1 accent-accent rounded shrink-0"/>
                 )}
                 <div className="min-w-0 flex-1">
                   <div className="font-medium truncate" title={m.display_name}>{m.display_name || fullId}</div>
@@ -286,7 +287,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
 
               {/* Inline editor (same fields and save normalization as before) */}
               {isEdit && (
-                <div className="mt-3 space-y-2 rounded-lg border border-teal/30 bg-app/50 p-3">
+                <div className="mt-3 space-y-2 rounded-lg border border-accent/30 bg-app/50 p-3">
                   <div className="grid grid-cols-2 gap-2">
                     <Field label="Context"><Input value={edit.context_window} inputMode="numeric" onChange={e=>setEdit({...edit, context_window: parseInt(e.target.value)||0})}/></Field>
                     <Field label="Max output"><Input value={edit.max_output} inputMode="numeric" onChange={e=>setEdit({...edit, max_output: parseInt(e.target.value)||0})}/></Field>
@@ -294,7 +295,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
                     <Field label="Cost out"><Input value={edit.output_cost} inputMode="decimal" onChange={e=>setEdit({...edit, output_cost: parseFloat(e.target.value)||0})}/></Field>
                   </div>
                   <label className="flex items-center gap-2 text-xs text-paper">
-                    <input type="checkbox" checked={!!edit.reasoning} onChange={e=>setEdit({...edit, reasoning: e.target.checked})} className="accent-teal rounded"/> reasoning
+                    <input type="checkbox" checked={!!edit.reasoning} onChange={e=>setEdit({...edit, reasoning: e.target.checked})} className="accent-accent rounded"/> reasoning
                   </label>
                   {edit.reasoning && (
                     <div className="space-y-2">

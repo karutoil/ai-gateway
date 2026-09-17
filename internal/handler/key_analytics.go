@@ -153,9 +153,9 @@ func (h *AdminHandler) KeyAnalytics(w http.ResponseWriter, r *http.Request) {
 	rngSuccessful := rngReqs - rngFailed
 
 	// Daily/hourly buckets (hourly for 24h, matching Stats).
-	bucketExpr := "date(rl.created_at)"
+	bucketExpr := db.DateBucketExpr("rl.created_at")
 	if rng == "24h" {
-		bucketExpr = `strftime('%Y-%m-%dT%H:00:00Z', rl.created_at)`
+		bucketExpr = db.HourBucketExpr("rl.created_at")
 	}
 	daily := []keyDaily{}
 	rows, err := h.DB.Query(db.Q(`SELECT `+bucketExpr+`, COALESCE(SUM(rl.total_tokens),0), COALESCE(SUM(rl.cost_usd),0), COUNT(*) FROM request_logs rl`+baseWhere+` GROUP BY `+bucketExpr+` ORDER BY 1`), baseArgs...)

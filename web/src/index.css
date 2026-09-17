@@ -3,45 +3,47 @@
 @tailwind utilities;
 
 /* ------------------------------------------------------------------ */
-/* Design tokens — single source of truth for both themes.             */
-/* Neutrals are a deep slate-green family; teal is the brand accent.   */
+/* Ledger tokens — warm editorial surfaces, one persimmon accent.      */
+/* :root is the dim room; html.light is the default reading room.      */
 /* ------------------------------------------------------------------ */
 :root {
   color-scheme: dark;
-  --c-graphite: 16 21 19;    /* app background  #101513 */
-  --c-surface: 26 32 29;     /* card surface    #1A201D */
-  --c-raised: 34 42 38;      /* raised/hover    #222A26 */
-  --c-paper: 231 237 233;    /* primary text    #E7EDE9 */
-  --c-stone: 44 53 48;       /* borders/dividers#2C3530 */
-  --c-muted: 137 152 144;    /* secondary text  #899890 */
-  --c-danger: 239 107 107;
-  --c-teal: 44 217 163;      /* brand accent    #2CD9A3 */
-  --c-amber: 255 184 77;     /* warn accent     #FFB84D */
+  --c-graphite: 22 19 15;       /* app background */
+  --c-surface: 30 27 22;        /* card surface   */
+  --c-raised: 43 38 30;         /* raised/hover   */
+  --c-paper: 236 231 219;       /* primary text   */
+  --c-stone: 63 56 45;          /* borders        */
+  --c-muted: 161 150 132;       /* secondary text */
+  --c-danger: 224 109 86;
+  --c-accent: 228 110 54;       /* ember          */
+  --c-onaccent: 255 255 255;
+  --c-ink: 235 230 219;         /* solid fills    */
+  --c-cream: 24 21 17;          /* text on fills  */
+  --c-amber: 214 164 74;
+
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.35);
+  --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.6);
 }
 
 html.light {
   color-scheme: light;
-  /* Warm grey-green canvas instead of near-white; softens glare while     */
-  /* keeping white cards clearly elevated above the background.            */
-  --c-graphite: 240 242 239; /* app background  #F0F2EF */
-  --c-surface: 255 255 255;  /* cards           #FFFFFF */
-  --c-raised: 229 233 229;
-  --c-paper: 23 33 29;       /* ink text        #17211D */
-  --c-stone: 223 228 223;    /* borders         #DFE4DF */
-  --c-muted: 96 109 102;     /* #606D66 */
-  --c-danger: 202 62 62;
-  /* Softened accents for light mode: the dark-mode neons read as glare   */
-  /* on white. Deeper, desaturated values keep sufficient contrast.       */
-  --c-teal: 9 154 111;       /* #099A6F */
-  --c-amber: 176 116 22;     /* #B07416 */
+  --c-graphite: 243 241 234;    /* bone page      */
+  --c-surface: 255 255 255;     /* cards          */
+  --c-raised: 234 231 220;
+  --c-paper: 29 26 21;          /* warm ink       */
+  --c-stone: 221 216 202;
+  --c-muted: 109 102 87;
+  --c-danger: 178 58 32;
+  --c-accent: 194 72 21;        /* persimmon      */
+  --c-onaccent: 255 255 255;
+  --c-ink: 29 26 21;
+  --c-cream: 246 243 234;
+  --c-amber: 146 96 16;
 }
 
-/* Light mode: shadows tuned for dark surfaces read as harsh grey halos   */
-/* on a light canvas — swap to soft, low-opacity ambient shadows.         */
 html.light {
-  --shadow-card: 0 1px 2px rgb(23 33 29 / 0.06), 0 1px 3px rgb(23 33 29 / 0.04);
-  --shadow-pop: 0 10px 30px rgb(23 33 29 / 0.12), 0 2px 8px rgb(23 33 29 / 0.08);
-  --shadow-glow: 0 0 6px rgb(9 154 111 / 0.35);
+  --shadow-card: 0 1px 2px rgb(29 26 21 / 0.07);
+  --shadow-pop: 0 16px 40px -12px rgb(29 26 21 / 0.22);
 }
 
 html { font-size: 15px; }
@@ -49,15 +51,19 @@ html { font-size: 15px; }
 body {
   @apply bg-app text-paper font-sans antialiased;
   transition: background-color 0.25s ease, color 0.25s ease;
+  text-rendering: optimizeLegibility;
 }
 
-::selection { background: rgb(44 217 163 / 0.25); }
+::selection { background: rgb(var(--c-accent) / 0.22); }
 
 *:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(var(--c-teal) / 0.45);
+  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(var(--c-accent) / 0.45);
   border-radius: 8px;
 }
+
+/* Serif display face — headlines only. */
+.font-display { font-family: "Fraunces", Georgia, serif; letter-spacing: -0.01em; }
 
 /* Scrollbars — slim, themed, unobtrusive */
 * { scrollbar-width: thin; scrollbar-color: rgb(var(--c-stone)) transparent; }
@@ -76,19 +82,6 @@ body {
 @media (max-width: 640px) {
   button, a { min-height: 36px; }
   input, select, textarea { font-size: 16px; } /* prevent iOS zoom */
-}
-
-/* Legacy ambient grid (login / loading screens) */
-.bg-grid {
-  background-image:
-    linear-gradient(to right, rgb(44 217 163 / 0.035) 1px, transparent 1px),
-    linear-gradient(to bottom, rgb(44 217 163 / 0.03) 1px, transparent 1px);
-  background-size: 26px 26px;
-}
-html.light .bg-grid {
-  background-image:
-    linear-gradient(to right, rgb(23 33 29 / 0.035) 1px, transparent 1px),
-    linear-gradient(to bottom, rgb(23 33 29 / 0.025) 1px, transparent 1px);
 }
 
 @media (prefers-reduced-motion: reduce) {

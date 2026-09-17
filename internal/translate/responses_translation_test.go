@@ -137,6 +137,125 @@ func TestResponsesChatShapedToolsPassThrough(t *testing.T) {
 	}
 }
 
+// Multi-turn histories replay assistant turns as message items with
+// output_text parts. Those must become chat text parts — forwarding
+// output_text verbatim hands strict chat upstreams an unknown part type.
+func TestResponsesAssistantOutputTextBecomesText(t *testing.T) {
+	msgs := translateToMessages(t, `{"model":"m","input":[`+
+		`{"role":"user","content":"hi"},`+
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]},`+
+		`{"role":"user","content":"again"}]}`)
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 messages, got %d: %+v", len(msgs), msgs)
+	}
+	content, ok := msgs[1].Content.([]interface{})
+	if !ok || len(content) != 1 {
+		t.Fatalf("assistant content = %v", msgs[1].Content)
+	}
+	part, ok := content[0].(map[string]interface{})
+	if !ok || part["type"] != "text" || part["text"] != "hello" {
+		t.Fatalf("part = %v, want text/hello", content[0])
+	}
+	if _, hasAnnotations := part["annotations"]; hasAnnotations {
+		t.Fatalf("annotations must not leak to chat: %v", part)
+	}
+}
+
+// Refusal parts have no chat counterpart; the refusal text must survive
+// as plain text so the turn keeps its meaning.
+func TestResponsesRefusalBecomesText(t *testing.T) {
+	msgs := translateToMessages(t, `{"model":"m","input":[`+
+		`{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"cannot help"}]}]}`)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %d", len(msgs))
+	}
+	content, ok := msgs[0].Content.([]interface{})
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v", msgs[0].Content)
+	}
+	part, ok := content[0].(map[string]interface{})
+	if !ok || part["type"] != "text" || part["text"] != "cannot help" {
+		t.Fatalf("part = %v", content[0])
+	}
+}
+
+// Server-side tool items (web search, MCP, code interpreter, shell, ...)
+// have no chat counterpart and must be skipped, not forwarded as
+// null-content user messages that strict upstreams reject.
+func TestResponsesServerToolItemsSkipped(t *testing.T) {
+	msgs := translateToMessages(t, `{"model":"m","input":[`+
+		`{"type":"web_search_call","id":"ws1","status":"completed"},`+
+		`{"type":"mcp_call","id":"mc1","name":"grep"},`+
+		`{"type":"code_interpreter_call","id":"ci1"},`+
+		`{"type":"local_shell_call","id":"sh1"},`+
+		`{"type":"future_widget_call","id":"fw1"},`+
+		`{"role":"user","content":"hi"}]}`)
+	if len(msgs) != 1 {
+		t.Fatalf("want only the user message, got %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" || msgs[0].Content != "hi" {
+		t.Fatalf("msg = %+v", msgs[0])
+	}
+}
+
+// custom_tool_call (Responses custom tools) must become an assistant
+// tool_call so the paired function_call_output still lines up by call_id.
+func TestResponsesCustomToolCallBecomesAssistantToolCall(t *testing.T) {
+	msgs := translateToMessages(t, `{"model":"m","input":[`+
+		`{"type":"custom_tool_call","call_id":"c9","name":"editor","input":"{\"op\":\"read\"}"},`+
+		`{"type":"function_call_output","call_id":"c9","output":"file contents"}]}`)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 messages, got %d: %+v", len(msgs), msgs)
+	}
+	calls, ok := msgs[0].ToolCalls.([]interface{})
+	if !ok || len(calls) != 1 {
+		t.Fatalf("tool_calls = %v", msgs[0].ToolCalls)
+	}
+	c := calls[0].(map[string]interface{})
+	if c["id"] != "c9" {
+		t.Fatalf("call id = %v", c)
+	}
+	fn := c["function"].(map[string]interface{})
+	if fn["name"] != "editor" || fn["arguments"] != `{"op":"read"}` {
+		t.Fatalf("function = %v", fn)
+	}
+	if msgs[1].Role != "tool" || msgs[1].ToolCallID != "c9" {
+		t.Fatalf("output msg = %+v", msgs[1])
+	}
+}
+
+// A nameless function_call must keep its call_id pairing (placeholder
+// name) instead of dropping the call and orphaning its output.
+func TestResponsesNamelessFunctionCallKeepsPairing(t *testing.T) {
+	msgs := translateToMessages(t, `{"model":"m","input":[`+
+		`{"type":"function_call","call_id":"c1","arguments":"{}"},`+
+		`{"type":"function_call_output","call_id":"c1","output":"ok"}]}`)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 messages, got %d: %+v", len(msgs), msgs)
+	}
+	calls, ok := msgs[0].ToolCalls.([]interface{})
+	if !ok || len(calls) != 1 {
+		t.Fatalf("tool_calls = %v", msgs[0].ToolCalls)
+	}
+	c := calls[0].(map[string]interface{})
+	if c["id"] != "c1" {
+		t.Fatalf("call id lost: %v", c)
+	}
+}
+
+// A single (unwrapped) output_text object as a tool output must unwrap
+// to its text, not forward the JSON envelope as the tool result.
+func TestResponsesSingleOutputObjectUnwrapped(t *testing.T) {
+	msgs := translateToMessages(t, `{"model":"m","input":[`+
+		`{"type":"function_call_output","call_id":"c1","output":{"type":"output_text","text":"done"}}]}`)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %d", len(msgs))
+	}
+	if msgs[0].Content != "done" {
+		t.Fatalf("content = %v, want unwrapped text", msgs[0].Content)
+	}
+}
+
 func TestResponsesToolChoiceNamedConverted(t *testing.T) {
 	out, _, err := ResponsesToChat([]byte(`{"model":"m","input":"hi",` +
 		`"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{}}}],` +

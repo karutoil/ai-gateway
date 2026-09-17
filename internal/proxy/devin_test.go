@@ -161,3 +161,93 @@ func TestFriendlyDevinTrailerError(t *testing.T) {
 		t.Fatalf("non-internal errors pass through: %q", plain)
 	}
 }
+
+// swe-2 streams one logical call as head + continuation fragments with no
+// id/name. They must merge into one call with valid JSON args, not one
+// physical call per fragment (harness "tool not found: tool" errors).
+func TestDevinToolAccumFragmentedSwe2(t *testing.T) {
+	acc := newDevinToolAccum()
+	frags := []string{`{`, `"target_directory": "`, `.`, `"`, `}`}
+	var ids []string
+	for i, f := range frags {
+		id, name := "", ""
+		if i == 0 {
+			id, name = "call_1", "list_dir"
+		}
+		fragment, start, eid := acc.Add(id, name, f)
+		ids = append(ids, eid)
+		if i == 0 && !start {
+			t.Fatalf("head must start")
+		}
+		if i > 0 && start {
+			t.Fatalf("continuation %d must not start", i)
+		}
+		if fragment != f {
+			t.Fatalf("fragment %d = %q want %q", i, fragment, f)
+		}
+		if eid != "call_1" {
+			t.Fatalf("effective id %d = %q want call_1", i, eid)
+		}
+	}
+	if got := acc.Name("call_1"); got != "list_dir" {
+		t.Fatalf("name = %q want list_dir", got)
+	}
+	calls := acc.FinalCalls()
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d want 1: %+v", len(calls), calls)
+	}
+	if calls[0].Name != "list_dir" {
+		t.Fatalf("call name = %q want list_dir", calls[0].Name)
+	}
+	raw, _ := json.Marshal(calls[0].Arguments)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("merged args invalid: %s: %v", raw, err)
+	}
+	if decoded["target_directory"] != "." {
+		t.Fatalf("args = %s", raw)
+	}
+}
+
+func TestDevinDeltasToChunksFragmentedSwe2(t *testing.T) {
+	deltas := []devin.Delta{
+		{Type: "tool", ID: "call_1", Name: "list_dir", ArgsJSON: `{`},
+		{Type: "tool", ArgsJSON: `"target_directory": "`},
+		{Type: "tool", ArgsJSON: `.`},
+		{Type: "tool", ArgsJSON: `"`},
+		{Type: "tool", ArgsJSON: `}`},
+	}
+	chunks := devinDeltasToChunks(deltas)
+	if len(chunks) != 1 {
+		t.Fatalf("chunks = %d want 1: %+v", len(chunks), chunks)
+	}
+	if len(chunks[0].ToolCalls) != 1 {
+		t.Fatalf("tool calls = %+v", chunks[0].ToolCalls)
+	}
+	tc := chunks[0].ToolCalls[0]
+	if tc.Name != "list_dir" {
+		t.Fatalf("name = %q want list_dir", tc.Name)
+	}
+	raw, _ := json.Marshal(tc.Arguments)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("args invalid: %s: %v", raw, err)
+	}
+	if decoded["target_directory"] != "." {
+		t.Fatalf("args = %s", raw)
+	}
+}
+
+// A "tool" placeholder name on continuations must not clobber the head's
+// real name.
+func TestDevinToolAccumPlaceholderNameKept(t *testing.T) {
+	acc := newDevinToolAccum()
+	if _, _, _ = acc.Add("call_1", "list_dir", `{"a":`); true {
+	}
+	if _, start, _ := acc.Add("call_1", "tool", `1}`); start {
+		t.Fatalf("continuation must not start")
+	}
+	if got := acc.Name("call_1"); got != "list_dir" {
+		t.Fatalf("name = %q want list_dir", got)
+	}
+}

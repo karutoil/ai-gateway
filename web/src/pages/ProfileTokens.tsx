@@ -65,11 +65,12 @@ export default function ProfileTokens() {
   }
 
   return (
-    <Card className="space-y-4">
-      <div className="flex items-center justify-between">
+    <Card className="space-y-4 !rounded-xl">
+      <div className="flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-sm font-semibold flex items-center gap-2">
-            <Icon name="key" size={15} className="text-teal" /> API tokens
+          <div className="text-[11px] font-bold uppercase tracking-[0.16em] text-accent">Automation</div>
+          <h3 className="font-display text-lg font-bold tracking-tight mt-1 flex items-center gap-2">
+            <Icon name="key" size={16} className="text-accent" /> API tokens
           </h3>
           <p className="text-xs text-muted mt-0.5">
             Bearer tokens for the dashboard API (<code className="font-mono">Authorization: Bearer gwp_...</code>).
@@ -125,9 +126,9 @@ export default function ProfileTokens() {
       <Modal open={!!created} onClose={() => setCreated(null)} title="Token created" width="max-w-md">
         {created && (
           <>
-            <div className="rounded-lg border border-teal/40 bg-teal/5 p-3">
+            <div className="rounded-lg border border-accent/40 bg-accent/5 p-3">
               <div className="text-xs text-muted mb-1.5 uppercase tracking-wide">Token — shown only once</div>
-              <code className="block font-mono text-sm break-all select-all text-teal">{created.secret}</code>
+              <code className="block font-mono text-sm break-all select-all text-accent">{created.secret}</code>
             </div>
             <p className="text-xs text-muted mt-2">
               Use it with <code className="font-mono">Authorization: Bearer …</code> on dashboard API calls

@@ -106,10 +106,11 @@ export default function Webhooks() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <PageHeader
+        eyebrow="Govern · Events"
         title="Webhooks"
-        description="Outbound event delivery to your systems. Payloads are JSON, POST, signed with HMAC-SHA256 (X-Webhook-Signature)."
+        description="HMAC-signed POST delivery (X-Webhook-Signature) for key, user and billing events — in generic, Discord or Slack shape."
         actions={
           <Button variant="primary" onClick={openCreate}>
             <Icon name="plus" size={15} /> Add webhook
@@ -133,9 +134,9 @@ export default function Webhooks() {
       )}
 
       {hooks.length > 0 && (
-        <div className="space-y-2">
+        <div className="space-y-3">
           {hooks.map(h => (
-            <Card key={h.id} className="!p-4">
+            <Card key={h.id} className="!p-5 hover:border-muted/60 transition-colors">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
@@ -148,7 +149,7 @@ export default function Webhooks() {
                   <div className="font-mono text-xs text-muted mt-1 truncate" title={h.url}>{h.url}</div>
                   <div className="text-xs text-muted mt-1">
                     {h.last_status
-                      ? <>last delivery: <span className={h.last_status.startsWith('2') ? 'text-teal' : 'text-amber'}>{h.last_status}</span></>
+                      ? <>last delivery: <span className={h.last_status.startsWith('2') ? 'text-accent' : 'text-amber'}>{h.last_status}</span></>
                       : 'no deliveries yet'}
                   </div>
                 </div>
@@ -195,7 +196,7 @@ export default function Webhooks() {
 								onClick={() => setEditing({ ...editing, format: f } as typeof editing)}
 								className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors focus:outline-none ${
 									(editing?.format || 'json') === f
-										? 'border-teal/60 bg-teal/10 text-teal'
+										? 'border-accent/60 bg-accent/10 text-accent'
 										: 'border-stone text-muted hover:text-paper'
 								}`}
 							>
@@ -221,7 +222,7 @@ export default function Webhooks() {
                       onClick={() => toggleEvent(e)}
                       className={`px-2 py-1 rounded-md text-xs font-mono border transition-colors focus:outline-none ${
                         events.includes(e)
-                          ? 'border-teal/60 bg-teal/10 text-teal'
+                          ? 'border-accent/60 bg-accent/10 text-accent'
                           : 'border-stone text-muted hover:text-paper'
                       }`}
                     >
@@ -236,7 +237,7 @@ export default function Webhooks() {
                 type="checkbox"
                 checked={editing.enabled !== false}
                 onChange={e => setEditing({ ...editing, enabled: e.target.checked })}
-                className="w-4 h-4 accent-teal"
+                className="w-4 h-4 accent-accent"
               />
               Enabled
             </label>

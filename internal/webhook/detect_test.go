@@ -37,17 +37,23 @@ func TestDiscordBodyShape(t *testing.T) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		t.Fatalf("invalid discord body: %v\n%s", err, body)
 	}
-	content, _ := m["content"].(string)
-	if !strings.Contains(content, "key.rotated") || !strings.Contains(content, "prod-key") {
-		t.Fatalf("content summary missing: %q", content)
+	if u, _ := m["username"].(string); u == "" {
+		t.Error("discord body should set a username")
 	}
 	embeds, _ := m["embeds"].([]any)
 	if len(embeds) != 1 {
 		t.Fatalf("expected 1 embed, got %d", len(embeds))
 	}
 	embed := embeds[0].(map[string]any)
-	if _, ok := embed["description"]; !ok {
-		t.Error("embed missing description (full payload)")
+	title, _ := embed["title"].(string)
+	desc, _ := embed["description"].(string)
+	fieldsJSON, _ := json.Marshal(embed["fields"])
+	combined := title + "\n" + desc + "\n" + string(fieldsJSON)
+	if !strings.Contains(combined, "prod-key") || !strings.Contains(combined, "admin") {
+		t.Errorf("embed should name the key and actor: %s", combined)
+	}
+	if strings.Contains(desc, `"prefix"`) {
+		t.Errorf("embed description must be human text, not raw JSON: %q", desc)
 	}
 }
 
@@ -59,7 +65,7 @@ func TestSlackBodyShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	text, _ := m["text"].(string)
-	if !strings.Contains(text, "key.created") {
-		t.Fatalf("slack text missing event: %q", text)
+	if !strings.Contains(text, "API Key Created") || !strings.Contains(text, "ci") {
+		t.Fatalf("slack text should be a human summary: %q", text)
 	}
 }

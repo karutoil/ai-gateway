@@ -1,0 +1,28 @@
+# Standby gateway (Podman). Postgres runs natively; Redis runs alongside.
+services:
+  gateway:
+    image: ai-gateway:standby
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: ai-gateway-prod
+    ports:
+      - "8090:8090"
+    env_file:
+      - /etc/ai-gateway/env
+    environment:
+      PORT: 8090
+    volumes:
+      - gateway-data:/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-gateway-redis
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
+  redis-data:
