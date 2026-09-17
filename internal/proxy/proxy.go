@@ -21,6 +21,7 @@ import (
 	"ai-gateway/internal/cache"
 	"ai-gateway/internal/catalog"
 	"ai-gateway/internal/db"
+	"ai-gateway/internal/devin"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
@@ -2575,6 +2576,14 @@ func (h *Handler) knownReasoningConfig(providerID, modelID string) (known, reaso
 		// scoped to the pinned provider, so stripping is safe.
 		if short := shortModelID(modelID); short != modelID {
 			err = h.DB.QueryRow(pmQuery, providerID, short).Scan(&r, &rt, &rl, &rol)
+		}
+	}
+	if err != nil {
+		// Devin stores one collapsed base row ("swe-2") while clients may
+		// request explicit level variants ("devin/swe-2-max"): resolve to
+		// the base row so effort validation and level metadata apply.
+		if short, base := shortModelID(modelID), devin.CollapseReasoningVariant(shortModelID(modelID)); base != short {
+			err = h.DB.QueryRow(pmQuery, providerID, base).Scan(&r, &rt, &rl, &rol)
 		}
 	}
 	if err != nil {

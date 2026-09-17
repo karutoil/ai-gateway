@@ -54,15 +54,18 @@ func FromOpenAI(openAIJSON []byte, model string) (ChatInput, error) {
 				system = append(system, t)
 			}
 		case "user":
-			if t := openAIText(m["content"]); strings.TrimSpace(t) != "" {
-				out.Messages = append(out.Messages, WireMessage{Role: WireRoleChat, Text: t})
+			t, imgs := openAIText(m["content"]), openAIImages(m["content"])
+			if strings.TrimSpace(t) != "" || len(imgs) > 0 {
+				out.Messages = append(out.Messages, WireMessage{Role: WireRoleUser, Text: t, Images: imgs})
 			}
 		case "assistant":
 			// One OpenAI assistant turn is ONE wire prompt: text and its
 			// tool calls travel together. Splitting them (text turn + one
 			// turn per call) breaks the backend's turn tracking and the
 			// follow-up tool calls come back malformed.
-			wm := WireMessage{Role: WireRoleChat, Text: openAIText(m["content"])}
+			// Assistant history rides as SYSTEM (2): encoding it as USER (1)
+			// breaks turn tracking and the follow-up fails server-side.
+			wm := WireMessage{Role: WireRoleSystem, Text: openAIText(m["content"])}
 			for _, tc := range asSlice(m["tool_calls"]) {
 				tcm, _ := tc.(map[string]any)
 				if tcm == nil {
@@ -105,7 +108,7 @@ func FromOpenAI(openAIJSON []byte, model string) (ChatInput, error) {
 			if strings.TrimSpace(text) == "" {
 				text = "Tool finished."
 			}
-			out.Messages = append(out.Messages, WireMessage{Role: WireRoleTool, Text: text, ToolCallID: id})
+			out.Messages = append(out.Messages, WireMessage{Role: WireRoleTool, Text: text, ToolCallID: id, Images: openAIImages(m["content"])})
 		}
 	}
 	out.System = strings.Join(system, "\n\n")
@@ -163,6 +166,61 @@ func asSlice(v any) []any {
 		return s
 	}
 	return nil
+}
+
+// openAIImages extracts inline images from message content arrays, in both
+// OpenAI ({type:image_url, image_url:{url}}) and Anthropic ({type:image,
+// source:{data, media_type}}) shapes. Only data: URLs carry a base64 payload
+// for the wire ImageData schema; remote URLs are skipped.
+func openAIImages(v any) []WireImage {
+	parts, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []WireImage
+	for _, item := range parts {
+		m, _ := item.(map[string]any)
+		if m == nil {
+			continue
+		}
+		switch m["type"] {
+		case "image_url":
+			iu, _ := m["image_url"].(map[string]any)
+			if iu == nil {
+				continue
+			}
+			u, _ := iu["url"].(string)
+			if b64, mime, ok := parseDataURL(u); ok {
+				out = append(out, WireImage{Base64: b64, Mime: mime})
+			}
+		case "image":
+			src, _ := m["source"].(map[string]any)
+			if src == nil {
+				continue
+			}
+			data, _ := src["data"].(string)
+			mime, _ := src["media_type"].(string)
+			if strings.TrimSpace(data) != "" {
+				out = append(out, WireImage{Base64: strings.TrimSpace(data), Mime: strings.TrimSpace(mime)})
+			}
+		}
+	}
+	return out
+}
+
+func parseDataURL(u string) (b64, mime string, ok bool) {
+	if !strings.HasPrefix(u, "data:") {
+		return "", "", false
+	}
+	rest := u[len("data:"):]
+	i := strings.Index(rest, ";base64,")
+	if i <= 0 {
+		return "", "", false
+	}
+	if b64 = rest[i+len(";base64,"):]; b64 == "" {
+		return "", "", false
+	}
+	return b64, strings.TrimSpace(rest[:i]), true
 }
 
 // openAIText extracts plain text from string or content-array message content.

@@ -34,6 +34,29 @@ handler, route, migration, or UI changes.
    internal error, refresh the model list and use the newest model your
    account reports (e.g. `swe-1-7`).
 
+   Reasoning levels: Devin advertises one wire config per (model, level) as
+   `<model>-<level>` (e.g. `swe-2-max`). Discovery collapses those variants
+   to a single base row (`swe-2`) carrying the observed `reasoning_levels`,
+   so enrichment stays intact. Request a level with the usual effort knobs
+   (`reasoning_effort`, `reasoning.effort`, or Anthropic `thinking.effort`);
+   the proxy routes it to the suffixed wire id (`swe-2` + high → `swe-2-high`)
+   and validates it against the stored levels. With no effort requested the
+   bare id is sent as-is, and an explicit `devin/swe-2-max` passes through
+   verbatim.
+
+   Wire parity (verified against OMP's Devin integration): the gateway speaks
+   as the released CLI identity (`devin-cli`/`chisel`), encodes history with
+   native turn sources (user→USER, assistant→SYSTEM, tool result→TOOL —
+   assistant-as-USER breaks backend turn tracking and fails the follow-up),
+   forwards inline images, sends toolChoice auto + ephemeral prompt-cache
+   options, honors the server-directed chat host from auth, and discovers
+   with the dev-channel identity plus advertised display slots. Discovery
+   parses real per-model costs, context/output limits, feature flags, and
+   server-declared family effort lanes (stored per base row, preferred over
+   suffix routing); internal display slots and harness-less router uids are
+   filtered like the native client. Costs are informational — Devin bills via
+   seat/quota, so logged token costs stay zero.
+
 Devin tokens are long-lived; refresh is a no-op that keeps the same
 credentials. Health probes the session with a user-JWT request. Devin bills
 via seat/quota, so logged token costs are zero.

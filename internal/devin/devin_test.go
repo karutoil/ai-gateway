@@ -70,8 +70,8 @@ func TestBuildChatRequestShape(t *testing.T) {
 	in := ChatInput{
 		Model: "swe-1-7", System: "Be brief",
 		Messages: []WireMessage{
-			{Role: WireRoleChat, Text: "hi"},
-			{Role: WireRoleChat, ToolCalls: []WireToolCall{{ID: "call_1", Name: "get_w", ArgumentsJSON: `{"city":"Paris"}`}}},
+			{Role: WireRoleUser, Text: "hi"},
+			{Role: WireRoleSystem, ToolCalls: []WireToolCall{{ID: "call_1", Name: "get_w", ArgumentsJSON: `{"city":"Paris"}`}}},
 			{Role: WireRoleTool, Text: "sunny", ToolCallID: "call_1"},
 		},
 		Tools:       []ToolDef{{Name: "get_w", Description: "weather", Parameters: `{"type":"object"}`}},
@@ -87,10 +87,15 @@ func TestBuildChatRequestShape(t *testing.T) {
 	for _, f := range fields {
 		byNum[f.number]++
 	}
-	for _, want := range []uint64{1, 2, 3, 7, 8, 10, 11, 16, 17, 20, 21, 22} {
+	// 12 = toolChoice auto, 13 = system prompt cache options; 17 (promptId)
+	// is intentionally omitted — native clients leave it empty.
+	for _, want := range []uint64{1, 2, 3, 7, 8, 10, 11, 12, 13, 16, 20, 21, 22} {
 		if byNum[want] == 0 {
 			t.Errorf("missing top-level field %d", want)
 		}
+	}
+	if byNum[17] != 0 {
+		t.Errorf("promptId field 17 must be omitted, got %d", byNum[17])
 	}
 	// Three prompts expected.
 	if byNum[3] != 3 {
@@ -98,6 +103,25 @@ func TestBuildChatRequestShape(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "swe-1-7") || !strings.Contains(string(raw), "cascade-1") {
 		t.Error("model/cascade missing from request")
+	}
+	// Prompt sources: USER=1, SYSTEM=2, TOOL=4.
+	var roles []uint64
+	for _, f := range fields {
+		if f.number != 3 || f.wire != 2 {
+			continue
+		}
+		pf, err := parseFields(f.value)
+		if err != nil {
+			t.Fatalf("prompt parse: %v", err)
+		}
+		for _, p := range pf {
+			if p.number == 2 && p.wire == 0 {
+				roles = append(roles, p.vint)
+			}
+		}
+	}
+	if len(roles) != 3 || roles[0] != 1 || roles[1] != 2 || roles[2] != 4 {
+		t.Errorf("prompt sources = %v, want [1 2 4] (USER/SYSTEM/TOOL)", roles)
 	}
 }
 

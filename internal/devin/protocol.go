@@ -15,17 +15,35 @@ import (
 	"github.com/google/uuid"
 )
 
-// Client identity constants, matching the reference extension wire fingerprint.
+// Client identity constants, matching OMP's released Devin CLI fingerprint.
+// The backend gates router assignment and the CLI model surface on
+// ideType "chisel" — the older Windsurf identity does not reach them.
 const (
-	ideName           = "windsurf"
-	ideVersion        = "3.2.23"
-	extensionVersion  = "1.48.2"
+	ideName           = "devin-cli"
+	ideType           = "chisel"
+	ideVersion        = "3000.6.2"
+	extensionName     = "chisel"
+	extensionVersion  = "3000.6.2"
 	maxFramePayload   = 16 * 1024 * 1024
 	chatPath          = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 	userJWTPath       = "/exa.auth_pb.AuthService/GetUserJwt"
 	discoveryPath     = "/exa.api_server_pb.ApiServerService/GetCliModelConfigs"
 	discoveryTimeoutS = 5
 )
+
+// discoveryIdentity is the dev-channel identity that unlocks the full native
+// config set on GetCliModelConfigs (distinct from the released chat identity).
+const (
+	discoveryIdeName          = "chisel"
+	discoveryIdeVersion       = "0.0.0-dev"
+	discoveryExtensionName    = "chisel"
+	discoveryExtensionVersion = "0.0.0-dev"
+)
+
+// discoveryDisplays are the model display slots the native client advertises
+// (MODEL_ROUTER=3, QUICK_REVIEW=4, plus internal slots 6-8). Asking for the
+// internal slots is what makes the server return its full catalog.
+var discoveryDisplays = []uint64{3, 4, 6, 7, 8}
 
 // ---- protobuf primitives (hand-rolled codec, no .proto compiler needed) ----
 
@@ -34,6 +52,7 @@ type field struct {
 	wire   uint64 // 0=varint, 1=64bit, 2=length-delimited, 5=32bit
 	value  []byte // wire 2 payload
 	vint   uint64 // wire 0 value
+	fixed  uint32 // wire 5 value
 }
 
 func encodeVarint(v uint64) []byte {
@@ -115,6 +134,10 @@ func parseFields(buf []byte) ([]field, error) {
 		case 1:
 			off += 8
 		case 5:
+			if off+4 > len(buf) {
+				return nil, fmt.Errorf("truncated protobuf")
+			}
+			out = append(out, field{number: number, wire: wire, fixed: binary.LittleEndian.Uint32(buf[off : off+4])})
 			off += 4
 		default:
 			return nil, fmt.Errorf("unsupported wire type %d", wire)
@@ -142,19 +165,29 @@ func firstString(buf []byte, number uint64) string {
 // ---- metadata + auth ----
 
 func encodeMetadata(sessionToken, userJWT string) []byte {
+	return encodeMetadataWith(identity{ideName, ideType, ideVersion, extensionName, extensionVersion}, sessionToken, userJWT, nil)
+}
+
+// identity is one client fingerprint announced in Metadata.
+type identity struct {
+	ideName, ideType, ideVersion, extName, extVersion string
+}
+
+func encodeMetadataWith(id identity, sessionToken, userJWT string, displays []uint64) []byte {
 	parts := [][]byte{
-		stringField(1, ideName),
-		stringField(2, extensionVersion),
+		stringField(1, id.ideName),
+		stringField(2, id.extVersion),
 		stringField(3, sessionToken),
 		stringField(4, "en"),
 		stringField(5, runtime.GOOS),
-		stringField(7, ideVersion),
-		varintField(9, 1),
-		stringField(10, uuid.NewString()),
-		stringField(12, ideName),
-		stringField(25, uuid.NewString()),
-		stringField(26, "Unset"),
-		stringField(28, ideName),
+		stringField(7, id.ideVersion),
+		stringField(12, id.extName),
+	}
+	if id.ideType != "" {
+		parts = append(parts, stringField(28, id.ideType))
+	}
+	for _, d := range displays {
+		parts = append(parts, varintField(30, d))
 	}
 	if userJWT != "" {
 		parts = append(parts, stringField(21, userJWT))
@@ -162,14 +195,28 @@ func encodeMetadata(sessionToken, userJWT string) []byte {
 	return concat(parts...)
 }
 
+// encodeDiscoveryMetadata builds the dev-channel Metadata for
+// GetCliModelConfigs: the discovery identity plus the advertised display
+// slots (field 30) that make the server return its full catalog.
+func encodeDiscoveryMetadata(sessionToken string) []byte {
+	return encodeMetadataWith(identity{discoveryIdeName, "", discoveryIdeVersion, discoveryExtensionName, discoveryExtensionVersion}, sessionToken, "", discoveryDisplays)
+}
+
 // BuildUserJWTRequest encodes the GetUserJwt request body for a session token.
 func BuildUserJWTRequest(sessionToken string) []byte {
 	return message(1, encodeMetadata(NormalizeSessionToken(sessionToken), ""))
 }
 
+// BuildDiscoveryRequest encodes the GetCliModelConfigs request body.
+func BuildDiscoveryRequest(sessionToken string) []byte {
+	return message(1, encodeDiscoveryMetadata(NormalizeSessionToken(sessionToken)))
+}
+
 // GetUserJWT exchanges a session token for a short-lived user JWT against
-// the given transport base URL (empty selects the default host).
-func GetUserJWT(sessionToken, base string, client *http.Client) (string, error) {
+// the given transport base URL (empty selects the default host). It also
+// returns the server-directed chat base URL (GetUserJwtResponse field 2):
+// when present, chat traffic must go there instead of the default host.
+func GetUserJWT(sessionToken, base string, client *http.Client) (jwt, customBase string, err error) {
 	c := client
 	if c == nil {
 		c = http.DefaultClient
@@ -179,34 +226,55 @@ func GetUserJWT(sessionToken, base string, client *http.Client) (string, error) 
 	}
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+userJWTPath, bytes.NewReader(BuildUserJWTRequest(sessionToken)))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/proto")
 	req.Header.Set("connect-protocol-version", "1")
 	req.Header.Set("Accept", "*/*")
 	resp, err := c.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("devin auth unreachable: %w", err)
+		return "", "", fmt.Errorf("devin auth unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("devin auth failed: %d %s", resp.StatusCode, truncate(string(raw), 200))
+		return "", "", fmt.Errorf("devin auth failed: %d %s", resp.StatusCode, truncate(string(raw), 200))
 	}
-	jwt := firstString(raw, 1)
+	jwt = firstString(raw, 1)
 	if jwt == "" {
-		return "", fmt.Errorf("devin auth returned an empty user JWT")
+		return "", "", fmt.Errorf("devin auth returned an empty user JWT")
 	}
-	return jwt, nil
+	fields, ferr := parseFields(raw)
+	if ferr == nil {
+		for _, f := range fields {
+			if f.number == 2 && f.wire == 2 {
+				if u := strings.TrimSpace(string(f.value)); u != "" {
+					customBase = strings.TrimRight(u, "/")
+				}
+				break
+			}
+		}
+	}
+	return jwt, customBase, nil
 }
 
 // ---- chat request ----
 
-// WireRole mirrors the reference roles: 1 = conversational turn, 4 = tool result.
+// WireRole mirrors ChatMessageSource: USER=1 for user/developer turns,
+// SYSTEM=2 for assistant turns, TOOL=4 for tool results. Assistant history
+// MUST ride as SYSTEM — encoding it as USER breaks the backend's turn
+// tracking and the follow-up fails.
 const (
-	WireRoleChat = 1
-	WireRoleTool = 4
+	WireRoleUser   = 1
+	WireRoleSystem = 2
+	WireRoleTool   = 4
 )
+
+// WireImage is one inline image on a USER or TOOL prompt.
+type WireImage struct {
+	Base64 string
+	Mime   string
+}
 
 // WireToolCall is one tool invocation inside an assistant turn.
 type WireToolCall struct {
@@ -221,6 +289,7 @@ type WireMessage struct {
 	Text       string
 	ToolCallID string
 	ToolCalls  []WireToolCall
+	Images     []WireImage
 }
 
 // ToolDef is one callable tool.
@@ -259,6 +328,19 @@ func encodePrompt(item WireMessage, id string) []byte {
 	}
 	if item.ToolCallID != "" {
 		parts = append(parts, stringField(7, item.ToolCallID))
+	}
+	for _, img := range item.Images {
+		if strings.TrimSpace(img.Base64) == "" {
+			continue
+		}
+		mime := strings.TrimSpace(img.Mime)
+		if mime == "" {
+			mime = "image/png"
+		}
+		parts = append(parts, message(10, concat(
+			stringField(1, strings.TrimSpace(img.Base64)),
+			stringField(2, mime),
+		)))
 	}
 	for _, call := range item.ToolCalls {
 		parts = append(parts, encodeToolCall(call))
@@ -329,8 +411,13 @@ func BuildChatRequest(in ChatInput, sessionToken, userJWT string) []byte {
 	}
 	parts = append(parts,
 		varintField(11, 1),
+		// toolChoice optionName "auto" (oneof field 1).
+		message(12, stringField(1, "auto")),
+		// systemPromptCacheOptions type EPHEMERAL (1).
+		message(13, varintField(1, 1)),
 		stringField(16, cascade),
-		stringField(17, uuid.NewString()),
+		// Field 17 (promptId) is intentionally omitted: native clients leave
+		// it empty and the server mints turn ids itself.
 		varintField(20, 1),
 		stringField(21, in.Model),
 		stringField(22, uuid.NewString()),

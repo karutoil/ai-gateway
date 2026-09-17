@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS provider_models (
   reasoning_type TEXT,
   reasoning_levels TEXT,
   reasoning_output_limits TEXT,
+  reasoning_routing TEXT,
   FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE,
   UNIQUE(provider_id, model_id)
 );

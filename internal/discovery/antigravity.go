@@ -3,6 +3,7 @@ package discovery
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/antigravity"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/models"
 )
 
@@ -51,13 +53,39 @@ func (s *Service) discoverAntigravity(p *models.Provider) (int, error) {
 }
 
 func (s *Service) upsertAntigravity(p *models.Provider, pm antigravity.PublicModel, m rawModel) error {
+	// Operator overrides survive rediscovery.
+	if s.isManual(p.ID, m.ID) {
+		return nil
+	}
 	// Reuse generic upsert path but force enriched costs from the static catalog.
 	if err := s.upsert(p, m); err != nil {
 		return err
 	}
-	_, _ = s.db.Exec(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, attachment=?, source=?, updated_at=? WHERE provider_id=? AND model_id=?`,
-		pm.Name, "antigravity", pm.ContextWindow, pm.MaxTokens, pm.InputCost, pm.OutputCost, pm.CacheReadCost, pm.CacheWriteCost, true, true, true, "enriched", time.Now().UTC(), p.ID, m.ID)
-	return nil
+	return s.writeAntigravityRow(p.ID, m.ID, pm)
+}
+
+func (s *Service) writeAntigravityRow(providerID, modelID string, pm antigravity.PublicModel) error {
+	_, err := s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, attachment=?, source=?, updated_at=? WHERE provider_id=? AND model_id=?`),
+		pm.Name, "antigravity", pm.ContextWindow, pm.MaxTokens, pm.InputCost, pm.OutputCost, pm.CacheReadCost, pm.CacheWriteCost, true, true, true, "enriched", time.Now().UTC(), providerID, modelID)
+	return err
+}
+
+// enrichAntigravityRow re-applies static-catalog enrichment to a single row
+// for the per-model Enrich endpoint (the models.dev catalog has no
+// antigravity ids, so the generic path would wipe the row to zeros).
+// Runtime variants resolve to their public base. Unknown ids report
+// sql.ErrNoRows so the caller can fall back to the catalog path.
+func (s *Service) enrichAntigravityRow(rowID, modelID string) error {
+	base := collapseRuntime(modelID)
+	for _, m := range antigravity.PublicModels {
+		if m.ID != base {
+			continue
+		}
+		_, err := s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, attachment=?, source=?, updated_at=? WHERE id=?`),
+			m.Name, "antigravity", m.ContextWindow, m.MaxTokens, m.InputCost, m.OutputCost, m.CacheReadCost, m.CacheWriteCost, true, true, true, "enriched", time.Now().UTC(), rowID)
+		return err
+	}
+	return sql.ErrNoRows
 }
 
 // fetchAntigravityLive POSTs fetchAvailableModels with a fresh OAuth token.

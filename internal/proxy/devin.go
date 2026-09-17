@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,11 +11,14 @@ import (
 	"time"
 
 	"ai-gateway/internal/antigravity"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/devin"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/translate"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 // isDevin reports whether a provider speaks the Devin Connect-proto transport.
@@ -40,6 +44,12 @@ func devinEndpoints(p *models.Provider) []string {
 	return []string{devin.Host()}
 }
 
+// devinEffort normalizes the client's requested reasoning effort for wire
+// routing ("" when the request carries none).
+func devinEffort(openAIChatBody []byte) string {
+	return strings.ToLower(strings.TrimSpace(translate.ExtractReasoningEffort(openAIChatBody)))
+}
+
 // proxyDevin serves one inbound request via a Devin OAuth provider.
 // chatBody is OpenAI chat-shaped (callers normalize Anthropic/Responses
 // first). endpoint is the client dialect: "chat.completions", "messages" or
@@ -59,14 +69,16 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 		return
 	}
 
-	userJWT, err := devin.GetUserJWT(sessionToken, devinEndpoints(p)[0], h.clientOrDefault())
+	userJWT, chatBase, err := devin.GetUserJWT(sessionToken, devinEndpoints(p)[0], h.clientOrDefault())
 	if err != nil {
 		httperr.Write(w, http.StatusBadGateway, "devin authentication failed — reconnect in Providers", httperr.TypeProxy)
 		h.logRequestExtended(keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
 
-	chatIn, err := devin.FromOpenAI(chatBody, model)
+	baseModel := devin.CollapseReasoningVariant(stripProviderPrefix(model, p))
+	wire := devin.ResolveRuntime(stripProviderPrefix(model, p), devinEffort(chatBody), h.devinModelRouting(p.ID, baseModel))
+	chatIn, err := devin.FromOpenAI(chatBody, wire)
 	if err != nil {
 		httperr.Invalid(w, "invalid request body: "+err.Error())
 		return
@@ -76,7 +88,13 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 	var resp *http.Response
 	var lastStatus int
 	var lastErrText string
-	for _, base := range devinEndpoints(p) {
+	// The auth response may direct chat traffic at a per-account host: try it
+	// first, then fall back to the configured endpoints.
+	chatBases := devinEndpoints(p)
+	if chatBase != "" && chatBase != chatBases[0] {
+		chatBases = append([]string{chatBase}, chatBases...)
+	}
+	for _, base := range chatBases {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/exa.api_server_pb.ApiServerService/GetChatMessage", bytes.NewReader(framed))
 		if err != nil {
 			continue
@@ -119,10 +137,48 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 
 	switch endpoint {
 	case "messages", "responses":
-		h.serveDevinBuffered(w, resp, model, endpoint, keyPrefix, start, p.ID, isStream)
+		h.serveDevinBuffered(w, resp, model, wire, chatIn, endpoint, keyPrefix, start, p.ID, isStream)
 	default:
-		h.serveDevinChat(w, r, resp, model, keyPrefix, start, p.ID, isStream)
+		h.serveDevinChat(w, r, resp, model, wire, chatIn, keyPrefix, start, p.ID, isStream)
 	}
+}
+
+// devinModelRouting loads the server-declared effort→wire-uid map stored at
+// discovery for one base model. NULL (legacy rows) means "suffix convention";
+// an empty map means "no routable levels — send the id verbatim".
+func (h *Handler) devinModelRouting(providerID, base string) map[string]string {
+	if h.DB == nil || strings.TrimSpace(base) == "" {
+		return nil
+	}
+	var raw sql.NullString
+	if err := h.DB.QueryRow(db.Q(`SELECT reasoning_routing FROM provider_models WHERE provider_id=? AND model_id=?`), providerID, base).Scan(&raw); err != nil || !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil
+	}
+	var routing map[string]string
+	if err := json.Unmarshal([]byte(raw.String), &routing); err != nil {
+		return nil
+	}
+	if routing == nil {
+		routing = map[string]string{}
+	}
+	return routing
+}
+
+// logDevinTrailer records a backend trailer failure (or malformed stream) in
+// the requests-tab row (502), metrics, and a structured server log with
+// wire-level context for Devin support tickets. Streaming exchanges must call
+// this explicitly: headers have already flowed, so without it the failure is
+// invisible in request history.
+func (h *Handler) logDevinTrailer(model, wire string, chatIn devin.ChatInput, endpoint, keyPrefix, providerID string, start time.Time, stream bool, trailer string) {
+	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, stream)
+	toolCalls := 0
+	for _, m := range chatIn.Messages {
+		toolCalls += len(m.ToolCalls)
+	}
+	log.Warn().Str("provider", providerID).Str("model", model).Str("wire_model", wire).
+		Str("endpoint", endpoint).Bool("stream", stream).
+		Int("turns", len(chatIn.Messages)).Int("wire_tool_calls", toolCalls).Int("tool_defs", len(chatIn.Tools)).
+		Str("trailer", trailer).Msg("devin backend trailer error")
 }
 
 // friendlyDevinTrailerError classifies in-stream trailer errors. Backend
@@ -309,12 +365,12 @@ func (a *devinToolAccum) FinalRawCalls() []rawToolCall {
 
 // serveDevinChat relays a Devin Connect stream as OpenAI chat SSE (stream) or
 // JSON (non-stream).
-func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *http.Response, model, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *http.Response, model, wire string, chatIn devin.ChatInput, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	if !isStream {
 		deltas, trailerErr := collectDevinDeltas(resp.Body)
 		if trailerErr != "" {
 			httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+friendlyDevinTrailerError(trailerErr))
-			h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, false)
+			h.logDevinTrailer(model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, false, trailerErr)
 			return
 		}
 		chunks := devinDeltasToChunks(deltas)
@@ -350,14 +406,17 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		frames, rest, err := devin.ParseFrames(staging)
 		if err != nil {
 			writeSSEUpstreamError(w, false, "Devin stream error: malformed frame")
+			h.logDevinTrailer(model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, "malformed frame")
 			return
 		}
 		staging = rest
 		for _, fr := range frames {
 			if fr.Trailer {
-				// Headers already flowed, so errors terminate in-band.
+				// Headers already flowed, so errors terminate in-band —
+				// and still land in request history via logDevinTrailer.
 				if msg := devin.TrailerError(fr.Payload); msg != "" {
 					writeSSEUpstreamError(w, false, "Devin stream error: "+friendlyDevinTrailerError(msg))
+					h.logDevinTrailer(model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, msg)
 					return
 				}
 				continue
@@ -383,7 +442,9 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 				case "usage":
 					st.WriteUsage(d.Input, d.Output)
 				case "stop":
-					if d.Stop == 1 || d.Stop == 3 {
+					// StopReason MAX_TOKENS=3 alone means length; 1 is
+					// INCOMPLETE (a clean stop), per the OMP schema.
+					if d.Stop == 3 {
 						finishLen = true
 					}
 				}
@@ -412,11 +473,13 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 
 // serveDevinBuffered collects a full Devin stream then renders the messages
 // or responses dialect.
-func (h *Handler) serveDevinBuffered(w http.ResponseWriter, resp *http.Response, model, endpoint, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveDevinBuffered(w http.ResponseWriter, resp *http.Response, model, wire string, chatIn devin.ChatInput, endpoint, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	deltas, trailerErr := collectDevinDeltas(resp.Body)
 	if trailerErr != "" {
+		// Nothing written yet, so a plain 502 (not an SSE frame) is correct
+		// even when the client asked to stream.
 		httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+friendlyDevinTrailerError(trailerErr))
-		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logDevinTrailer(model, wire, chatIn, endpoint, keyPrefix, providerID, start, isStream, trailerErr)
 		return
 	}
 	chunks := devinDeltasToChunks(deltas)
@@ -487,7 +550,7 @@ func devinDeltasToChunks(deltas []devin.Delta) []antigravity.ParsedChunk {
 			}
 			cur.HasData = true
 		case "stop":
-			if d.Stop == 1 || d.Stop == 3 {
+			if d.Stop == 3 {
 				cur.Finish = "MAX_TOKENS"
 			} else {
 				cur.Finish = "STOP"

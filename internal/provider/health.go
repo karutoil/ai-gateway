@@ -70,7 +70,7 @@ func checkAll(db *sql.DB, store *Store) {
 			} else if access, _, _, rerr := store.EnsureFreshAccess(checkCtx(), &p, client); rerr != nil {
 				status = "down"
 				msg = "oauth refresh failed — reconnect"
-			} else if _, derr := devin.GetUserJWT(access, p.BaseURL, client); derr != nil {
+			} else if _, _, derr := devin.GetUserJWT(access, p.BaseURL, client); derr != nil {
 				status = "down"
 				msg = "devin auth failed — reconnect"
 			} else {

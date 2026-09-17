@@ -741,6 +741,7 @@ func applyLegacyAlters(db *sql.DB) {
 		"ALTER TABLE provider_models ADD COLUMN reasoning_type TEXT",
 		"ALTER TABLE provider_models ADD COLUMN reasoning_levels TEXT",
 		"ALTER TABLE provider_models ADD COLUMN reasoning_output_limits TEXT",
+		"ALTER TABLE provider_models ADD COLUMN reasoning_routing TEXT",
 		"ALTER TABLE provider_models ADD COLUMN cache_read_cost REAL",
 		"ALTER TABLE provider_models ADD COLUMN cache_write_cost REAL",
 		"ALTER TABLE provider_models ADD COLUMN structured_output BOOLEAN",

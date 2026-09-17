@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -235,6 +236,184 @@ func TestDevinDeltasToChunksFragmentedSwe2(t *testing.T) {
 	}
 	if decoded["target_directory"] != "." {
 		t.Fatalf("args = %s", raw)
+	}
+}
+
+// Reasoning effort on a base id must route to the suffixed wire id
+// ("swe-2" + high -> "swe-2-high"); explicit variants pass through.
+func TestProxyDevinEffortRoutesToSuffixedWireID(t *testing.T) {
+	var wire []byte
+	payload := []byte{
+		0x0A, 0x06, 'r', 'e', 's', 'p', '-', '1',
+		0x1A, 0x05, 'H', 'e', 'l', 'l', 'o',
+		0x28, 0x00,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/GetUserJwt"):
+			w.Header().Set("Content-Type", "application/proto")
+			_, _ = w.Write([]byte{0x0A, 0x0C, 'u', 's', 'e', 'r', '-', 'j', 'w', 't', '-', '1', '2', '3'})
+		case strings.HasSuffix(r.URL.Path, "/GetChatMessage"):
+			b, _ := io.ReadAll(r.Body)
+			wire = b
+			w.Header().Set("Content-Type", "application/connect+proto")
+			_, _ = w.Write(devin.FrameConnect(payload))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	mk := make([]byte, 32)
+	for i := range mk {
+		mk[i] = byte(i + 11)
+	}
+	ps := provider.NewStore(database, mk)
+	p, err := ps.CreateWithOrg("devin", models.ProviderDevin, "", "", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = database.Exec(`UPDATE providers SET base_url=? WHERE id=?`, srv.URL, p.ID)
+	full, _ := ps.GetByID(p.ID)
+	tok := &oauth.Tokens{Access: "sess-123", Refresh: "sess-123", ExpiresAt: time.Now().Add(2 * time.Hour).UnixMilli()}
+	if err := ps.SetOAuthTokens(full.ID, "devin", tok); err != nil {
+		t.Fatalf("set tokens: %v", err)
+	}
+	full, _ = ps.GetByID(full.ID)
+	h := New(ps, database)
+
+	wireModel := func() string {
+		frames, _, err := devin.ParseFrames(wire)
+		if err != nil {
+			t.Fatalf("parse wire frames: %v", err)
+		}
+		var sb strings.Builder
+		for _, fr := range frames {
+			sb.Write(fr.Payload)
+		}
+		return sb.String()
+	}
+
+	// Base + effort routes to the suffixed wire id.
+	wire = nil
+	chatBody := []byte(`{"model":"devin/swe-2","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+	w := httptest.NewRecorder()
+	h.proxyDevin(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), chatBody, false, "devin/swe-2", "chat.completions", "test", time.Now(), full)
+	if w.Result().StatusCode != 200 {
+		t.Fatalf("status = %d", w.Result().StatusCode)
+	}
+	if got := wireModel(); !strings.Contains(got, "swe-2-high") {
+		t.Fatalf("wire model missing swe-2-high: %q", got)
+	}
+
+	// No effort keeps the bare id (never invents a suffix).
+	wire = nil
+	chatBody = []byte(`{"model":"devin/swe-2","messages":[{"role":"user","content":"hi"}]}`)
+	w = httptest.NewRecorder()
+	h.proxyDevin(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), chatBody, false, "devin/swe-2", "chat.completions", "test", time.Now(), full)
+	if w.Result().StatusCode != 200 {
+		t.Fatalf("status = %d", w.Result().StatusCode)
+	}
+	if got := wireModel(); !strings.Contains(got, "swe-2") || strings.Contains(got, "swe-2-") {
+		t.Fatalf("bare request must send bare wire id, got %q", got)
+	}
+
+	// Explicit variant passes through verbatim.
+	wire = nil
+	chatBody = []byte(`{"model":"devin/swe-2-max","messages":[{"role":"user","content":"hi"}]}`)
+	w = httptest.NewRecorder()
+	h.proxyDevin(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), chatBody, false, "devin/swe-2-max", "chat.completions", "test", time.Now(), full)
+	if w.Result().StatusCode != 200 {
+		t.Fatalf("status = %d", w.Result().StatusCode)
+	}
+	if got := wireModel(); !strings.Contains(got, "swe-2-max") {
+		t.Fatalf("wire model missing swe-2-max: %q", got)
+	}
+}
+
+// A backend trailer error mid-stream must still land in request history:
+// headers already flowed, so the client gets an in-band SSE error AND the
+// requests tab gets a 502 row (previously the failure was invisible).
+func TestProxyDevinStreamTrailerErrorIsLogged(t *testing.T) {
+	payload := []byte{
+		0x0A, 0x06, 'r', 'e', 's', 'p', '-', '1',
+		0x1A, 0x05, 'H', 'e', 'l', 'l', 'o',
+	}
+	trailerJSON := []byte(`{"error":{"message":"an internal error occurred (trace ID: abc)"}}`)
+	trailer := append([]byte{0x02, 0, 0, 0, byte(len(trailerJSON))}, trailerJSON...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/GetUserJwt"):
+			w.Header().Set("Content-Type", "application/proto")
+			_, _ = w.Write([]byte{0x0A, 0x0C, 'u', 's', 'e', 'r', '-', 'j', 'w', 't', '-', '1', '2', '3'})
+		case strings.HasSuffix(r.URL.Path, "/GetChatMessage"):
+			w.Header().Set("Content-Type", "application/connect+proto")
+			_, _ = w.Write(devin.FrameConnect(payload))
+			_, _ = w.Write(trailer)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	mk := make([]byte, 32)
+	for i := range mk {
+		mk[i] = byte(i + 11)
+	}
+	ps := provider.NewStore(database, mk)
+	p, err := ps.CreateWithOrg("devin", models.ProviderDevin, "", "", "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	_, _ = database.Exec(`UPDATE providers SET base_url=? WHERE id=?`, srv.URL, p.ID)
+	full, _ := ps.GetByID(p.ID)
+	tok := &oauth.Tokens{Access: "sess-123", Refresh: "sess-123", ExpiresAt: time.Now().Add(2 * time.Hour).UnixMilli()}
+	if err := ps.SetOAuthTokens(full.ID, "devin", tok); err != nil {
+		t.Fatalf("set tokens: %v", err)
+	}
+	full, _ = ps.GetByID(full.ID)
+	h := New(ps, database)
+
+	chatBody := []byte(`{"model":"devin/swe-2","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	w := httptest.NewRecorder()
+	h.proxyDevin(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), chatBody, true, "devin/swe-2", "chat.completions", "test", time.Now(), full)
+	if w.Result().StatusCode != 200 {
+		t.Fatalf("stream status = %d, want 200 with in-band error", w.Result().StatusCode)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "internal error") {
+		t.Fatalf("stream body missing trailer error: %q", body)
+	}
+	var n int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE provider_id=? AND status=?`, full.ID, 502).Scan(&n); err != nil {
+		t.Fatalf("count logs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("request_logs 502 rows = %d, want 1", n)
+	}
+}
+
+// Per the OMP schema only StopReason MAX_TOKENS (3) means length;
+// INCOMPLETE (1) is a clean stop.
+func TestDevinStopReasonMapping(t *testing.T) {
+	for _, d := range []devin.Delta{{Type: "stop", Stop: 1}} {
+		chunks := devinDeltasToChunks([]devin.Delta{d})
+		if len(chunks) != 1 || chunks[0].Finish == "MAX_TOKENS" {
+			t.Fatalf("stop=1 chunks = %+v, want clean stop", chunks)
+		}
+	}
+	chunks := devinDeltasToChunks([]devin.Delta{{Type: "stop", Stop: 3}})
+	if len(chunks) != 1 || chunks[0].Finish != "MAX_TOKENS" {
+		t.Fatalf("stop=3 chunks = %+v, want MAX_TOKENS", chunks)
 	}
 }
 

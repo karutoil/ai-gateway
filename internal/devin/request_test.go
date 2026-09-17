@@ -26,8 +26,11 @@ func TestFromOpenAICombinesAssistantTextAndToolCalls(t *testing.T) {
 		t.Fatalf("messages = %d want 3 (user + combined assistant + tool): %+v", len(in.Messages), in.Messages)
 	}
 	assistant := in.Messages[1]
-	if assistant.Role != WireRoleChat {
-		t.Fatalf("assistant role = %d", assistant.Role)
+	if assistant.Role != WireRoleSystem {
+		t.Fatalf("assistant role = %d, want SYSTEM (%d)", assistant.Role, WireRoleSystem)
+	}
+	if in.Messages[0].Role != WireRoleUser {
+		t.Fatalf("user role = %d, want USER (%d)", in.Messages[0].Role, WireRoleUser)
 	}
 	if !strings.Contains(assistant.Text, "I'll list them") {
 		t.Fatalf("assistant text lost: %q", assistant.Text)

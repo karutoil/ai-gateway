@@ -392,27 +392,32 @@ func (s *Service) List(providerID, q string) ([]models.ProviderModel, error) {
 }
 
 func (s *Service) Enrich(providerModelID string) error {
-	var pm models.ProviderModel
-	var cc, cw sql.NullFloat64
-	var rn, tl, so, at sql.NullBool
-	var rt, rl, rol sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT pm.model_id, pm.display_name FROM provider_models pm WHERE pm.id=?`), providerModelID).Scan(&pm.ModelID, &pm.DisplayName)
+	var providerID, modelID string
+	err := s.db.QueryRow(db.Q(`SELECT provider_id, model_id FROM provider_models WHERE id=?`), providerModelID).Scan(&providerID, &modelID)
 	if err != nil {
 		return err
 	}
-	mID := pm.ModelID
-	e := s.enrichFor(mID)
+	// OAuth providers with bespoke enrichment: the models.dev catalog has no
+	// entries for their ids, so the generic path below would wipe the
+	// discovery enrichment (context, costs, reasoning levels) to zeros.
+	// Re-derive from the provider source instead.
+	if s.providerStore != nil {
+		if p, perr := s.providerStore.GetByID(providerID); perr == nil && p != nil {
+			switch p.Type {
+			case models.ProviderDevin:
+				if err := s.enrichDevinRow(p, providerModelID, modelID); err == nil {
+					return nil
+				}
+			case models.ProviderAntigravity:
+				if err := s.enrichAntigravityRow(providerModelID, modelID); err == nil {
+					return nil
+				}
+			}
+		}
+	}
+	e := s.enrichFor(modelID)
 	_, err = s.db.Exec(db.Q(`UPDATE provider_models SET context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, source=?, updated_at=? WHERE id=?`),
 		e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), providerModelID)
-	_ = cc
-	_ = cw
-	_ = rn
-	_ = tl
-	_ = so
-	_ = at
-	_ = rt
-	_ = rl
-	_ = rol
 	return err
 }
 
