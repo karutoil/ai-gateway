@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS model_group_members (
 	model_override TEXT NOT NULL DEFAULT '',
 	weight INTEGER NOT NULL DEFAULT 1,
 	created_at DATETIME NOT NULL,
-	UNIQUE(group_id, provider_id)
+	UNIQUE(group_id, provider_id),
+	FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_model_group_members_group ON model_group_members(group_id, position);

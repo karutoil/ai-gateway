@@ -148,7 +148,7 @@ export default function ModelGroups({ role = 'admin' }: { role?: string }){
   const validate = () => {
     const n = name.trim().toLowerCase()
     if (!n) return 'Group name required.'
-    if (!/^[a-z0-9._/-]{1,64}$/.test(n)) return 'Group name may only contain a-z, 0-9, \'.,\', \'_\', \'-\', \'/\'.'
+    if (!/^[a-z0-9._-]{1,64}$/.test(n)) return "Group name may only contain a-z, 0-9, '._-'"
     if (members.length === 0) return 'Add at least one provider/model pair.'
     return ''
   }
@@ -293,6 +293,7 @@ export default function ModelGroups({ role = 'admin' }: { role?: string }){
         </TableShell>
       )}
 
+      {isAdmin && (
       <div ref={builderRef} className="scroll-mt-24">
         <Card className={editing ? 'border-accent' : ''}>
           <div className="flex items-start justify-between gap-3 mb-4">
@@ -468,6 +469,7 @@ export default function ModelGroups({ role = 'admin' }: { role?: string }){
           </div>
         </Card>
       </div>
+      )}
 
       <Card className="bg-app/40">
         <div className="font-mono text-xs text-muted uppercase tracking-wide">Tip</div>
