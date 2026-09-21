@@ -384,7 +384,43 @@ func TestWeightedRuleDistribution(t *testing.T) {
 	}
 }
 
-// model_override rewrites the outbound model for that member's upstream.
+// model groups route a single name to an ordered list of provider/model
+// members with per-member overrides.
+func TestModelGroupFailover(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	hh.failA = true
+	if _, err := hh.lbStore.ReplaceGroup("subagent-dispatcher", "", lb.StrategyFailover, "", []lb.RuleMemberInput{
+		{ProviderID: hh.paID, ModelOverride: "gpt-4o-mini"},
+		{ProviderID: hh.pbID, ModelOverride: "gpt-4o-mini"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code, body := hh.do(t, "subagent-dispatcher", "")
+	if code != 200 || !strings.Contains(body, "from-b") {
+		t.Fatalf("group failover should serve from prov-b, got %d: %s", code, body)
+	}
+	if n := hh.hitsA.Load(); n == 0 {
+		t.Fatal("primary should have been attempted first")
+	}
+}
+
+// model groups are not alias-resolved; the name itself drives routing.
+func TestModelGroupBeatsAlias(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	// Create an alias that would otherwise rewrite the group name.
+	if _, err := hh.h.DB.Exec(`INSERT INTO model_aliases(alias,target,created_at) VALUES(?,?,?)`, "subagent-dispatcher", "unknown-model", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hh.lbStore.ReplaceGroup("subagent-dispatcher", "", lb.StrategyRoundRobin, "", []lb.RuleMemberInput{
+		{ProviderID: hh.paID, ModelOverride: "gpt-4o-mini"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code, body := hh.do(t, "subagent-dispatcher", "")
+	if code != 200 || !strings.Contains(body, "from-a") {
+		t.Fatalf("group should win over alias: %d %s", code, body)
+	}
+}
 func TestRuleMemberModelOverride(t *testing.T) {
 	hh := newLBHarness(t, nil, false)
 	// prov-a serves the rule; override asks upstream for a different model id.

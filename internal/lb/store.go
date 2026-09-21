@@ -245,6 +245,17 @@ func (s *Store) RuleForModel(model string) *Rule {
 	return rule
 }
 
+// RuleForModelOrGroup first checks for a per-model load-balancer rule. If none
+// exists, it falls back to a model group with a matching name. This lets
+// user-created groups ("subagent-dispatcher") be used directly as the model
+// field in chat requests while still allowing explicit per-model rules to win.
+func (s *Store) RuleForModelOrGroup(model string) *Rule {
+	if rule := s.RuleForModel(model); rule != nil {
+		return rule
+	}
+	return s.ruleForGroup(model)
+}
+
 // AllRules lists every configured rule with joined provider metadata,
 // ordered by model then position.
 func (s *Store) AllRules() ([]Rule, error) {
