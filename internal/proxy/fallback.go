@@ -188,7 +188,7 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 			if key == "" {
 				continue
 			}
-			if rule := h.LB.RuleForModel(key); rule != nil {
+			if rule := h.LB.RuleForModelOrGroup(key); rule != nil {
 				ordered := h.LB.Select(rule)
 				if len(ordered) == 0 {
 					continue

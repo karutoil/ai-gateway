@@ -3,6 +3,7 @@ import { Routes, Route, Link, NavLink, useLocation, useNavigate, Navigate } from
 import Dashboard from './pages/Dashboard'
 import Providers from './pages/Providers'
 import Routing from './pages/Routing'
+import ModelGroups from './pages/ModelGroups'
 import Keys from './pages/Keys'
 import Playground from './pages/Playground'
 import Logs from './pages/Logs'
@@ -126,6 +127,7 @@ const NAV_GROUPS: { title: string; caption: string; items: NavItem[] }[] = [
       { to: '/providers', label: 'Providers', icon: 'server', hint: 'Endpoints & health', perm: 'providers:read' },
       { to: '/models', label: 'Models', icon: 'box', hint: 'Catalog & pricing', perm: 'catalog:read' },
       { to: '/routing', label: 'Routing', icon: 'route', hint: 'Failover & balancing', perm: 'routing:read' },
+      { to: '/model-groups', label: 'Model groups', icon: 'layers', hint: 'User-creatable model groups', perm: 'routing:read' },
     ],
   },
   {
@@ -390,6 +392,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/providers" element={<Providers role={role} />} />
             <Route path="/routing" element={<Routing role={role} />} />
+            <Route path="/model-groups" element={<ModelGroups role={role} />} />
             <Route path="/keys" element={<Keys role={role} />} />
             <Route path="/models" element={<Models role={role} />} />
             <Route path="/playground" element={<Playground />} />
