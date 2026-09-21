@@ -105,6 +105,9 @@ func NewWithCatalog(ps *provider.Store, cs *catalog.Store, db *sql.DB) *Handler 
 }
 
 func (h *Handler) resolveAlias(model string) string {
+	if h.LB != nil && h.LB.IsGroup(model) {
+		return model
+	}
 	// direct alias
 	if h.DB != nil {
 		var target string
