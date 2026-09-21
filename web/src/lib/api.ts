@@ -171,6 +171,24 @@ export type LBMemberInput = {
   weight?: number
 }
 
+// User-created model groups: a single gateway-facing name maps to an ordered
+// list of provider/model members. Clients send the group name as the model.
+export type ModelGroup = {
+  id: string
+  name: string
+  display_name: string
+  strategy: RoutingStrategy
+  created_at: string
+  members: LBMember[]
+}
+
+// Write-path shape for model groups.
+export type ModelGroupInput = {
+  display_name?: string
+  strategy?: RoutingStrategy
+  members: LBMemberInput[]
+}
+
 export const api = {
   login: (password: string, username?: string) => fetch(apiUrl('/api/auth/login'), { method:'POST', headers:{'Content-Type':'application/json'}, credentials:'same-origin', body: JSON.stringify(username ? {username, password} : {password})}).then(r=>r.json()),
   providers: {
@@ -199,6 +217,14 @@ export const api = {
       req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'PUT', body: JSON.stringify({ strategy: opts.strategy, members: opts.members })}),
     deleteRule: (model: string): Promise<null> =>
       req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'DELETE'}),
+
+    // User-created model groups. A group name maps to ordered provider/model members.
+    listGroups: (): Promise<ModelGroup[]> => req('/api/lb/groups'),
+    getGroup: (name: string): Promise<ModelGroup> => req(`/api/lb/groups/${encodeURIComponent(name)}`),
+    saveGroup: (name: string, opts: ModelGroupInput): Promise<ModelGroup> =>
+      req(`/api/lb/groups/${encodeURIComponent(name)}`, { method:'PUT', body: JSON.stringify({ display_name: opts.display_name || '', strategy: opts.strategy, members: opts.members })}),
+    deleteGroup: (name: string): Promise<null> =>
+      req(`/api/lb/groups/${encodeURIComponent(name)}`, { method:'DELETE'}),
   },
   keys: {
     list: () => req('/api/keys'),
