@@ -204,7 +204,7 @@ func (h *Handler) candidateProvidersWithRuleContextAndRule(ctx context.Context, 
 			if key == "" {
 				continue
 			}
-			if rule := h.LB.RuleForModel(key); rule != nil {
+			if rule := h.LB.RuleForModelOrGroup(key); rule != nil {
 				quotaEligible := make(map[string]bool, len(rule.Members))
 				for _, member := range rule.Members {
 					p, err := h.ProviderStore.GetByID(member.ProviderID)
