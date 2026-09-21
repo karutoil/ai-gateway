@@ -55,7 +55,7 @@ func TestGroupRoundTrip(t *testing.T) {
 	}
 
 	// AllGroups lists it.
-	groups, err := s.AllGroups()
+	groups, err := s.AllGroups("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,10 +64,10 @@ func TestGroupRoundTrip(t *testing.T) {
 	}
 
 	// Delete removes it.
-	if err := s.DeleteGroup("subagent-dispatcher"); err != nil {
+	if err := s.DeleteGroup("subagent-dispatcher", ""); err != nil {
 		t.Fatal(err)
 	}
-	if s.IsGroup("subagent-dispatcher") {
+	if s.IsGroup("subagent-dispatcher", "") {
 		t.Fatal("group still exists after delete")
 	}
 	if s.RuleForModelOrGroup("subagent-dispatcher") != nil {
@@ -88,8 +88,42 @@ func TestGroupValidation(t *testing.T) {
 	}
 	for i, tc := range cases {
 		_, err := s.ReplaceGroup(tc.name, "", "round_robin", "", tc.members)
-		if err == nil && i >= 2 {
+		if err == nil {
 			t.Errorf("expected error for case %d %q", i, tc.name)
 		}
+	}
+	// slash is not a legal group-name character.
+	if _, err := s.ReplaceGroup("org/team", "", "round_robin", "", []RuleMemberInput{{ProviderID: pa.ID, ModelOverride: "m"}}); err == nil {
+		t.Error("expected slash in group name to be rejected")
+	}
+}
+
+func TestGroupOrgScoping(t *testing.T) {
+	s, _, pa, pb := groupStoreEnv(t)
+	if _, err := s.ReplaceGroup("shared", "", "failover", "", []RuleMemberInput{{ProviderID: pa.ID, ModelOverride: "m"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsGroup("shared", "org-1") {
+		t.Error("global group should be visible to a scoped org")
+	}
+	// A different org cannot replace a group owned by another org.
+	if _, err := s.ReplaceGroup("owned-by-1", "", "failover", "org-1", []RuleMemberInput{{ProviderID: pa.ID, ModelOverride: "m"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReplaceGroup("owned-by-1", "", "failover", "org-2", []RuleMemberInput{{ProviderID: pb.ID, ModelOverride: "n"}}); err == nil {
+		t.Error("expected cross-org replace to be rejected")
+	}
+	// A scoped org can create and delete its own group.
+	if _, err := s.ReplaceGroup("org-1-private", "", "round_robin", "org-1", []RuleMemberInput{{ProviderID: pa.ID, ModelOverride: "m"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.IsGroup("org-1-private", "org-1") {
+		t.Error("org group should be visible to its own org")
+	}
+	if s.IsGroup("org-1-private", "org-2") {
+		t.Error("org group should not be visible to a different org")
+	}
+	if err := s.DeleteGroup("org-1-private", "org-1"); err != nil {
+		t.Fatal(err)
 	}
 }
