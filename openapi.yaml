@@ -1269,7 +1269,7 @@ paths:
         - name: name
           in: path
           required: true
-          schema: { type: string, pattern: '^[a-z0-9._/-]{1,64}$', example: subagent-dispatcher }
+          schema: { type: string, pattern: '^[a-z0-9._-]{1,64}$', example: subagent-dispatcher }
       responses:
         '200':
           description: Group with members
@@ -1290,14 +1290,14 @@ paths:
         - name: name
           in: path
           required: true
-          schema: { type: string, pattern: '^[a-z0-9._/-]{1,64}$', example: subagent-dispatcher }
+          schema: { type: string, pattern: '^[a-z0-9._-]{1,64}$', example: subagent-dispatcher }
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [providers]
+              required: [members]
               properties:
                 display_name:
                   type: string
@@ -1306,18 +1306,26 @@ paths:
                   type: string
                   enum: [round_robin, random, weighted, failover]
                   default: round_robin
-                providers:
-                  type: array
-                  maxItems: 50
-                  minItems: 1
-                  items: { type: string }
-                  description: Provider IDs in order.
                 members:
                   type: array
-                  maxItems: 50
+                  description: Ordered provider/model members.
                   minItems: 1
-                  items: { $ref: '#/components/schemas/LBRuleMember' }
-                  description: Rich member shape; takes precedence over providers.
+                  maxItems: 50
+                  items:
+                    type: object
+                    required: [provider_id, model_override]
+                    properties:
+                      provider_id:
+                        type: string
+                        example: p-uuid
+                      model_override:
+                        type: string
+                        example: openai/gpt-5
+                      weight:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                        example: 50
       responses:
         '201':
           description: Saved group

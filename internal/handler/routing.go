@@ -2,10 +2,12 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
@@ -149,7 +151,7 @@ func (b *putGroupBody) members() []lb.RuleMemberInput {
 }
 
 func (h *RoutingHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
-	groups, err := h.LB.AllGroups()
+	groups, err := h.LB.AllGroups(h.ProviderID(r))
 	if err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "failed to load model groups", httperr.TypeProxy)
 		return
@@ -163,7 +165,7 @@ func (h *RoutingHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
 
 func (h *RoutingHandler) GetGroup(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	group, err := h.LB.GroupByName(name)
+	group, err := h.LB.GroupByName(name, h.ProviderID(r))
 	if err != nil {
 		httperr.NotFound(w, "group not found")
 		return
@@ -182,14 +184,20 @@ func (h *RoutingHandler) PutGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	members := body.members()
 	if len(members) == 0 {
-		httperr.Invalid(w, "providers required (ordered provider ids or members)")
+		httperr.Invalid(w, "members required (ordered provider/model pairs)")
 		return
+	}
+	for i, m := range members {
+		if m.ModelOverride == "" {
+			httperr.Invalid(w, fmt.Sprintf("member %d: model_override is required for group members", i))
+			return
+		}
 	}
 	orgID := h.ProviderID(r)
 	if orgID != "" {
 		for _, m := range members {
 			var cnt int
-			if err := h.LB.DB.QueryRow(`SELECT COUNT(*) FROM providers WHERE id=? AND org_id=?`, m.ProviderID, orgID).Scan(&cnt); err != nil || cnt == 0 {
+			if err := h.LB.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM providers WHERE id=? AND org_id=?`), m.ProviderID, orgID).Scan(&cnt); err != nil || cnt == 0 {
 				httperr.Forbidden(w, "provider not in your organization: "+m.ProviderID)
 				return
 			}
@@ -211,7 +219,7 @@ func (h *RoutingHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "group name required")
 		return
 	}
-	if err := h.LB.DeleteGroup(name); err != nil {
+	if err := h.LB.DeleteGroup(name, h.ProviderID(r)); err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "delete failed", httperr.TypeProxy)
 		return
 	}

@@ -105,7 +105,12 @@ func NewWithCatalog(ps *provider.Store, cs *catalog.Store, db *sql.DB) *Handler 
 }
 
 func (h *Handler) resolveAlias(model string) string {
-	if h.LB != nil && h.LB.IsGroup(model) {
+	// opencode/ prefixed IDs are never rewritten: they are either an explicit
+	// provider-qualified model or a group name and must reach routing unchanged.
+	if strings.HasPrefix(model, "opencode/") {
+		return model
+	}
+	if h.LB != nil && h.LB.IsGroup(model, "") {
 		return model
 	}
 	// direct alias
@@ -115,18 +120,6 @@ func (h *Handler) resolveAlias(model string) string {
 		if err == nil && target != "" {
 			return target
 		}
-		// strip opencode/ prefix fallback
-		if strings.HasPrefix(model, "opencode/") {
-			trimmed := strings.TrimPrefix(model, "opencode/")
-			// try alias of trimmed
-			err = h.DB.QueryRow(db.Q(`SELECT target FROM model_aliases WHERE alias=?`), trimmed).Scan(&target)
-			if err == nil && target != "" {
-				return target
-			}
-			// just return trimmed
-			return trimmed
-		}
-		// also try meta/ prefix for ckff?
 	}
 	return model
 }
