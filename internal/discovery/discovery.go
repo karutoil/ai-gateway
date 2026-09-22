@@ -281,7 +281,8 @@ func (s *Service) upsert(p *models.Provider, m rawModel) error {
 		return nil
 	}
 	if err == sql.ErrNoRows && s.isExcluded(p.ID, m.ID) {
-		// Operator removed this model; only a manual add brings it back.
+		// Operator removed this model; it comes back only from the recycling
+		// bin or a manual add, never from discovery.
 		return nil
 	}
 	if err == nil {
@@ -444,12 +445,25 @@ func (s *Service) Delete(id string) error {
 	if err != nil {
 		return err
 	}
+	// Snapshot before the delete: the recycling bin restores this exact row.
+	snap, ok, err := loadSnapshot(tx, id)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
 	if _, err := tx.Exec(db.Q(`DELETE FROM provider_models WHERE id=?`), id); err != nil {
 		tx.Rollback()
 		return err
 	}
-	// Remember the removal so the next auto-discovery does not reinsert it.
-	if err := s.excludeTx(tx, providerID, modelID); err != nil {
+	var raw []byte
+	if ok {
+		raw, err = json.Marshal(snap)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err := insertExclusion(tx, providerID, modelID, raw); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -484,6 +498,112 @@ func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel
 		return "", err
 	}
 	return id, nil
+}
+
+// ListExcluded returns the recycling bin: models an operator removed, which
+// discovery will not reinsert. Housekeeping exclusions (pruned variants) have
+// no snapshot and are not shown.
+func (s *Service) ListExcluded(providerID, q string) ([]models.ExcludedModel, error) {
+	where := "e.snapshot IS NOT NULL"
+	args := []interface{}{}
+	if providerID != "" {
+		where += " AND e.provider_id = ?"
+		args = append(args, providerID)
+	}
+	if q != "" {
+		where += " AND (e.model_id LIKE ? OR p.name LIKE ? OR (p.name || '/' || e.model_id) LIKE ? OR e.snapshot LIKE ?)"
+		like := "%" + q + "%"
+		args = append(args, like, like, like, like)
+	}
+	rows, err := s.db.Query(db.Q(`SELECT e.id, e.provider_id, e.model_id, e.created_at, e.snapshot, p.name FROM provider_model_exclusions e JOIN providers p ON p.id=e.provider_id WHERE `+where+` ORDER BY e.created_at DESC LIMIT 500`), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.ExcludedModel
+	for rows.Next() {
+		var em models.ExcludedModel
+		var raw sql.NullString
+		if err := rows.Scan(&em.ID, &em.ProviderID, &em.ModelID, &em.RemovedAt, &raw, &em.ProviderName); err != nil {
+			continue
+		}
+		if raw.Valid && raw.String != "" {
+			var snap modelSnapshot
+			if json.Unmarshal([]byte(raw.String), &snap) == nil {
+				pm := models.ProviderModel{
+					ID: snap.ID, ProviderID: snap.ProviderID, ProviderName: em.ProviderName,
+					ModelID: snap.ModelID, DisplayName: snap.DisplayName, OwnedBy: snap.OwnedBy,
+					ContextWindow: snap.ContextWindow, MaxOutput: snap.MaxOutput,
+					InputCost: snap.InputCost, OutputCost: snap.OutputCost,
+					CacheReadCost: snap.CacheReadCost, CacheWriteCost: snap.CacheWriteCost,
+					Reasoning: snap.Reasoning, ToolCall: snap.ToolCall,
+					StructuredOutput: snap.StructuredOutput, Attachment: snap.Attachment,
+					Modalities: snap.Modalities, Source: snap.Source,
+					CreatedAt: snap.CreatedAt, UpdatedAt: snap.UpdatedAt,
+					ReasoningType: snap.ReasoningType, ReasoningLevels: snap.ReasoningLevels,
+					ReasoningOutputLimits: snap.ReasoningOutputLimits,
+				}
+				em.Snapshot = &pm
+			}
+		}
+		out = append(out, em)
+	}
+	return out, nil
+}
+
+// Restore puts a recycling-bin model back. A snapshotted row returns exactly
+// as it was removed; a legacy exclusion (no snapshot) returns as a plain
+// discovered model that the next discovery run will enrich. Restoring clears
+// the exclusion, so discovery treats the model normally again.
+func (s *Service) Restore(exclusionID string) (string, error) {
+	var providerID, modelID string
+	var raw sql.NullString
+	err := s.db.QueryRow(db.Q(`SELECT provider_id, model_id, snapshot FROM provider_model_exclusions WHERE id=?`), exclusionID).Scan(&providerID, &modelID, &raw)
+	if err != nil {
+		return "", err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	var newID string
+	if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		var snap modelSnapshot
+		if err := json.Unmarshal([]byte(raw.String), &snap); err != nil {
+			tx.Rollback()
+			return "", fmt.Errorf("recycling bin snapshot is corrupt")
+		}
+		newID = uuid.NewString()
+		now := time.Now().UTC()
+		_, err = tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, reasoning_routing, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+			newID, providerID, modelID, snap.DisplayName, snap.OwnedBy, snap.ContextWindow, snap.MaxOutput, snap.InputCost, snap.OutputCost, snap.CacheReadCost, snap.CacheWriteCost, snap.Reasoning, snap.ToolCall, snap.StructuredOutput, snap.Attachment, snap.Modalities, snap.ReasoningType, snap.ReasoningLevels, snap.ReasoningOutputLimits, snap.ReasoningRouting, snap.Source, snap.CreatedAt, now)
+	} else {
+		newID, err = s.restoreBare(tx, providerID, modelID)
+	}
+	if err != nil {
+		tx.Rollback()
+		return "", err
+	}
+	if _, err := tx.Exec(db.Q(`DELETE FROM provider_model_exclusions WHERE id=?`), exclusionID); err != nil {
+		tx.Rollback()
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	if s.Cache != nil {
+		s.Cache.Invalidate("models:")
+	}
+	return newID, nil
+}
+
+// restoreBare reinserts a model that was excluded before snapshots existed.
+func (s *Service) restoreBare(tx *sql.Tx, providerID, modelID string) (string, error) {
+	id := uuid.NewString()
+	now := time.Now().UTC()
+	_, err := tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`),
+		id, providerID, modelID, modelID, "discovered", now, now)
+	return id, err
 }
 
 func (s *Service) DiscoverAll() (int, error) {

@@ -159,27 +159,91 @@ func (s *Service) isManual(providerID, modelID string) bool {
 }
 
 // isExcluded reports whether the operator removed this model from the
-// provider. Discovery must not reinsert it; only a manual add clears the mark.
+// provider. Discovery must not reinsert it; restoring from the recycling bin
+// or a manual add clears the mark.
 func (s *Service) isExcluded(providerID, modelID string) bool {
 	var n int
 	err := s.db.QueryRow(db.Q(`SELECT COUNT(*) FROM provider_model_exclusions WHERE provider_id=? AND model_id=?`), providerID, modelID).Scan(&n)
 	return err == nil && n > 0
 }
 
-// exclude records a removal so discovery will not reinsert the model. Used
-// where there is no surrounding transaction (variant pruning).
-func (s *Service) exclude(providerID, modelID string) error {
-	_, err := s.db.Exec(db.Q(`INSERT INTO provider_model_exclusions(id, provider_id, model_id, created_at) VALUES(?,?,?,?)`+db.UpsertEnd([]string{"provider_id", "model_id"}, []string{"created_at"})),
-		uuid.NewString(), providerID, modelID, time.Now().UTC())
+// modelSnapshot is the provider_models row frozen into the recycling bin.
+// Traffic stats are derived at read time and are not part of the row.
+type modelSnapshot struct {
+	ID                    string    `json:"id"`
+	ProviderID            string    `json:"provider_id"`
+	ModelID               string    `json:"model_id"`
+	DisplayName           string    `json:"display_name"`
+	OwnedBy               string    `json:"owned_by"`
+	ContextWindow         int       `json:"context_window"`
+	MaxOutput             int       `json:"max_output"`
+	InputCost             float64   `json:"input_cost"`
+	OutputCost            float64   `json:"output_cost"`
+	CacheReadCost         float64   `json:"cache_read_cost"`
+	CacheWriteCost        float64   `json:"cache_write_cost"`
+	Reasoning             bool      `json:"reasoning"`
+	ToolCall              bool      `json:"tool_call"`
+	StructuredOutput      bool      `json:"structured_output"`
+	Attachment            bool      `json:"attachment"`
+	Modalities            string    `json:"modalities"`
+	ReasoningType         string    `json:"reasoning_type"`
+	ReasoningLevels       string    `json:"reasoning_levels"`
+	ReasoningOutputLimits string    `json:"reasoning_output_limits"`
+	ReasoningRouting      *string   `json:"reasoning_routing"`
+	Source                string    `json:"source"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+// loadSnapshot reads the live provider_models row that a removal is about to
+// drop. A missing row (already gone) yields ok=false and no error.
+func loadSnapshot(q dbQuerier, id string) (modelSnapshot, bool, error) {
+	var snap modelSnapshot
+	var cc, cw sql.NullFloat64
+	var rn, tl, so, at sql.NullBool
+	var mods, rt, rl, rol, routing sql.NullString
+	err := q.QueryRow(db.Q(`SELECT id, provider_id, model_id, COALESCE(display_name,''), COALESCE(owned_by,''), COALESCE(context_window,0), COALESCE(max_output,0), COALESCE(input_cost,0), COALESCE(output_cost,0), cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, reasoning_routing, COALESCE(source,''), created_at, updated_at FROM provider_models WHERE id=?`), id).
+		Scan(&snap.ID, &snap.ProviderID, &snap.ModelID, &snap.DisplayName, &snap.OwnedBy, &snap.ContextWindow, &snap.MaxOutput, &snap.InputCost, &snap.OutputCost, &cc, &cw, &rn, &tl, &so, &at, &mods, &rt, &rl, &rol, &routing, &snap.Source, &snap.CreatedAt, &snap.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return modelSnapshot{}, false, nil
+	}
+	if err != nil {
+		return modelSnapshot{}, false, err
+	}
+	if cc.Valid {
+		snap.CacheReadCost = cc.Float64
+	}
+	if cw.Valid {
+		snap.CacheWriteCost = cw.Float64
+	}
+	snap.Reasoning, snap.ToolCall, snap.StructuredOutput, snap.Attachment = rn.Bool, tl.Bool, so.Bool, at.Bool
+	snap.Modalities, snap.ReasoningType, snap.ReasoningLevels, snap.ReasoningOutputLimits = mods.String, rt.String, rl.String, rol.String
+	if routing.Valid {
+		snap.ReasoningRouting = &routing.String
+	}
+	return snap, true, nil
+}
+
+// dbQuerier is the subset of *sql.DB and *sql.Tx the snapshot helpers need.
+type dbQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// insertExclusion writes the recycling-bin row. snapshotJSON is nil for
+// housekeeping removals (pruned variants) that should not surface in the bin.
+func insertExclusion(q dbQuerier, providerID, modelID string, snapshotJSON []byte) error {
+	_, err := q.Exec(db.Q(`INSERT INTO provider_model_exclusions(id, provider_id, model_id, created_at, snapshot) VALUES(?,?,?,?,?)`+db.UpsertEnd([]string{"provider_id", "model_id"}, []string{"created_at", "snapshot"})),
+		uuid.NewString(), providerID, modelID, time.Now().UTC(), snapshotJSON)
 	return err
 }
 
-// excludeTx records a removal inside the caller's transaction so the model
-// row and its exclusion mark commit together.
-func (s *Service) excludeTx(tx *sql.Tx, providerID, modelID string) error {
-	_, err := tx.Exec(db.Q(`INSERT INTO provider_model_exclusions(id, provider_id, model_id, created_at) VALUES(?,?,?,?)`+db.UpsertEnd([]string{"provider_id", "model_id"}, []string{"created_at"})),
-		uuid.NewString(), providerID, modelID, time.Now().UTC())
-	return err
+// exclude records a removal so discovery will not reinsert the model. Used
+// where there is no surrounding transaction (variant pruning). Pruned
+// variants are housekeeping, not an operator choice, so they carry no
+// snapshot and stay out of the recycling bin.
+func (s *Service) exclude(providerID, modelID string) error {
+	return insertExclusion(s.db, providerID, modelID, nil)
 }
 
 // pruneDevinVariants removes pre-collapse per-variant rows (e.g. "swe-2-max")

@@ -138,6 +138,90 @@ func TestDeleteExcludesFromRediscovery(t *testing.T) {
 	}
 }
 
+// Removing a model parks it in the recycling bin with its row intact, and
+// restoring puts that exact row back while letting discovery resume.
+func TestRecyclingBinRestoresSnapshot(t *testing.T) {
+	s, p := openAIService(t, []string{"gpt-bin"})
+	if _, err := s.Discover(p.ID); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	rowID, _, ok := modelRow(t, s.db, p.ID, "gpt-bin")
+	if !ok {
+		t.Fatal("gpt-bin not discovered")
+	}
+	if _, err := s.db.Exec(`UPDATE provider_models SET display_name=?, input_cost=?, context_window=? WHERE id=?`, "Fancy Bin", 1.25, 128000, rowID); err != nil {
+		t.Fatalf("customize row: %v", err)
+	}
+	if err := s.Delete(rowID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	bin, err := s.ListExcluded("", "")
+	if err != nil {
+		t.Fatalf("list excluded: %v", err)
+	}
+	if len(bin) != 1 || bin[0].ModelID != "gpt-bin" || bin[0].ProviderName == "" {
+		t.Fatalf("bin = %+v, want the one removed model", bin)
+	}
+	if bin[0].Snapshot == nil || bin[0].Snapshot.DisplayName != "Fancy Bin" || bin[0].Snapshot.InputCost != 1.25 || bin[0].Snapshot.ContextWindow != 128000 {
+		t.Fatalf("snapshot = %+v, want the removed row", bin[0].Snapshot)
+	}
+	// The provider filter and search both narrow the bin, including the
+	// snapshotted display name.
+	if narrowed, err := s.ListExcluded(p.ID, "fancy"); err != nil || len(narrowed) != 1 {
+		t.Fatalf("search by display name = %+v %v, want the row", narrowed, err)
+	}
+	if narrowed, err := s.ListExcluded(p.ID, "gpt-bin"); err != nil || len(narrowed) != 1 {
+		t.Fatalf("search by model id = %+v %v, want the row", narrowed, err)
+	}
+	if narrowed, err := s.ListExcluded(p.ID, "nope"); err != nil || len(narrowed) != 0 {
+		t.Fatalf("search miss = %+v %v, want empty", narrowed, err)
+	}
+	if narrowed, err := s.ListExcluded("no-such-provider", ""); err != nil || len(narrowed) != 0 {
+		t.Fatalf("other provider's bin = %+v %v, want empty", narrowed, err)
+	}
+
+	// Still excluded from discovery while it sits in the bin.
+	if _, err := s.Discover(p.ID); err != nil {
+		t.Fatalf("rediscover: %v", err)
+	}
+	if _, _, ok := modelRow(t, s.db, p.ID, "gpt-bin"); ok {
+		t.Fatal("binned model came back on discovery")
+	}
+
+	restoredID, err := s.Restore(bin[0].ID)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	id, source, ok := modelRow(t, s.db, p.ID, "gpt-bin")
+	if !ok || id != restoredID {
+		t.Fatalf("restored row = %q present:%v, want %q", id, ok, restoredID)
+	}
+	var display string
+	var cost float64
+	var ctx int
+	if err := s.db.QueryRow(`SELECT display_name, input_cost, context_window, source FROM provider_models WHERE id=?`, restoredID).Scan(&display, &cost, &ctx, &source); err != nil {
+		t.Fatalf("select restored: %v", err)
+	}
+	if display != "Fancy Bin" || cost != 1.25 || ctx != 128000 || source == "" {
+		t.Errorf("restored row = %q/%.2f/%d/%q, want Fancy Bin/1.25/128000/<source>", display, cost, ctx, source)
+	}
+	if exclusionCount(t, s.db, p.ID, "gpt-bin") != 0 {
+		t.Fatal("restore left the exclusion in place")
+	}
+	if again, err := s.ListExcluded("", ""); err != nil || len(again) != 0 {
+		t.Fatalf("bin after restore = %+v %v, want empty", again, err)
+	}
+
+	// Back in circulation: discovery may refresh it, and it is no longer skipped.
+	if _, err := s.Discover(p.ID); err != nil {
+		t.Fatalf("rediscover after restore: %v", err)
+	}
+	if _, _, ok := modelRow(t, s.db, p.ID, "gpt-bin"); !ok {
+		t.Fatal("restored model disappeared on the next discovery")
+	}
+}
+
 // An exclusion is per provider: the same model id on another provider is
 // unaffected, and removing one model never blocks its siblings.
 func TestExclusionIsScopedToProviderAndModel(t *testing.T) {

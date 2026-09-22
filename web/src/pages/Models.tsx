@@ -70,6 +70,9 @@ export default function Models({ role = 'admin' }: { role?: string }){
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [pendingDelete, setPendingDelete] = useState<PendingDelete|null>(null)
+  const [excluded, setExcluded] = useState<any[]>([])
+  const [binOpen, setBinOpen] = useState(false)
+  const [restoring, setRestoring] = useState<string|null>(null)
   const toast = useToast()
 
   const load = async()=>{
@@ -81,6 +84,11 @@ export default function Models({ role = 'admin' }: { role?: string }){
     api.catalog.status().then(setStatus).catch(()=>{})
     api.catalog.aliases().then(setAliases).catch(()=>{})
     api.providers.list().then(setProviders).catch(()=>{})
+    api.providerModels.excluded(provider || undefined, q || undefined).then(d=>{
+      const rows = d.data || []
+      setExcluded(rows)
+      if(q && rows.length) setBinOpen(true)
+    }).catch(()=>{})
     setLoading(false)
   }
   useEffect(()=>{ load()},[])
@@ -122,7 +130,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
   const bulkDelete = async()=>{
     if(selected.size===0) return
     setBusy(true)
-    try{ await api.providerModels.bulkRemove(Array.from(selected)); await load(); clearSelection(); toast.success('Removed selected models — they will not be auto-discovered again') }catch(e:any){ toast.error(e.message || String(e))} finally{ setBusy(false)}
+    try{ await api.providerModels.bulkRemove(Array.from(selected)); await load(); clearSelection(); toast.success('Moved to the recycling bin — they will not be auto-discovered again') }catch(e:any){ toast.error(e.message || String(e))} finally{ setBusy(false)}
   }
 
   const confirmDelete = ()=>{
@@ -130,7 +138,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
     if(pendingDelete.kind==='bulk') bulkDelete()
     else if(pendingDelete.kind==='model'){
       api.providerModels.remove(pendingDelete.id)
-        .then(()=>{ toast.success('Model removed — it will not be auto-discovered again'); return load() })
+        .then(()=>{ toast.success('Model moved to the recycling bin — it will not be auto-discovered again'); return load() })
         .catch((e:any)=> toast.error(e.message || String(e)))
         .finally(()=> setPendingDelete(null))
     } else {
@@ -380,10 +388,61 @@ export default function Models({ role = 'admin' }: { role?: string }){
         })}
         {!loading && !loadError && list.length===0 && (
           <div className="col-span-full">
-            <EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above. Removed models stay out of discovery until added back by hand.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/>
+            <EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above. Removed models sit in the recycling bin and stay out of discovery until restored.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/>
           </div>
         )}
       </div>
+
+      {/* Recycling bin: removed models stay out of auto-discovery until restored. */}
+      {(isAdmin || excluded.length > 0) && (
+        <Card>
+          <button type="button" onClick={()=>setBinOpen(o=>!o)} className="w-full flex items-center justify-between gap-3 text-left">
+            <span className="flex items-center gap-2 font-semibold tracking-tight">
+              <Icon name="trash" size={15}/> Recycling bin
+              <Badge tone={excluded.length ? 'warn' : 'neutral'}>{excluded.length}</Badge>
+            </span>
+            <Icon name="chevronRight" size={14} className={`text-muted transition-transform ${binOpen ? 'rotate-90' : ''}`}/>
+          </button>
+          {binOpen && (
+            excluded.length === 0 ? (
+              <p className="mt-3 text-sm text-muted">Nothing here. Removed models land in the bin and are skipped by discovery until you restore them.</p>
+            ) : (
+              <div className="mt-3 divide-y divide-stone/70">
+                {excluded.map((e:any)=>{
+                  const snap = e.snapshot || {}
+                  const fullId = e.provider_name ? `${e.provider_name}/${e.model_id}` : e.model_id
+                  const removed = e.removed_at ? new Date(e.removed_at).toLocaleString() : ''
+                  return (
+                    <div key={e.id} className="py-2.5 flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium truncate" title={snap.display_name || fullId}>{snap.display_name || fullId}</div>
+                        <div className="mt-0.5 flex items-center gap-2 text-xs text-muted font-mono min-w-0">
+                          <span className="truncate" title={fullId}>{fullId}</span>
+                          {removed && <span className="shrink-0 font-sans">removed {removed}</span>}
+                        </div>
+                      </div>
+                      {snap.source && <Badge tone={sourceTone(snap.source)}>{snap.source}</Badge>}
+                      {isAdmin && (
+                        <Button variant="secondary" size="sm" disabled={restoring===e.id} onClick={async()=>{
+                          setRestoring(e.id)
+                          try{
+                            await api.providerModels.restore(e.id)
+                            toast.success(`Restored ${fullId}`)
+                            await load()
+                          }catch(err:any){ toast.error(err.message || String(err)) }
+                          finally{ setRestoring(null) }
+                        }}>
+                          <Icon name="refresh" size={13}/> {restoring===e.id ? 'Restoring' : 'Restore'}
+                        </Button>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )
+          )}
+        </Card>
+      )}
 
       {/* Aliases (writes are admin-only; everyone can read) */}
       <Card>
@@ -431,9 +490,9 @@ export default function Models({ role = 'admin' }: { role?: string }){
           : 'Remove selected models'
         }
         body={
-          pendingDelete?.kind==='model' ? `Remove "${pendingDelete.label}"? It will not be auto-discovered again — add it manually to bring it back.`
+          pendingDelete?.kind==='model' ? `Move "${pendingDelete.label}" to the recycling bin? It will not be auto-discovered again. Restore it from the bin to bring it back.`
           : pendingDelete?.kind==='alias' ? `Remove alias "${pendingDelete.alias}"? Requests resolving through it will stop mapping to its target.`
-          : `Remove ${selected.size} selected model(s)? They will not be auto-discovered again — add them manually to bring them back.`
+          : `Move ${selected.size} selected model(s) to the recycling bin? They will not be auto-discovered again. Restore them from the bin to bring them back.`
         }
         confirmLabel="Remove"
       />

@@ -82,6 +82,9 @@ var migration021SQL string
 //go:embed migrations/022_model_exclusions.sql
 var migration022SQL string
 
+//go:embed migrations/023_model_recycling_bin.sql
+var migration023SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -337,6 +340,7 @@ func Migrate(db *sql.DB) error {
 		{20, migration020SQL},
 		{21, migration021SQL},
 		{22, migration022SQL},
+		{23, migration023SQL},
 	}
 
 	for _, m := range migrations {

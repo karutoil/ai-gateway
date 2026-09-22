@@ -176,3 +176,16 @@ type ProviderModel struct {
 	AvgTPS                float64   `json:"avg_tps,omitempty"`
 	RequestCount          int       `json:"request_count,omitempty"`
 }
+
+// ExcludedModel is a provider model an operator removed. It stays out of
+// auto-discovery until restored or re-added by hand. Snapshot is the row as
+// it was when removed; legacy exclusions (written before the recycling bin)
+// have an empty snapshot and restore as a plain discovered model.
+type ExcludedModel struct {
+	ID           string         `json:"id"`
+	ProviderID   string         `json:"provider_id"`
+	ProviderName string         `json:"provider_name,omitempty"`
+	ModelID      string         `json:"model_id"`
+	RemovedAt    time.Time      `json:"removed_at"`
+	Snapshot     *ProviderModel `json:"snapshot,omitempty"`
+}

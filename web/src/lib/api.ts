@@ -303,6 +303,13 @@ export const api = {
     remove: (id: string) => req(`/api/provider-models/${id}`, { method:'DELETE'}),
     bulkEnrich: (ids:string[]) => Promise.all(ids.map(id=> req(`/api/provider-models/${id}/enrich`, { method:'POST'}))),
     bulkRemove: (ids:string[]) => Promise.all(ids.map(id=> req(`/api/provider-models/${id}`, { method:'DELETE'}))),
+    excluded: (providerId?: string, q?: string) => {
+      const p = new URLSearchParams()
+      if(providerId) p.set('provider_id', providerId)
+      if(q) p.set('q', q)
+      return req(`/api/provider-models/excluded?${p.toString()}`)
+    },
+    restore: (id: string) => req(`/api/provider-models/excluded/${id}/restore`, { method:'POST'}),
   },
   orgs: {
     list: () => req('/api/orgs'),

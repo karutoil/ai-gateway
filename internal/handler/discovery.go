@@ -145,3 +145,31 @@ func (h *DiscoveryHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(204)
 }
+
+func (h *DiscoveryHandler) ListExcluded(w http.ResponseWriter, r *http.Request) {
+	providerID := r.URL.Query().Get("provider_id")
+	if providerID == "" {
+		providerID = r.URL.Query().Get("provider")
+	}
+	list, err := h.Service.ListExcluded(providerID, r.URL.Query().Get("q"))
+	if err != nil {
+		http.Error(w, `{"error":"list failed"}`, 500)
+		return
+	}
+	if list == nil {
+		list = []models.ExcludedModel{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"data": list, "total": len(list)})
+}
+
+func (h *DiscoveryHandler) Restore(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	newID, err := h.Service.Restore(id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"id": newID, "status": "restored"})
+}

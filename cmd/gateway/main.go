@@ -422,6 +422,8 @@ func main() {
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Put("/provider-models/{id}", discoveryHandler.Update)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/{id}/enrich", discoveryHandler.Enrich)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/provider-models/{id}", discoveryHandler.Delete)
+			r.Get("/provider-models/excluded", discoveryHandler.ListExcluded)
+			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/excluded/{id}/restore", discoveryHandler.Restore)
 			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/providers/{id}/discover", discoveryHandler.DiscoverProvider)
 			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/discover-all", discoveryHandler.DiscoverAll)
 			oauthHandler.Routes(r)
