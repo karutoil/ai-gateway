@@ -142,8 +142,11 @@ export function logsParamsToSearch(params: Record<string, unknown>): string {
   return s ? `?${s}` : ''
 }
 
-// Load-balancer routing rules: per-model provider groups with a strategy.
-// Non-failover strategies serve each request with ONE member; failover walks
+// Load-balancer routing rules: per-model ordered option groups with a
+// strategy. An option is a specific provider + model pair; the same provider
+// may appear multiple times with different model overrides, and exact
+// duplicate (provider, model) pairs are rejected server-side. Non-failover
+// strategies serve each request with ONE member; failover walks
 // members in position order on retriable failures. Qualified model ids
 // ("openai/gpt-4o") and X-Provider headers bypass these rules.
 export type RoutingStrategy = 'round_robin' | 'random' | 'weighted' | 'failover'
@@ -158,7 +161,7 @@ export type LBMember = {
 export type LBRule = {
   model: string
   strategy: RoutingStrategy
-  providers: LBMember[] // array order = member position / failover order
+  providers: LBMember[] // array order = member position / failover order; a provider may repeat with distinct models
 }
 
 // Write-path member shape for saveRule.

@@ -10,6 +10,8 @@ import (
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/devin"
 	"ai-gateway/internal/models"
+
+	"github.com/google/uuid"
 )
 
 // discoverDevin seeds provider_models from the static fallback catalog, then
@@ -156,6 +158,30 @@ func (s *Service) isManual(providerID, modelID string) bool {
 	return false
 }
 
+// isExcluded reports whether the operator removed this model from the
+// provider. Discovery must not reinsert it; only a manual add clears the mark.
+func (s *Service) isExcluded(providerID, modelID string) bool {
+	var n int
+	err := s.db.QueryRow(db.Q(`SELECT COUNT(*) FROM provider_model_exclusions WHERE provider_id=? AND model_id=?`), providerID, modelID).Scan(&n)
+	return err == nil && n > 0
+}
+
+// exclude records a removal so discovery will not reinsert the model. Used
+// where there is no surrounding transaction (variant pruning).
+func (s *Service) exclude(providerID, modelID string) error {
+	_, err := s.db.Exec(db.Q(`INSERT INTO provider_model_exclusions(id, provider_id, model_id, created_at) VALUES(?,?,?,?)`+db.UpsertEnd([]string{"provider_id", "model_id"}, []string{"created_at"})),
+		uuid.NewString(), providerID, modelID, time.Now().UTC())
+	return err
+}
+
+// excludeTx records a removal inside the caller's transaction so the model
+// row and its exclusion mark commit together.
+func (s *Service) excludeTx(tx *sql.Tx, providerID, modelID string) error {
+	_, err := tx.Exec(db.Q(`INSERT INTO provider_model_exclusions(id, provider_id, model_id, created_at) VALUES(?,?,?,?)`+db.UpsertEnd([]string{"provider_id", "model_id"}, []string{"created_at"})),
+		uuid.NewString(), providerID, modelID, time.Now().UTC())
+	return err
+}
+
 // pruneDevinVariants removes pre-collapse per-variant rows (e.g. "swe-2-max")
 // now represented by their collapsed base row. Scoped to variant ids that
 // resolve into a stored base; manual rows are never touched.
@@ -164,7 +190,7 @@ func (s *Service) pruneDevinVariants(providerID string, bases map[string]devin.C
 	if err != nil {
 		return
 	}
-	var stale []string
+	var stale []struct{ id, modelID string }
 	for rows.Next() {
 		var id, modelID string
 		var source sql.NullString
@@ -178,13 +204,21 @@ func (s *Service) pruneDevinVariants(providerID string, bases map[string]devin.C
 		if base == modelID {
 			continue
 		}
-		if _, ok := bases[base]; ok {
-			stale = append(stale, id)
+		if _, ok := bases[base]; !ok {
+			continue
 		}
+		stale = append(stale, struct{ id, modelID string }{id, modelID})
 	}
+	// Close before any further query: SQLite runs with MaxOpenConns(1), so
+	// writing while this result set is open deadlocks the sole connection.
 	rows.Close()
-	for _, id := range stale {
-		_, _ = s.db.Exec(db.Q(`DELETE FROM provider_models WHERE id=?`), id)
+	for _, row := range stale {
+		// A removed variant must stay removed: pruning it without an exclusion
+		// would let the next discovery reinsert it under its collapsed base.
+		if err := s.exclude(providerID, row.modelID); err != nil {
+			continue
+		}
+		_, _ = s.db.Exec(db.Q(`DELETE FROM provider_models WHERE id=?`), row.id)
 	}
 }
 

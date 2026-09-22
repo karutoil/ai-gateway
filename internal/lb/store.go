@@ -1,6 +1,9 @@
 // Package lb implements the operator-curated load-balancer routing rules:
 // per-model ordered provider groups with a selectable strategy per rule
-// (round-robin, random, weighted, failover). For every strategy except
+// (round-robin, random, weighted, failover). A member is a specific
+// (provider, model) option — the same provider may appear multiple times
+// with different model overrides, so a rule can offer as many specific
+// provider+model options as the operator wants. For every strategy except
 // failover, exactly ONE member serves each request — there is deliberately NO
 // within-request failover between members (product decision). The failover
 // strategy is the explicit opt-in: members are tried in position order until
@@ -112,11 +115,16 @@ func validateStrategyAndInputs(strategy string, members []RuleMemberInput) error
 }
 
 // validateRuleInputs checks member shape against the strategy: provider ids
-// required, weights in range, weighted rules require positive weights.
+// required, weights in range, weighted rules require positive weights. The
+// same provider may appear multiple times (e.g. two of its models as
+// separate options) as long as each (provider, model_override) pair is
+// unique — an exact duplicate would be two entries that can never be
+// distinguished at request time.
 func validateRuleInputs(strategy string, members []RuleMemberInput) error {
 	if len(members) > 50 {
-		return fmt.Errorf("too many providers in rule (max 50)")
+		return fmt.Errorf("too many members in rule (max 50)")
 	}
+	seen := make(map[string]bool, len(members))
 	for i, m := range members {
 		if m.ProviderID == "" {
 			return fmt.Errorf("member %d: provider required", i)
@@ -130,12 +138,28 @@ func validateRuleInputs(strategy string, members []RuleMemberInput) error {
 		if len(m.ModelOverride) > 256 {
 			return fmt.Errorf("member %d: model_override too long", i)
 		}
+		key := memberKey(m)
+		if seen[key] {
+			if strings.TrimSpace(m.ModelOverride) == "" {
+				return fmt.Errorf("provider %q is already a member of this rule", m.ProviderID)
+			}
+			return fmt.Errorf("provider %q with model %q is already a member of this rule", m.ProviderID, m.ModelOverride)
+		}
+		seen[key] = true
 	}
 	return nil
 }
 
+// memberKey identifies a member by its (provider, model_override) pair —
+// the unit of uniqueness within a rule.
+func memberKey(m RuleMemberInput) string {
+	return strings.ToLower(strings.TrimSpace(m.ProviderID)) + "\x00" + strings.ToLower(strings.TrimSpace(m.ModelOverride))
+}
+
 // ReplaceRule atomically swaps the member set AND strategy for a model.
-// Empty members deletes the rule. strategy "" defaults to round_robin.
+// Empty members deletes the rule. strategy "" defaults to round_robin. The
+// same provider may appear more than once with distinct model overrides;
+// exact duplicate (provider, model) pairs are rejected.
 func (s *Store) ReplaceRule(model, strategy string, members []RuleMemberInput) error {
 	if s.DB == nil {
 		return fmt.Errorf("lb store unavailable")
@@ -161,11 +185,6 @@ func (s *Store) ReplaceRule(model, strategy string, members []RuleMemberInput) e
 	}
 	now := time.Now().UTC()
 	for pos, m := range members {
-		for _, prev := range members[:pos] {
-			if prev.ProviderID == m.ProviderID {
-				return fmt.Errorf("duplicate provider in rule")
-			}
-		}
 		var exists int
 		if err := tx.QueryRow(db.Q(`SELECT COUNT(*) FROM providers WHERE id=?`), m.ProviderID).Scan(&exists); err != nil || exists == 0 {
 			return fmt.Errorf("unknown provider %q", m.ProviderID)
@@ -265,23 +284,50 @@ func (s *Store) AllRules() ([]Rule, error) {
 	return out, nil
 }
 
-// Select orders the rule's healthy members for this request according to the
-// rule's strategy. The caller serves the first member and only walks further
-// members on failover rules. Down members are filtered; if every member is
-// down the full set returns and lets normal retry/failure handling report
-// honestly.
-func (s *Store) Select(rule *Rule) []*models.Provider {
+// Candidate is one ordered serving option for a request: the resolved
+// provider plus the rule member that selected it. Carrying the member lets
+// callers apply THAT member's model override — with multiple members per
+// provider, a provider id alone no longer identifies the option.
+type Candidate struct {
+	*models.Provider
+	Member Member
+}
+
+// ModelOverrideForRequest returns the upstream model id this candidate
+// should send (its member's override, or "" to keep the requested model).
+func (c Candidate) ModelOverrideForRequest() string {
+	return c.Member.ModelOverride
+}
+
+// SelectCandidates orders the rule's healthy members for this request
+// according to the rule's strategy and resolves each to a provider. The
+// caller serves the first candidate; only failover rules walk further.
+// Down members are filtered; if every member is down the full set returns
+// and lets normal retry/failure handling report honestly.
+func (s *Store) SelectCandidates(rule *Rule) []Candidate {
 	if rule == nil || len(rule.Members) == 0 {
 		return nil
 	}
 	ordered := s.orderMembers(rule)
-	out := make([]*models.Provider, 0, len(ordered))
+	out := make([]Candidate, 0, len(ordered))
 	for _, m := range ordered {
 		p, err := (&providerFetcher{s}).byID(m.ProviderID)
 		if err != nil || p == nil {
 			continue
 		}
-		out = append(out, p)
+		out = append(out, Candidate{Provider: p, Member: m})
+	}
+	return out
+}
+
+// Select orders the rule's healthy members and returns just the providers
+// (legacy entry point — prefer SelectCandidates when per-member model
+// overrides matter).
+func (s *Store) Select(rule *Rule) []*models.Provider {
+	cands := s.SelectCandidates(rule)
+	out := make([]*models.Provider, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.Provider)
 	}
 	return out
 }
@@ -363,6 +409,12 @@ func (s *Store) RotateProviders(rule *Rule) []*models.Provider {
 // ModelOverrideFor returns the model id to send upstream for providerID
 // within rule (the member's override, else the rule's model name). ok=false
 // when the provider is not a rule member.
+//
+// Deprecated for routing decisions on rules that may repeat a provider: it
+// resolves by provider id alone, so with several members on one provider it
+// always answers with the FIRST match. The request path uses
+// Candidate.ModelOverrideForRequest instead; this remains for simple
+// lookups (single-member-per-provider rules, tests).
 func (r *Rule) ModelOverrideFor(providerID string) (string, bool) {
 	if r == nil {
 		return "", false

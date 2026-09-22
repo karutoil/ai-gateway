@@ -313,16 +313,25 @@ func escapeLike(s string) string {
 //	"exact"      — verbatim or provider-suffix match, same as Get/GetByShortID
 //	"normalized" — match after stripping channel tags ("[aws] grok-4.6")
 //	"wildcard"   — approximate: think/think spelling, "-vN" variant,
-//	               thinking base, or dated-version containment
-//	               ("claude-opus-4-1" -> "…/claude-opus-4-1-20250805")
+//	               thinking base, dated-version containment
+//	               ("claude-opus-4-1" -> "…/claude-opus-4-1-20250805"),
+//	               AIHubMix coding-plan prefix ("coding-glm-5.3" -> "…/glm-5.3")
+//	               or free-tier base ("coding-glm-5.3-free" -> "…/glm-5.3-free"
+//	               or zeroed "…/glm-5.3")
 //
 // Callers should record "wildcard" distinctly (provider_models.source =
 // "enriched-wildcard") so estimated pricing is distinguishable from exact
 // catalog data. Unknown slugs return sql.ErrNoRows.
 func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, error) {
+	free := isFreeSlug(modelID)
 	if m, sub := s.trySlug(modelID, signalsThinking(modelID)); m != nil {
 		if sub == "" {
+			// Verbatim hit on a *-free row already carries zero pricing;
+			// a verbatim hit without it cannot happen for free slugs.
 			return m, "exact", nil
+		}
+		if free {
+			m = zeroFreeCosts(m)
 		}
 		return m, "wildcard", nil
 	}
@@ -331,10 +340,14 @@ func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, err
 		return nil, "", sql.ErrNoRows
 	}
 	thinking := signalsThinking(norm)
+	normFree := isFreeSlug(norm)
 	if norm != strings.TrimSpace(modelID) {
 		if m, sub := s.trySlug(norm, thinking); m != nil {
 			if sub == "" {
 				return m, "normalized", nil
+			}
+			if normFree || free {
+				m = zeroFreeCosts(m)
 			}
 			return m, "wildcard", nil
 		}
@@ -345,7 +358,26 @@ func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, err
 			if thinking {
 				m = ensureReasoning(m)
 			}
+			if normFree || free {
+				m = zeroFreeCosts(m)
+			}
 			return m, "wildcard", nil
+		}
+		// Coding-plan slugs never contain-match (the catalog holds the base,
+		// not the prefixed id), so retry containment on the stripped base:
+		// ("coding-foo-9" -> "…/foo-9-20250101").
+		for _, alt := range codingFreeAlternates(norm) {
+			if len(alt) >= 4 {
+				if m, err := s.getByContains(alt); err == nil {
+					if thinking {
+						m = ensureReasoning(m)
+					}
+					if normFree || free {
+						m = zeroFreeCosts(m)
+					}
+					return m, "wildcard", nil
+				}
+			}
 		}
 	}
 	// Segment backoff for suffixed variants ("gemini-3.5-flash-high" ->
@@ -355,6 +387,9 @@ func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, err
 			if thinking {
 				m = ensureReasoning(m)
 			}
+			if normFree || free {
+				m = zeroFreeCosts(m)
+			}
 			return m, "wildcard", nil
 		}
 	}
@@ -362,8 +397,8 @@ func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, err
 }
 
 // trySlug runs the per-slug match tiers: verbatim/suffix hits return
-// subkind "", approximate (think spelling, "-vN" variant, thinking base)
-// hits return "wild".
+// subkind "", approximate (think spelling, "-vN" variant, thinking base,
+// coding-plan prefix, free-tier base) hits return "wild".
 func (s *Store) trySlug(slug string, thinking bool) (*models.CatalogModel, string) {
 	if m, err := s.Get(slug); err == nil {
 		return m, ""
@@ -384,6 +419,33 @@ func (s *Store) trySlug(slug string, thinking bool) (*models.CatalogModel, strin
 			return m, "wild"
 		}
 	}
+	// AIHubMix coding-plan channel ("coding-glm-5.3" -> "glm-5.3") and
+	// free-tier base ("x-free" -> "x"). Each alternate also tries the "-vN"
+	// spellings, since the strip can expose a version-variant base
+	// ("coding-deepseek-3.2" -> "deepseek-v3.2").
+	free := isFreeSlug(slug)
+	for _, alt := range codingFreeAlternates(slug) {
+		if m, err := s.GetByShortID(alt); err == nil {
+			if thinking {
+				m = ensureReasoning(m)
+			}
+			if free {
+				m = zeroFreeCosts(m)
+			}
+			return m, "wild"
+		}
+		for _, valt := range vAlternates(alt) {
+			if m, err := s.GetByShortID(valt); err == nil {
+				if thinking {
+					m = ensureReasoning(m)
+				}
+				if free {
+					m = zeroFreeCosts(m)
+				}
+				return m, "wild"
+			}
+		}
+	}
 	if base, ok := cutThinkingSuffix(slug); ok && base != "" {
 		if m, err := s.GetByShortID(base); err == nil {
 			return ensureReasoning(m), "wild"
@@ -398,6 +460,74 @@ func (s *Store) trySlug(slug string, thinking bool) (*models.CatalogModel, strin
 		}
 	}
 	return nil, ""
+}
+
+// stripCodingPrefix removes the AIHubMix coding-plan channel prefix
+// ("coding-glm-5.3" -> "glm-5.3"). Only the coding- namespace observed in
+// models.dev is handled; matching stays case-insensitive like the rest of
+// the lookup chain. Reports whether a prefix was stripped.
+func stripCodingPrefix(slug string) (string, bool) {
+	if len(slug) > len("coding-") && strings.HasPrefix(strings.ToLower(slug), "coding-") {
+		return slug[len("coding-"):], true
+	}
+	return slug, false
+}
+
+// stripFreeSuffix removes the free-tier suffix ("glm-5.3-free" -> "glm-5.3").
+// Reports whether a suffix was stripped.
+func stripFreeSuffix(slug string) (string, bool) {
+	if len(slug) > len("-free") && strings.HasSuffix(strings.ToLower(slug), "-free") {
+		return slug[:len(slug)-len("-free")], true
+	}
+	return slug, false
+}
+
+// isFreeSlug reports whether a slug names a free-tier variant.
+func isFreeSlug(slug string) bool {
+	_, ok := stripFreeSuffix(strings.TrimSpace(slug))
+	return ok
+}
+
+// zeroFreeCosts zeroes pricing on a fallback match for a *-free slug so a
+// paid base row never bills free-tier traffic. Exact *-free catalog rows
+// already carry zero costs; this only affects approximate fallbacks
+// ("coding-glm-5.3-free" -> "…/glm-5.3").
+func zeroFreeCosts(m *models.CatalogModel) *models.CatalogModel {
+	if m == nil {
+		return nil
+	}
+	m.InputCost, m.OutputCost = 0, 0
+	m.CacheReadCost, m.CacheWriteCost = 0, 0
+	return m
+}
+
+// codingFreeAlternates proposes stripped candidates for AIHubMix coding-plan
+// slugs, in priority order. Chained variants come last:
+// ("coding-glm-5.3-free" -> ["coding-glm-5.3", "glm-5.3-free", "glm-5.3"]).
+func codingFreeAlternates(slug string) []string {
+	var out []string
+	seen := map[string]bool{slug: true}
+	if noFree, ok := stripFreeSuffix(slug); ok && !seen[noFree] {
+		seen[noFree] = true
+		out = append(out, noFree)
+	}
+	if noCoding, ok := stripCodingPrefix(slug); ok && !seen[noCoding] {
+		seen[noCoding] = true
+		out = append(out, noCoding)
+	}
+	if noFree, ok := stripFreeSuffix(slug); ok {
+		if both, ok2 := stripCodingPrefix(noFree); ok2 && !seen[both] {
+			seen[both] = true
+			out = append(out, both)
+		}
+	}
+	if noCoding, ok := stripCodingPrefix(slug); ok {
+		if both, ok2 := stripFreeSuffix(noCoding); ok2 && !seen[both] {
+			seen[both] = true
+			out = append(out, both)
+		}
+	}
+	return out
 }
 
 // backoffSegment drops the last dash-separated segment

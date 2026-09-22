@@ -126,6 +126,37 @@ func (s *Store) GetByName(name string) (*models.Provider, error) {
 	return &p, nil
 }
 
+// GetByNameCI is the case-insensitive GetByName: qualified model pins
+// ("AIHubMix/coding-glm-5.3") and X-Provider hints arrive in arbitrary case
+// while provider names keep their display casing ("AIHubMix"). Exact match is
+// tried first (preserves current behavior when casing already matches);
+// the LOWER() fallback is dialect-safe on SQLite and Postgres.
+func (s *Store) GetByNameCI(name string) (*models.Provider, error) {
+	if p, err := s.GetByName(name); err == nil {
+		return p, nil
+	}
+	var p models.Provider
+	var hs, lh, org sql.NullString
+	err := s.db.QueryRow(db.Q(`SELECT id, name, type, base_url, api_key_enc, created_at, health_status, last_health, org_id FROM providers WHERE LOWER(name)=LOWER(?) ORDER BY created_at ASC LIMIT 1`), name).Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &p.APIKeyEnc, &p.CreatedAt, &hs, &lh, &org)
+	if err != nil && strings.Contains(err.Error(), "org_id") {
+		err = s.db.QueryRow(db.Q(`SELECT id, name, type, base_url, api_key_enc, created_at, health_status, last_health FROM providers WHERE LOWER(name)=LOWER(?) ORDER BY created_at ASC LIMIT 1`), name).Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &p.APIKeyEnc, &p.CreatedAt, &hs, &lh)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if hs.Valid {
+		p.HealthStatus = &hs.String
+	}
+	if lh.Valid {
+		p.LastHealth = &lh.String
+	}
+	if org.Valid {
+		p.OrgID = &org.String
+	}
+	s.loadOAuthMeta(&p)
+	return &p, nil
+}
+
 // GetByType returns the first provider of the given type, health-aware
 // (up first, then unknown/none, then down) and deterministic by age.
 // Used by qualified-model pinning ("anthropic/claude-..." -> type match).
@@ -441,7 +472,7 @@ func (s *Store) Delete(id string) error {
 // It prefers healthy providers and is deterministic (ordered by health then creation time).
 func (s *Store) Resolve(model string, preferredProvider string) (*models.Provider, error) {
 	if preferredProvider != "" {
-		if p, err := s.GetByName(preferredProvider); err == nil {
+		if p, err := s.GetByNameCI(preferredProvider); err == nil {
 			return p, nil
 		}
 		if p, err := s.GetByID(preferredProvider); err == nil {
@@ -453,10 +484,11 @@ func (s *Store) Resolve(model string, preferredProvider string) (*models.Provide
 		parts := strings.SplitN(model, "/", 2)
 		prefix := strings.ToLower(strings.TrimSpace(parts[0]))
 		for _, cand := range []string{prefix} {
-			// try healthy name first, fallback to any
+			// try healthy name first, fallback to any (case-insensitive:
+			// display names keep their casing, e.g. "AIHubMix")
 			var hp models.Provider
 			var hhs, hlh sql.NullString
-			err2 := s.db.QueryRow(db.Q(`SELECT id, name, type, base_url, api_key_enc, created_at, health_status, last_health FROM providers WHERE name=? AND (health_status IS NULL OR health_status != 'down') ORDER BY CASE WHEN health_status='up' THEN 0 ELSE 1 END, created_at ASC LIMIT 1`), cand).Scan(&hp.ID, &hp.Name, &hp.Type, &hp.BaseURL, &hp.APIKeyEnc, &hp.CreatedAt, &hhs, &hlh)
+			err2 := s.db.QueryRow(db.Q(`SELECT id, name, type, base_url, api_key_enc, created_at, health_status, last_health FROM providers WHERE LOWER(name)=LOWER(?) AND (health_status IS NULL OR health_status != 'down') ORDER BY CASE WHEN health_status='up' THEN 0 ELSE 1 END, created_at ASC LIMIT 1`), cand).Scan(&hp.ID, &hp.Name, &hp.Type, &hp.BaseURL, &hp.APIKeyEnc, &hp.CreatedAt, &hhs, &hlh)
 			if err2 == nil {
 				if hhs.Valid {
 					hp.HealthStatus = &hhs.String
@@ -466,7 +498,7 @@ func (s *Store) Resolve(model string, preferredProvider string) (*models.Provide
 				}
 				return &hp, nil
 			}
-			if p2, err := s.GetByName(cand); err == nil {
+			if p2, err := s.GetByNameCI(cand); err == nil {
 				return p2, nil
 			}
 			// also match type - health-aware ordering
@@ -526,7 +558,7 @@ func (s *Store) ResolveWithOrg(model string, preferredProvider string, orgID str
 	}
 	// Preferred provider must belong to org
 	if preferredProvider != "" {
-		if p, err := s.GetByName(preferredProvider); err == nil {
+		if p, err := s.GetByNameCI(preferredProvider); err == nil {
 			if p.OrgID != nil && *p.OrgID != "" && *p.OrgID != orgID {
 				// org mismatch -> forbid
 			} else {
@@ -545,7 +577,7 @@ func (s *Store) ResolveWithOrg(model string, preferredProvider string, orgID str
 		for _, cand := range []string{prefix} {
 			var hp models.Provider
 			var hhs, hlh, org sql.NullString
-			err2 := s.db.QueryRow(db.Q(`SELECT id, name, type, base_url, api_key_enc, created_at, health_status, last_health, org_id FROM providers WHERE name=? AND org_id=? AND (health_status IS NULL OR health_status != 'down') ORDER BY CASE WHEN health_status='up' THEN 0 ELSE 1 END, created_at ASC LIMIT 1`), cand, orgID).Scan(&hp.ID, &hp.Name, &hp.Type, &hp.BaseURL, &hp.APIKeyEnc, &hp.CreatedAt, &hhs, &hlh, &org)
+			err2 := s.db.QueryRow(db.Q(`SELECT id, name, type, base_url, api_key_enc, created_at, health_status, last_health, org_id FROM providers WHERE LOWER(name)=LOWER(?) AND org_id=? AND (health_status IS NULL OR health_status != 'down') ORDER BY CASE WHEN health_status='up' THEN 0 ELSE 1 END, created_at ASC LIMIT 1`), cand, orgID).Scan(&hp.ID, &hp.Name, &hp.Type, &hp.BaseURL, &hp.APIKeyEnc, &hp.CreatedAt, &hhs, &hlh, &org)
 			if err2 == nil {
 				if hhs.Valid {
 					hp.HealthStatus = &hhs.String

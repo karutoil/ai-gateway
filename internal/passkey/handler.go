@@ -13,6 +13,7 @@ import (
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/user"
 
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -357,7 +358,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 		// Try to find owner of credential
 		b64 := base64.RawURLEncoding.EncodeToString(credential.ID)
 		var ownerID string
-		h.DB.QueryRow("SELECT user_id FROM webauthn_credentials WHERE credential_id=?", b64).Scan(&ownerID)
+		h.DB.QueryRow(db.Q("SELECT user_id FROM webauthn_credentials WHERE credential_id=?"), b64).Scan(&ownerID)
 		if ownerID != "" {
 			if u, err := h.UserStore.GetByID(ownerID); err == nil {
 				username = u.Username

@@ -1,0 +1,11 @@
+-- 021_cache_status.sql — per-request cache disposition for full visibility
+-- cache_hit (migration 019) only marks HITs; misses and non-eligible requests
+-- are indistinguishable. cache_status records the disposition of every
+-- request against the response cache:
+--   'hit'    answered from cache (X-Cache: HIT) — no upstream call
+--   'miss'   cache-eligible, consulted, not present (X-Cache: MISS)
+--   'bypass' not cache-eligible: streaming with CACHE_STREAMS off, request
+--            bodies over the cache size cap, or endpoints without cache
+--            wiring (X-Cache: BYPASS)
+-- NULL on legacy rows written before this migration.
+ALTER TABLE request_logs ADD COLUMN cache_status TEXT;

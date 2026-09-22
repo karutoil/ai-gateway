@@ -72,8 +72,11 @@ data, but a final delta copy + flip needs a brief restart:
 cd /home/karutoil/ai-gateway
 sqlite3 deploy/production/data/gateway.db ".backup '/tmp/gw-final.db'"
 GW_PW=$(grep '^POSTGRES_PASSWORD=' deploy/production/.env | cut -d= -f2)
-go run ./scripts/migrate-sqlite-pg.go /tmp/gw-final.db \
-  "postgres://gateway:${GW_PW}@127.0.0.1:5434/gateway?sslmode=disable"
+PG="postgres://gateway:${GW_PW}@127.0.0.1:5434/gateway?sslmode=disable"
+go run ./scripts/migrate-sqlite-pg.go /tmp/gw-final.db "$PG"
+# Copy ends with a per-table verify (exit 0 = every source row present).
+# "target has extra rows" on models_catalog is expected: booting the gateway
+# against Postgres syncs a fresher models.dev catalog into the target.
 rm /tmp/gw-final.db
 # flip + rebuild + restart (seconds of downtime)
 sed -i -E "s#^DATABASE_URL=.*#DATABASE_URL=postgres://gateway:${GW_PW}@postgres:5432/gateway?sslmode=disable#" deploy/production/.env

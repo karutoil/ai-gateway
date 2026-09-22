@@ -180,3 +180,91 @@ func TestFindBestMatchWildcard(t *testing.T) {
 		t.Errorf("venice = kind %q cost %.2f, want wildcard/13", kind, m.InputCost)
 	}
 }
+
+func TestStripCodingPrefixFreeSuffix(t *testing.T) {
+	if got, ok := stripCodingPrefix("coding-glm-5.3"); !ok || got != "glm-5.3" {
+		t.Errorf("stripCodingPrefix = %q,%v want glm-5.3,true", got, ok)
+	}
+	if got, ok := stripCodingPrefix("Coding-GLM-5.3"); !ok || got != "GLM-5.3" {
+		t.Errorf("stripCodingPrefix case = %q,%v", got, ok)
+	}
+	if _, ok := stripCodingPrefix("glm-5.3"); ok {
+		t.Errorf("stripCodingPrefix on base should not strip")
+	}
+	if got, ok := stripFreeSuffix("glm-5.3-free"); !ok || got != "glm-5.3" {
+		t.Errorf("stripFreeSuffix = %q,%v want glm-5.3,true", got, ok)
+	}
+	if _, ok := stripFreeSuffix("glm-5.3"); ok {
+		t.Errorf("stripFreeSuffix on paid should not strip")
+	}
+	if !isFreeSlug("coding-glm-5.3-free") || isFreeSlug("coding-glm-5.3") {
+		t.Errorf("isFreeSlug mismatch")
+	}
+}
+
+// AIHubMix coding-plan channel ("coding-<base>", "<base>-free") has no exact
+// models.dev row for new generations (e.g. coding-glm-5.3): enrichment must
+// fall back to the base row as wildcard, zeroing costs for *-free so free
+// traffic never inherits paid pricing.
+func TestFindBestMatchCodingPlan(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	s := NewStore(database)
+	body := []byte(`{
+		"aihubmix": {"id":"aihubmix","name":"aihubmix","api":"openai","models":{
+			"glm-5.3": {"id":"aihubmix/glm-5.3","name":"GLM-5.3","cost":{"input":1.1268,"output":3.9438,"cache_read":0.28},"limit":{"context":1000000,"output":128000},"reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high","max"]}],"tool_call":true,"structured_output":true},
+			"coding-glm-5.1": {"id":"aihubmix/coding-glm-5.1","name":"Coding GLM 5.1","cost":{"input":0.06,"output":0.22},"limit":{"context":200000,"output":128000},"reasoning":true,"tool_call":true}
+		}},
+		"tokenrouter": {"id":"tokenrouter","name":"tokenrouter","api":"openai","models":{
+			"glm-5.3-free": {"id":"z-ai/glm-5.3-free","name":"GLM free","cost":{"input":0,"output":0},"limit":{"context":1000000,"output":131072},"reasoning":true,"tool_call":true}
+		}}
+	}`)
+	if _, err := s.SyncFromBytes(body); err != nil {
+		t.Fatal(err)
+	}
+
+	// Paid coding-plan slug inherits base context/reasoning/pricing.
+	m, kind, err := s.FindBestMatch("coding-glm-5.3")
+	if err != nil {
+		t.Fatalf("coding paid lookup failed: %v", err)
+	}
+	if kind != "wildcard" {
+		t.Errorf("coding paid kind = %q, want wildcard", kind)
+	}
+	if m.ContextWindow != 1000000 || m.MaxOutput != 128000 || !m.Reasoning || !m.ToolCall {
+		t.Errorf("coding paid wrong detail: %+v", m)
+	}
+	if m.InputCost != 1.1268 || m.OutputCost != 3.9438 {
+		t.Errorf("coding paid cost = %.4f/%.4f, want base 1.1268/3.9438", m.InputCost, m.OutputCost)
+	}
+	if m.ReasoningType != "effort" {
+		t.Errorf("coding paid reasoning_type = %q, want effort", m.ReasoningType)
+	}
+
+	// Free coding-plan slug resolves with zeroed pricing but kept detail.
+	m, kind, err = s.FindBestMatch("coding-glm-5.3-free")
+	if err != nil {
+		t.Fatalf("coding free lookup failed: %v", err)
+	}
+	if kind != "wildcard" {
+		t.Errorf("coding free kind = %q, want wildcard", kind)
+	}
+	if m.InputCost != 0 || m.OutputCost != 0 || m.CacheReadCost != 0 || m.CacheWriteCost != 0 {
+		t.Errorf("coding free must be zeroed, got in=%.4f out=%.4f cr=%.4f cw=%.4f", m.InputCost, m.OutputCost, m.CacheReadCost, m.CacheWriteCost)
+	}
+	if m.ContextWindow == 0 || !m.Reasoning {
+		t.Errorf("coding free missing detail: %+v", m)
+	}
+
+	// Exact coding rows still match exactly (not wildcard).
+	m, kind, err = s.FindBestMatch("coding-glm-5.1")
+	if err != nil {
+		t.Fatalf("exact coding lookup failed: %v", err)
+	}
+	if kind != "exact" || m.InputCost != 0.06 {
+		t.Errorf("exact coding = kind %q cost %.4f, want exact/0.06", kind, m.InputCost)
+	}
+}

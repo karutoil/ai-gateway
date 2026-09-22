@@ -182,6 +182,58 @@ func TestValidStrategy(t *testing.T) {
 	}
 }
 
+// A rule may list the same provider several times as distinct
+// (provider, model) options; an exact duplicate pair is rejected.
+func TestValidateRuleInputsDuplicateMembers(t *testing.T) {
+	mk := func(override string) RuleMemberInput {
+		return RuleMemberInput{ProviderID: "openai", ModelOverride: override, Weight: 1}
+	}
+	// Same provider, different models: allowed — as many options as wanted.
+	if err := validateRuleInputs(StrategyRoundRobin, []RuleMemberInput{mk("gpt-4o"), mk("gpt-4o-mini"), {ProviderID: "groq", ModelOverride: "llama-3", Weight: 1}}); err != nil {
+		t.Fatalf("distinct provider+model options must be accepted: %v", err)
+	}
+	// Exact duplicate (same provider AND same model): rejected.
+	if err := validateStrategyAndInputs(StrategyRoundRobin, []RuleMemberInput{mk("gpt-4o"), mk("gpt-4o")}); err == nil {
+		t.Fatal("exact duplicate member must be rejected")
+	}
+	// Same provider twice with no override at all: also an exact duplicate.
+	if err := validateStrategyAndInputs(StrategyRoundRobin, []RuleMemberInput{mk(""), mk("")}); err == nil {
+		t.Fatal("duplicate bare member must be rejected")
+	}
+}
+
+// SelectCandidates carries each member's own model override — with several
+// members on one provider, the provider id alone must not decide the model.
+func TestSelectCandidatesPerMemberOverride(t *testing.T) {
+	rule := testRule(StrategyFailover,
+		Member{ProviderID: "a", ModelOverride: "gpt-4o-2024-11-20"},
+		Member{ProviderID: "a", ModelOverride: "gpt-4o-mini"},
+		Member{ProviderID: "b"},
+	)
+	// orderMembers is the DB-free ordering core; verify each position keeps
+	// its own override rather than collapsing to the first "a" entry.
+	ordered := (&Store{}).orderMembers(rule)
+	if len(ordered) != 3 {
+		t.Fatalf("expected 3 ordered members, got %d", len(ordered))
+	}
+	overrides := map[string]int{}
+	for _, m := range ordered {
+		key := m.ProviderID + "\x00" + m.ModelOverride
+		overrides[key]++
+	}
+	if overrides["a\x00gpt-4o-2024-11-20"] != 1 || overrides["a\x00gpt-4o-mini"] != 1 || overrides["b\x00"] != 1 {
+		t.Fatalf("per-member overrides lost in ordering: %v", overrides)
+	}
+	// Candidate helper: override travels with the member.
+	c := Candidate{Member: ordered[0]}
+	if got := c.ModelOverrideForRequest(); got != "gpt-4o-2024-11-20" {
+		t.Fatalf("candidate override: got %q", got)
+	}
+	if got := (Candidate{Member: ordered[2]}).ModelOverrideForRequest(); got != "" {
+		t.Fatalf("plain member should keep the requested model, got %q", got)
+	}
+}
+
 func memberIDs(members []Member) []string {
 	out := make([]string, 0, len(members))
 	for _, m := range members {

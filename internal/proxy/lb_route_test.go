@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -231,6 +232,36 @@ func TestQualifiedPinBeatsRule(t *testing.T) {
 	}
 }
 
+// Mixed-case display names ("AIHubMix") must pin from qualified IDs and
+// X-Provider hints in any casing — the qualified prefix is lowercased before
+// lookup while the stored name keeps its display case.
+func TestQualifiedPinCaseInsensitive(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := provider.NewStore(database, make([]byte, 32))
+	pa, err := ps.Create("MixedCase", models.ProviderOpenAI, "https://example.com/v1", "sk-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(ps, database)
+	h.LB = lb.NewStore(database)
+
+	for _, model := range []string{"MixedCase/m", "mixedcase/m", "MIXEDCASE/m"} {
+		cands, _ := h.candidateProvidersWithRule(model, model, "", "", nil)
+		if len(cands) != 1 || cands[0].ID != pa.ID {
+			t.Fatalf("qualified pin %q missed MixedCase (got %d candidates)", model, len(cands))
+		}
+	}
+	for _, hint := range []string{"MixedCase", "mixedcase", "MIXEDCASE"} {
+		cands, _ := h.candidateProvidersWithRule("m", "m", hint, "", nil)
+		if len(cands) != 1 || cands[0].ID != pa.ID {
+			t.Fatalf("X-Provider hint %q missed MixedCase (got %d candidates)", hint, len(cands))
+		}
+	}
+}
+
 // Failing member surfaces its own error; rotation continues on LATER requests
 // (operators remove dead members from the UI rather than relying on silent
 // failover).
@@ -392,4 +423,59 @@ func (c captureModelTransport) RoundTrip(req *http.Request) (*http.Response, err
 		req.Body = io.NopCloser(bytes.NewReader(b))
 	}
 	return http.DefaultTransport.RoundTrip(req)
+}
+
+// A rule may list the SAME provider several times with different model
+// overrides — one member per (provider, model) option. Round-robin must
+// alternate the options and send each member's own model upstream (the
+// provider id alone cannot decide the model).
+func TestRuleMultipleModelsSameProvider(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	if err := hh.lbStore.ReplaceRule("gpt-4o-mini", lb.StrategyRoundRobin, []lb.RuleMemberInput{
+		{ProviderID: hh.paID, ModelOverride: "gpt-4o-mini-2024-07-18"},
+		{ProviderID: hh.paID, ModelOverride: "gpt-4o-mini-2024-10-22"},
+		{ProviderID: hh.pbID, ModelOverride: "llama-b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	seen := map[string]int{}
+	hh.h.Client.Transport = captureModelTransport{fn: func(m string) {
+		mu.Lock()
+		seen[m]++
+		mu.Unlock()
+	}}
+
+	for i := 0; i < 9; i++ {
+		code, body := hh.do(t, "gpt-4o-mini", "")
+		if code != 200 {
+			t.Fatalf("request %d failed: %d %s", i, code, body)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{"gpt-4o-mini-2024-07-18", "gpt-4o-mini-2024-10-22", "llama-b"} {
+		if seen[want] == 0 {
+			t.Fatalf("member model %q never served (seen %v)", want, seen)
+		}
+	}
+	if seen["gpt-4o-mini"] != 0 {
+		t.Fatalf("requested model must be overridden on every member (seen %v)", seen)
+	}
+	if total := seen["gpt-4o-mini-2024-07-18"] + seen["gpt-4o-mini-2024-10-22"] + seen["llama-b"]; total != 9 {
+		t.Fatalf("expected 9 upstream calls, counted %d (%v)", total, seen)
+	}
+}
+
+// Exact duplicate (provider, model) members are rejected at write time.
+func TestRuleRejectsDuplicateMember(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	err := hh.lbStore.ReplaceRule("gpt-4o-mini", lb.StrategyRoundRobin, []lb.RuleMemberInput{
+		{ProviderID: hh.paID, ModelOverride: "same-model"},
+		{ProviderID: hh.paID, ModelOverride: "same-model"},
+	})
+	if err == nil {
+		t.Fatal("exact duplicate member must be rejected")
+	}
 }

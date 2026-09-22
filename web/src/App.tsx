@@ -67,7 +67,10 @@ function useAuth() {
       const meRes = await fetch('/api/admin/users/me', { credentials: 'same-origin' })
       if (meRes.ok) {
         const me = await meRes.json()
-        setUser({ username: me.username || data.username || '', role: me.role || data.role || '' })
+        // Apply the full identity (permissions included): setUser alone
+        // leaves the permission store empty, hiding every permission-gated
+        // nav link until a hard refresh re-ran the /me fetch.
+        applyIdentity({ username: me.username || data.username, role: me.role || data.role, permissions: me.permissions ?? data.permissions })
         return
       }
     } catch {}

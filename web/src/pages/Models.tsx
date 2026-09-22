@@ -122,7 +122,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
   const bulkDelete = async()=>{
     if(selected.size===0) return
     setBusy(true)
-    try{ await api.providerModels.bulkRemove(Array.from(selected)); await load(); clearSelection(); toast.success('Deleted selected models') }catch(e:any){ toast.error(e.message || String(e))} finally{ setBusy(false)}
+    try{ await api.providerModels.bulkRemove(Array.from(selected)); await load(); clearSelection(); toast.success('Removed selected models — they will not be auto-discovered again') }catch(e:any){ toast.error(e.message || String(e))} finally{ setBusy(false)}
   }
 
   const confirmDelete = ()=>{
@@ -130,7 +130,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
     if(pendingDelete.kind==='bulk') bulkDelete()
     else if(pendingDelete.kind==='model'){
       api.providerModels.remove(pendingDelete.id)
-        .then(()=>{ toast.success('Model deleted'); return load() })
+        .then(()=>{ toast.success('Model removed — it will not be auto-discovered again'); return load() })
         .catch((e:any)=> toast.error(e.message || String(e)))
         .finally(()=> setPendingDelete(null))
     } else {
@@ -208,7 +208,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
           <Badge tone="warn">{selected.size} model(s) selected</Badge>
           <div className="flex gap-2">
             <Button variant="primary" size="sm" onClick={bulkEnrich} disabled={busy}>Enrich selected</Button>
-            <Button variant="danger" size="sm" onClick={()=>setPendingDelete({kind:'bulk'})} disabled={busy}>Delete selected</Button>
+            <Button variant="danger" size="sm" onClick={()=>setPendingDelete({kind:'bulk'})} disabled={busy}>Remove selected</Button>
             <Button variant="ghost" size="sm" onClick={clearSelection}>Clear</Button>
           </div>
         </div>
@@ -369,7 +369,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
                       <Icon name="pencil" size={14}/> Edit
                     </Button>
                     <Button variant="ghost" size="sm" onClick={()=>setPendingDelete({kind:'model', id:m.id, label:fullId})}
-                      title={`Delete ${fullId}`} className="hover:text-red-400">
+                      title={`Remove ${fullId} from discovery`} className="hover:text-red-400">
                       <Icon name="trash" size={14}/>
                     </Button>
                   </>
@@ -380,7 +380,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
         })}
         {!loading && !loadError && list.length===0 && (
           <div className="col-span-full">
-            <EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/>
+            <EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above. Removed models stay out of discovery until added back by hand.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/>
           </div>
         )}
       </div>
@@ -426,16 +426,16 @@ export default function Models({ role = 'admin' }: { role?: string }){
         onConfirm={confirmDelete}
         busy={busy}
         title={
-          pendingDelete?.kind==='model' ? 'Delete model'
+          pendingDelete?.kind==='model' ? 'Remove model'
           : pendingDelete?.kind==='alias' ? 'Remove alias'
-          : 'Delete selected models'
+          : 'Remove selected models'
         }
         body={
-          pendingDelete?.kind==='model' ? `Delete "${pendingDelete.label}"? It will be removed from the catalog of provider models.`
+          pendingDelete?.kind==='model' ? `Remove "${pendingDelete.label}"? It will not be auto-discovered again — add it manually to bring it back.`
           : pendingDelete?.kind==='alias' ? `Remove alias "${pendingDelete.alias}"? Requests resolving through it will stop mapping to its target.`
-          : `Delete ${selected.size} selected model(s)? This cannot be undone.`
+          : `Remove ${selected.size} selected model(s)? They will not be auto-discovered again — add them manually to bring them back.`
         }
-        confirmLabel={pendingDelete?.kind==='alias' ? 'Remove' : 'Delete'}
+        confirmLabel="Remove"
       />
     </div>
   )

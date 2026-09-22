@@ -70,6 +70,18 @@ var migration017SQL string
 //go:embed migrations/018_response_store.sql
 var migration018SQL string
 
+//go:embed migrations/019_cache_hit.sql
+var migration019SQL string
+
+//go:embed migrations/020_lb_rules_member_options.sql
+var migration020SQL string
+
+//go:embed migrations/021_cache_status.sql
+var migration021SQL string
+
+//go:embed migrations/022_model_exclusions.sql
+var migration022SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -321,6 +333,10 @@ func Migrate(db *sql.DB) error {
 		{16, migration016SQL},
 		{17, migration017SQL},
 		{18, migration018SQL},
+		{19, migration019SQL},
+		{20, migration020SQL},
+		{21, migration021SQL},
+		{22, migration022SQL},
 	}
 
 	for _, m := range migrations {
@@ -385,6 +401,16 @@ func Migrate(db *sql.DB) error {
 			return fmt.Errorf("failed to record migration %d as applied: %w", m.version, err)
 		}
 	}
+
+	// Postgres-only: spend_counters accumulates unbounded window totals, but
+	// migration 008 declared tokens/cost_micros as INTEGER — 32-bit on
+	// Postgres (SQLite INTEGER is 64-bit, so dev never saw this). A busy
+	// month crossed 2^31 tokens and every further UPDATE failed with
+	// "pq: integer out of range", silently freezing budget enforcement.
+	// ALTER COLUMN TYPE cannot live in a migration file (SQLite rejects the
+	// syntax), so this idempotent widen runs at boot like the hardening
+	// ALTERs above.
+	widenSpendCountersPostgres(db)
 
 	// Legacy fallback: ensure base schema/tables exist even if a DB pre-dates versioning
 	// and the embedded 001 was somehow skipped (e.g. legacy binary). This is the
@@ -690,11 +716,40 @@ func execSchemaIdempotent(db *sql.DB, stmt string) {
 	}
 }
 
+// ExecSchemaIdempotent is the exported wrapper for call sites outside the db
+// package that need ensure-on-demand DDL (e.g. org scaffolding in handlers).
+func ExecSchemaIdempotent(db *sql.DB, stmt string) { execSchemaIdempotent(db, stmt) }
+
+// ExecAlterIdempotent is the exported wrapper for additive ALTERs outside
+// the db package.
+func ExecAlterIdempotent(db *sql.DB, stmt string) { execAlterIdempotent(db, stmt) }
+
+// widenSpendCountersPostgres grows spend_counters.tokens and
+// spend_counters.cost_micros from int4 to int8. No-op on SQLite (its INTEGER
+// is 64-bit) and on already-widened schemas; safe to run every boot.
+func widenSpendCountersPostgres(db *sql.DB) {
+	if Dialect() != "postgres" {
+		return
+	}
+	for _, col := range []string{"tokens", "cost_micros"} {
+		var typ string
+		if err := db.QueryRow(`SELECT data_type FROM information_schema.columns WHERE table_name='spend_counters' AND column_name=$1`, col).Scan(&typ); err != nil {
+			continue // table absent this boot; migration 008 creates it
+		}
+		if typ == "bigint" {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE spend_counters ALTER COLUMN ` + col + ` TYPE BIGINT`); err != nil {
+			log.Warn().Err(err).Str("column", col).Msg("spend_counters widen to BIGINT failed (budget counters may overflow int4)")
+		} else {
+			log.Info().Str("column", col).Msg("spend_counters column widened to BIGINT")
+		}
+	}
+}
+
 func applyHardeningV2Alters(db *sql.DB) {
 	cols := []string{
 		"ALTER TABLE dashboard_users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE organizations ADD COLUMN daily_cost_limit_cents INTEGER",
-		"ALTER TABLE organizations ADD COLUMN monthly_cost_limit_cents INTEGER",
 		"ALTER TABLE gateway_keys ADD COLUMN expires_at DATETIME",
 		"ALTER TABLE gateway_keys ADD COLUMN metadata TEXT",
 	}
@@ -774,6 +829,11 @@ func applyOrgScaffold(db *sql.DB) {
 	execAlterIdempotent(db, `ALTER TABLE gateway_keys ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
 	execSchemaIdempotent(db, `CREATE INDEX IF NOT EXISTS idx_providers_org ON providers(org_id)`)
 	execSchemaIdempotent(db, `CREATE INDEX IF NOT EXISTS idx_gateway_keys_org ON gateway_keys(org_id)`)
+	// Organization budget caps live here (not in applyHardeningV2Alters):
+	// that hook also runs mid-migration (version 8) before this scaffold
+	// exists, which spams "relation does not exist" noise on first boot.
+	execAlterIdempotent(db, "ALTER TABLE organizations ADD COLUMN daily_cost_limit_cents INTEGER")
+	execAlterIdempotent(db, "ALTER TABLE organizations ADD COLUMN monthly_cost_limit_cents INTEGER")
 }
 
 func applyTTFTAlters(db *sql.DB) {

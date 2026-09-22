@@ -63,6 +63,12 @@ type Handler struct {
 	LegacyFallback bool
 	// CacheTTLSeconds bounds non-stream completion caching (default 10).
 	CacheTTLSeconds int
+	// CacheStreams extends the exact-match response cache to streaming
+	// requests: a clean stream's client-bound SSE bytes are stored (bounded)
+	// and replayed verbatim for identical requests. Opt-in via
+	// CACHE_STREAMS=true — all-streaming deployments get zero benefit from
+	// the classic non-stream cache.
+	CacheStreams bool
 	// Usage, when set, records actual per-request token/cost outcomes.
 	Usage UsageSink
 	// LogBodies enables captured request/response body logging (opt-in),
@@ -592,7 +598,7 @@ func (h *Handler) serveCacheHit(w http.ResponseWriter, body []byte, status int, 
 	w.Write(body)
 }
 
-func (h *Handler) writeJSONCached(w http.ResponseWriter, cacheKey string, ttl int, payload any) {
+func (h *Handler) writeJSONCached(w http.ResponseWriter, r *http.Request, cacheKey string, ttl int, payload any) {
 	b, _ := json.Marshal(payload)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Cache", "MISS")
@@ -600,6 +606,10 @@ func (h *Handler) writeJSONCached(w http.ResponseWriter, cacheKey string, ttl in
 	if cacheKey != "" && len(b) <= 1<<20 {
 		h.cacheOrNoop().Set(cacheKey, b, http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, ttl)
 	}
+	// Model-list requests carry X-Cache like every other gateway response;
+	// log them so the cache disposition shows in reporting too (free
+	// metadata call: zero tokens, zero cost).
+	h.logRequestExtendedBodies(r.Header.Get("X-Gateway-Key-Prefix"), "", "", "models", http.StatusOK, 0, 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: "miss"})
 }
 
 // upstreamForwardHeaders is an ALLOWLIST of client headers proxied to
@@ -902,17 +912,58 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		cacheTTL = 10
 	}
 
+	// cacheMaxBodyBytes bounds the REQUEST body size eligible for the exact-
+	// match cache. Agentic prompts run large; a 1 MiB cap excluded a real
+	// share of traffic. Cached VALUES remain response-bounded (1 MiB), so
+	// this only widens which requests may consult/participate.
+	const cacheMaxBodyBytes = 4 << 20
+
+	// cacheStatus records this request's disposition against the response
+	// cache on every log row: 'hit', 'miss' (eligible, consulted, absent) or
+	// 'bypass' (not eligible: oversize body, streaming with the stream cache
+	// off). The X-Cache response header mirrors it.
+	cacheStatus := "bypass"
+	if len(body) <= cacheMaxBodyBytes {
+		if !isStream || h.CacheStreams {
+			cacheStatus = "miss"
+		}
+	}
+
 	cacheKey := ""
-	if !isStream && len(body) <= 1<<20 {
+	if !isStream && len(body) <= cacheMaxBodyBytes {
 		cacheKey = cacheKeyFor(endpoint, model, body, cacheScopeFor(r, providerID))
 		if cached, status, headers, ok := c.Get(cacheKey); ok && status >= 200 && status < 400 {
 			h.serveCacheHit(w, cached, status, headers)
-			h.logRequestExtended(keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, false)
+			// Stamp the row as a gateway cache hit so reporting can separate
+			// cached responses from fresh upstream calls (token counts stay
+			// zero: cached responses are neither re-billed nor re-metered).
+			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
 			return attemptOutcome{committed: true, status: status}
 		}
 		if h.Metrics != nil {
 			h.Metrics.IncCacheHit(false)
 		}
+	}
+
+	// Streaming response cache (opt-in, CACHE_STREAMS=true): replay the exact
+	// SSE bytes a previous identical request received. The key is salted with
+	// the stream marker so a cached stream can never be served to a
+	// non-streaming client and vice versa.
+	var streamCache *streamCacheCollector
+	if isStream && h.CacheStreams && len(body) <= cacheMaxBodyBytes {
+		sKey := cacheKeyFor(endpoint+"|stream", model, body, cacheScopeFor(r, providerID))
+		if cached, status, headers, ok := c.Get(sKey); ok && status >= 200 && status < 400 {
+			h.serveCacheHit(w, cached, status, headers)
+			if f, canFlush := w.(http.Flusher); canFlush {
+				f.Flush()
+			}
+			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
+			return attemptOutcome{committed: true, status: status}
+		}
+		if h.Metrics != nil {
+			h.Metrics.IncCacheHit(false)
+		}
+		streamCache = &streamCacheCollector{key: sKey, ttl: cacheTTL, max: 1 << 20}
 	}
 
 	ctx := r.Context()
@@ -959,7 +1010,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		// piling another silent attempt onto a doomed request.
 		if !isStream && ttfb.expired() {
 			httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
-			h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false)
+			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: cacheStatus})
 			return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
 		}
 		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, body, isStream, isAnthropicUpstream)
@@ -1014,7 +1065,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				// Buffered (or exhausted retries): an honest 504 that edges
 				// pass through beats a synthesized 524 the gateway never sees.
 				httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
-				h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+				h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{CacheStatus: cacheStatus})
 				return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
 			}
 		}
@@ -1100,7 +1151,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		}
 
 		if isStream {
-			h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader, ttfb)
+			h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader, ttfb, streamCache, cacheStatus)
 			ttfb.stop()
 			return attemptOutcome{committed: true, status: lastStatus}
 		}
@@ -1241,20 +1292,17 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		if len(outBody) != len(lastBody) {
 			w.Header().Del("Content-Length")
 		}
-		w.Header().Set("X-Cache", "MISS")
+		if cacheStatus == "bypass" {
+			w.Header().Set("X-Cache", "BYPASS")
+		} else {
+			w.Header().Set("X-Cache", "MISS")
+		}
 		if (needsChatShape || needsResponsesShape) && lastStatus == 200 {
 			w.Header().Set("Content-Type", "application/json")
 		}
 		_, _, nd := extractUsageDetail(outBody)
-		var meta *logMeta
-		if nd != (usageDetail{}) || len(opts.attempts) > 0 {
-			meta = &logMeta{FinishReason: nd.FinishReason, CacheRead: nd.CacheRead, CacheWrite: nd.CacheWrite, Reasoning: nd.Reasoning, FallbackChain: marshalAttemptChain(opts.attempts)}
-		}
-		if meta != nil {
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, lastStatus, time.Since(start).Milliseconds(), pt, ct, cost, false, body, outBody, meta)
-		} else {
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, lastStatus, time.Since(start).Milliseconds(), pt, ct, cost, false, body, outBody)
-		}
+		meta := &logMeta{CacheStatus: cacheStatus, FinishReason: nd.FinishReason, CacheRead: nd.CacheRead, CacheWrite: nd.CacheWrite, Reasoning: nd.Reasoning, FallbackChain: marshalAttemptChain(opts.attempts)}
+		h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, lastStatus, time.Since(start).Milliseconds(), pt, ct, cost, false, body, outBody, meta)
 		w.WriteHeader(lastStatus)
 		w.Write(outBody)
 		return attemptOutcome{committed: true, status: lastStatus}
@@ -1639,7 +1687,48 @@ func (sc *streamCapture) body() []byte {
 //   - framing-aware SSE parsing across TCP chunk boundaries,
 //   - protocol-correct termination on ANY abnormal exit,
 //   - honest downstream accounting (usage-so-far, real outcome status).
-func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response, model, keyPrefix, providerID, endpoint string, start time.Time, isAnthropicUpstream bool, applyFallbackHeader func(http.Header), ttfb *ttfbController) streamPumpResult {
+//
+// streamCacheCollector accumulates the exact client-bound bytes of one
+// streaming response so a clean, fully-drained success stream can be cached
+// and replayed verbatim for identical requests. Bounded: a stream larger
+// than max is never cached (dropped permanently, no partial replays).
+type streamCacheCollector struct {
+	key     string
+	ttl     int
+	max     int
+	buf     []byte
+	dropped bool
+}
+
+// add appends client-bound stream bytes (called after commit, so keepalive
+// heartbeats written by the TTFB watchdog are never captured).
+func (s *streamCacheCollector) add(p []byte) {
+	if s == nil || s.dropped || len(p) == 0 {
+		return
+	}
+	if len(s.buf)+len(p) > s.max {
+		s.dropped = true
+		s.buf = nil
+		return
+	}
+	s.buf = append(s.buf, p...)
+}
+
+// commit stores the captured stream when it is complete and cacheable.
+func (s *streamCacheCollector) commit(c cache.Cache, status int, contentType string) {
+	if s == nil || c == nil || s.dropped || len(s.buf) == 0 || s.ttl <= 0 {
+		return
+	}
+	if status < 200 || status >= 300 {
+		return
+	}
+	if contentType == "" {
+		contentType = "text/event-stream"
+	}
+	c.Set(s.key, s.buf, status, http.Header{"Content-Type": []string{contentType}}, s.ttl)
+}
+
+func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response, model, keyPrefix, providerID, endpoint string, start time.Time, isAnthropicUpstream bool, applyFallbackHeader func(http.Header), ttfb *ttfbController, streamCache *streamCacheCollector, cacheStatus string) streamPumpResult {
 	res := streamPumpResult{}
 
 	commit := func() {
@@ -1700,6 +1789,12 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 
 	var pending []byte // partial SSE event carry-over between reads
 	var promptTok, completeTok int
+	// Usage detail (cache/reasoning/finish) harvested independently of body
+	// logging: it rides the billing parse of every frame, so streams get
+	// full cache-token reporting even with LOG_BODIES off. Previously this
+	// detail only survived inside `capture`, which is allocated for body
+	// logging — silently zeroing cache_read_tokens for all streams.
+	var liveDetail usageDetail
 	sample := &bytes.Buffer{}
 	sampleCap := h.BodyLogMaxBytes
 	if sampleCap > 32<<10 {
@@ -1744,6 +1839,18 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 			// prompt_tokens_details.cached_tokens is a BREAKDOWN of
 			// prompt_tokens (already included), never additive.
 			pt, ct, pd := extractUsageDetailFromMap(evMap)
+			if pd.CacheRead > 0 {
+				liveDetail.CacheRead = pd.CacheRead
+			}
+			if pd.CacheWrite > 0 {
+				liveDetail.CacheWrite = pd.CacheWrite
+			}
+			if pd.Reasoning > 0 {
+				liveDetail.Reasoning = pd.Reasoning
+			}
+			if pd.FinishReason != "" {
+				liveDetail.FinishReason = pd.FinishReason
+			}
 			if pd.CacheRead > 0 || pd.CacheWrite > 0 {
 				anthropicCache := pd.CacheWrite // cache_write is anthropic-only
 				if usageMap, ok := evMap["usage"].(map[string]interface{}); ok {
@@ -1798,7 +1905,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		}
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Bool("client_gone", clientGone).Msg("mid-stream failure terminated")
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, endpoint, logStatus, time.Since(start).Milliseconds(), promptTok, completeTok, cost, sample.Bytes(), capture)
+		h.logRequestStreamed(keyPrefix, providerID, model, endpoint, logStatus, time.Since(start).Milliseconds(), promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
 		return res
 	}
 
@@ -1819,10 +1926,15 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 				if flusher != nil {
 					flusher.Flush()
 				}
+				streamCache.add(tail)
 			}
 		}
+		// Clean, fully-drained success stream: make it replayable for the
+		// next identical request (stream caching is opt-in; nil collector =
+		// disabled, commit is a no-op).
+		streamCache.commit(h.cacheOrNoop(), resp.StatusCode, resp.Header.Get("Content-Type"))
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, sample.Bytes(), capture)
+		h.logRequestStreamed(keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
 		return res
 	}
 
@@ -1889,6 +2001,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 						if flusher != nil {
 							flusher.Flush()
 						}
+						streamCache.add(out)
 					}
 					pending = append(pending, buf...) // raw kept for harvest/sample
 				} else {
@@ -1896,6 +2009,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 					if flusher != nil {
 						flusher.Flush()
 					}
+					streamCache.add(buf)
 					pending = append(pending, buf...)
 				}
 				if idx := bytes.LastIndexByte(pending, '\n'); idx >= 0 {
@@ -2178,17 +2292,36 @@ func (h *Handler) logRequestExtended(keyPrefix, providerID, model, endpoint stri
 // chat-shaped body wins over the raw SSE sample when body logging is on, and
 // the harvested usage detail (finish reason, cache/reasoning split) is stored
 // on the row.
-func (h *Handler) logRequestStreamed(keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, rawSample []byte, capture *streamCapture) {
+func (h *Handler) logRequestStreamed(keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, rawSample []byte, capture *streamCapture, cacheStatus string, liveDetail usageDetail) {
+	// Merge the always-on harvest with the capture's own (body-logging path)
+	// so enabling LOG_BODIES never reduces detail.
+	d := liveDetail
+	if capture != nil {
+		if capture.detail.CacheRead > d.CacheRead {
+			d.CacheRead = capture.detail.CacheRead
+		}
+		if capture.detail.CacheWrite > d.CacheWrite {
+			d.CacheWrite = capture.detail.CacheWrite
+		}
+		if capture.detail.Reasoning > d.Reasoning {
+			d.Reasoning = capture.detail.Reasoning
+		}
+		if d.FinishReason == "" {
+			d.FinishReason = capture.detail.FinishReason
+		}
+	}
+	meta := &logMeta{
+		FinishReason: d.FinishReason,
+		CacheRead:    d.CacheRead,
+		CacheWrite:   d.CacheWrite,
+		Reasoning:    d.Reasoning,
+		CacheStatus:  cacheStatus,
+	}
 	if capture == nil {
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, nil, rawSample)
+		h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, nil, rawSample, meta)
 		return
 	}
-	h.logRequestExtendedDetail(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, rawSample, capture.body(), &logMeta{
-		FinishReason: capture.detail.FinishReason,
-		CacheRead:    capture.detail.CacheRead,
-		CacheWrite:   capture.detail.CacheWrite,
-		Reasoning:    capture.detail.Reasoning,
-	})
+	h.logRequestExtendedDetail(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, rawSample, capture.body(), meta)
 }
 
 // logMeta carries the extended per-request observability fields beyond the
@@ -2199,6 +2332,8 @@ type logMeta struct {
 	CacheRead     int
 	CacheWrite    int
 	Reasoning     int
+	CacheHit      bool   // served from the gateway response cache (X-Cache: HIT)
+	CacheStatus   string // hit | miss | bypass — disposition against the response cache
 }
 
 // logRequestExtendedDetail is the full-fidelity insert used when captured
@@ -2260,9 +2395,22 @@ func (h *Handler) logRequestExtendedBodies(keyPrefix, providerID, model, endpoin
 			respBodyStr = ScrubSecrets(string(b))
 		}
 	}
-	h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+	// cache_hit is an INTEGER column on both dialects: bind an int, never a
+	// Go bool — lib/pq will not cast boolean→integer, so a bool parameter
+	// fails the whole INSERT on Postgres (SQLite tolerates it, which is why
+	// this must be an explicit conversion).
+	cacheHit := 0
+	if m.CacheHit {
+		cacheHit = 1
+	}
+	if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		id, keyPrefix, providerID, model, endpoint, status, latencyMs, time.Now().UTC(), promptTokens, completionTokens, total, costUSD, isStream, nullIfEmpty(reqBodyStr), nullIfEmpty(respBodyStr),
-		nullIfEmpty(m.FinishReason), nullIfEmpty(m.FallbackChain), m.CacheRead, m.CacheWrite, m.Reasoning)
+		nullIfEmpty(m.FinishReason), nullIfEmpty(m.FallbackChain), m.CacheRead, m.CacheWrite, m.Reasoning, cacheHit, nullIfEmpty(m.CacheStatus)); err != nil {
+		// The insert error was previously discarded, which let a dialect
+		// mismatch silently drop EVERY request row on Postgres. Log loudly so
+		// the next regression surfaces immediately.
+		log.Error().Err(err).Str("model", model).Str("endpoint", endpoint).Int("status", status).Msg("request_logs insert failed")
+	}
 	// Per-key analytics attribution: stamp the owning gateway key's id. Runs
 	// after the primary insert so a failure here never loses the request log.
 	if keyPrefix != "" && h.DB != nil {
@@ -2724,14 +2872,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
-	if err := h.validateReasoning(candidates[0].ID, model, body); err != nil {
+	if err := h.validateReasoning(candidates[0].Provider.ID, model, body); err != nil {
 		httperr.Invalid(w, err.Error())
 		return
 	}
 	// Multi-protocol providers serve each model on exactly one upstream
 	// endpoint. Fail fast with the right endpoint instead of forwarding a
 	// chat body to a messages/responses-only model for a cryptic 400.
-	if p0 := candidates[0]; isMultiProtocolProvider(p0) {
+	if p0 := candidates[0].Provider; isMultiProtocolProvider(p0) {
 		if api := UpstreamAPIForModel(p0, model); api == UpstreamMessages || api == UpstreamResponses {
 			httperr.Invalid(w, "model '"+model+"' is served via "+correctInboundFor(api)+" on this provider; use POST "+correctInboundFor(api)+" instead of /v1/chat/completions")
 			return
@@ -2740,12 +2888,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	// Antigravity speaks Cloud Code Assist (OAuth), not OpenAI — translate.
-	if p0 := candidates[0]; isAntigravity(p0) {
+	if p0 := candidates[0].Provider; isAntigravity(p0) {
 		h.proxyAntigravity(w, r, body, body, isStream, model, "chat.completions", keyPrefix, start, p0)
 		return
 	}
 	// Devin speaks Connect-proto (OAuth session token), not OpenAI — translate.
-	if p0 := candidates[0]; isDevin(p0) {
+	if p0 := candidates[0].Provider; isDevin(p0) {
 		h.proxyDevin(w, r, body, isStream, model, "chat.completions", keyPrefix, start, p0)
 		return
 	}
@@ -2801,7 +2949,7 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, _ := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
 		if h.unroutedModel() {
 			noRouteFor(w, model)
@@ -2810,9 +2958,9 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
-	p := candidates[0]
+	p := candidates[0].Provider
 	// Per-member model override from a curated rule (rule-routed traffic only).
-	if override, ok := rule.ModelOverrideFor(p.ID); ok && override != model {
+	if override := candidates[0].ModelOverrideForRequest(); override != "" && override != model {
 		body = replaceModelInBody(body, override)
 		model = override
 	}
@@ -3065,8 +3213,10 @@ var gatewayEpoch = time.Now().Unix()
 // Models handles GET /v1/models - now returns provider_models (discovered per provider) enriched, not full catalog
 func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	ck := modelsCacheKey(r)
+	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	if cached, status, headers, ok := h.cacheOrNoop().Get(ck); ok {
 		h.serveCacheHit(w, cached, status, headers)
+		h.logRequestExtendedBodies(keyPrefix, "", "", "models", status, 0, 0, 0, 0, false, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
 		return
 	}
 	// allowlist filter for Models — if key is restricted, only return allowed models
@@ -3169,7 +3319,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
-				h.writeJSONCached(w, ck, 30, map[string]interface{}{"object": "list", "data": filterAllowed(pmModels)})
+				h.writeJSONCached(w, r, ck, 30, map[string]interface{}{"object": "list", "data": filterAllowed(pmModels)})
 				return
 			}
 		}
@@ -3198,10 +3348,10 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil || len(providers) == 0 {
 		if len(catalogModels) > 0 {
-			h.writeJSONCached(w, ck, 30, map[string]interface{}{"object": "list", "data": filterAllowed(catalogModels)})
+			h.writeJSONCached(w, r, ck, 30, map[string]interface{}{"object": "list", "data": filterAllowed(catalogModels)})
 			return
 		}
-		h.writeJSONCached(w, ck, 30, map[string]interface{}{"object": "list", "data": []interface{}{}})
+		h.writeJSONCached(w, r, ck, 30, map[string]interface{}{"object": "list", "data": []interface{}{}})
 		return
 	}
 	type modelResp struct {
@@ -3337,7 +3487,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 			filteredAll = []interface{}{}
 		}
 	}
-	h.writeJSONCached(w, ck, 30, map[string]interface{}{"object": "list", "data": filteredAll})
+	h.writeJSONCached(w, r, ck, 30, map[string]interface{}{"object": "list", "data": filteredAll})
 }
 
 func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -3402,14 +3552,14 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	// endpoint. A messages-model called here is correct; a chat/responses
 	// model is a client wiring error — fail fast with the right endpoint
 	// instead of forwarding to /v1/messages for a cryptic upstream 400.
-	if p0 := candidates[0]; isMultiProtocolProvider(p0) {
+	if p0 := candidates[0].Provider; isMultiProtocolProvider(p0) {
 		if api := UpstreamAPIForModel(p0, model); api == UpstreamChat || api == UpstreamResponses {
 			httperr.Invalid(w, "model '"+model+"' is served via "+correctInboundFor(api)+" on this provider; use POST "+correctInboundFor(api)+" instead of /v1/messages")
 			return
 		}
 	}
 	// Antigravity via OAuth: normalize Anthropic -> OpenAI chat, then translate.
-	if p0 := candidates[0]; isAntigravity(p0) {
+	if p0 := candidates[0].Provider; isAntigravity(p0) {
 		chatBody, _, err := translate.AnthropicToOpenAI(body)
 		if err != nil {
 			httperr.Invalid(w, "invalid anthropic body: "+err.Error())
@@ -3420,7 +3570,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Devin via OAuth: normalize Anthropic -> OpenAI chat, then translate.
-	if p0 := candidates[0]; isDevin(p0) {
+	if p0 := candidates[0].Provider; isDevin(p0) {
 		chatBody, _, err := translate.AnthropicToOpenAI(body)
 		if err != nil {
 			httperr.Invalid(w, "invalid anthropic body: "+err.Error())
@@ -3501,7 +3651,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, _ := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
 		if h.unroutedModel() {
 			noRouteFor(w, model)
@@ -3510,9 +3660,9 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
-	p := candidates[0]
+	p := candidates[0].Provider
 	// Per-member model override from a curated rule (rule-routed traffic only).
-	if override, ok := rule.ModelOverrideFor(p.ID); ok && override != model {
+	if override := candidates[0].ModelOverrideForRequest(); override != "" && override != model {
 		body = replaceModelInBody(body, override)
 		model = override
 	}

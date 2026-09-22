@@ -28,13 +28,13 @@ func (h *OrgHandler) ensureTables() {
 	if h.DB == nil {
 		return
 	}
-	_, _ = h.DB.Exec(`CREATE TABLE IF NOT EXISTS organizations(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at DATETIME NOT NULL)`)
-	_, _ = h.DB.Exec(`CREATE TABLE IF NOT EXISTS memberships(id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, user_id TEXT NOT NULL, role TEXT NOT NULL, created_at DATETIME NOT NULL)`)
-	_, _ = h.DB.Exec(`CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(org_id)`)
-	_, _ = h.DB.Exec(`ALTER TABLE providers ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
-	_, _ = h.DB.Exec(`ALTER TABLE gateway_keys ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
-	_, _ = h.DB.Exec(`CREATE INDEX IF NOT EXISTS idx_providers_org ON providers(org_id)`)
-	_, _ = h.DB.Exec(`CREATE INDEX IF NOT EXISTS idx_gateway_keys_org ON gateway_keys(org_id)`)
+	db.ExecSchemaIdempotent(h.DB, `CREATE TABLE IF NOT EXISTS organizations(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at DATETIME NOT NULL)`)
+	db.ExecSchemaIdempotent(h.DB, `CREATE TABLE IF NOT EXISTS memberships(id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE, user_id TEXT NOT NULL, role TEXT NOT NULL, created_at DATETIME NOT NULL)`)
+	db.ExecSchemaIdempotent(h.DB, `CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(org_id)`)
+	db.ExecAlterIdempotent(h.DB, `ALTER TABLE providers ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
+	db.ExecAlterIdempotent(h.DB, `ALTER TABLE gateway_keys ADD COLUMN org_id TEXT REFERENCES organizations(id)`)
+	db.ExecSchemaIdempotent(h.DB, `CREATE INDEX IF NOT EXISTS idx_providers_org ON providers(org_id)`)
+	db.ExecSchemaIdempotent(h.DB, `CREATE INDEX IF NOT EXISTS idx_gateway_keys_org ON gateway_keys(org_id)`)
 }
 
 func (h *OrgHandler) Routes(r chi.Router) {

@@ -22,14 +22,43 @@ services:
         required: false
     environment:
       PORT: 8080
-      DATABASE_URL: /data/gateway.db
+      # Postgres primary (recommended). Override with sqlite via
+      #   DATABASE_URL=/data/gateway.db
+      # in .env if you ever need the file-backed fallback.
+      DATABASE_URL: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
       # Optional shared cache / rate limiter — uncomment with the redis service:
       # REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./data:/data
     # No built-in healthcheck: the image ships without curl/wget and the
     # binary exposes no self-probe flag. Probe GET /health or /ready from
     # your orchestrator/load balancer instead.
+    restart: unless-stopped
+
+  # Postgres primary. First boot auto-creates the gateway database;
+  # the gateway runs all migrations itself on startup.
+  # Migrate existing SQLite data with:
+  #   go run ./scripts/migrate-sqlite-pg.go ./data/gateway.db \
+  #     "postgres://gateway:gateway@127.0.0.1:5433/gateway?sslmode=disable"
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_DB: gateway
+      # Dev default only — set POSTGRES_PASSWORD in .env for anything shared.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # Optional: Redis for multi-replica cache/rate-limit backends.
@@ -44,4 +73,5 @@ services:
   #   restart: unless-stopped
 
 volumes:
+  pgdata:
   redis-data:

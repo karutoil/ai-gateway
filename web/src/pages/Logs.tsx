@@ -21,6 +21,15 @@ function statusTone(s:number): 'good'|'warn'|'bad' {
   return s>=500 ? 'bad' : s>=400 ? 'warn' : 'good'
 }
 
+/** Cache disposition of one request — hit / miss / bypass / unknown (legacy rows). */
+function CacheState({ status }: { status?: string }) {
+  if (!status) return <span className="text-[10px] font-mono text-muted/40" title="Cache status not recorded (row predates cache reporting)">cache ·—</span>
+  if (status === 'hit') return <span className="text-[10px] font-mono text-accent" title="Answered from the gateway response cache (X-Cache: HIT) — no upstream call">cache·hit</span>
+  if (status === 'miss') return <span className="text-[10px] font-mono text-muted/70" title="Cache-eligible but not cached (X-Cache: MISS) — identical requests within the TTL replay from cache">cache·miss</span>
+  if (status === 'bypass') return <span className="text-[10px] font-mono text-muted/40" title="Not cache-eligible (X-Cache: BYPASS): streaming with the stream cache off, oversize body, or a non-cached endpoint">cache·bypass</span>
+  return <span className="text-[10px] font-mono text-muted/40">cache ·—</span>
+}
+
 /* ---------------- Structured message parsing ---------------- */
 
 type ChatMessage = {
@@ -269,12 +278,20 @@ function DetailBody({ detail, selected, keyMap }: {
       </div>
 
       {/* Usage metadata: finish reason + cache/reasoning token split */}
-      {((detail.log?.finish_reason ?? (detail as any).finish_reason) || (detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) || (detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens) || (detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens)) && (
+      {((detail.log?.finish_reason ?? (detail as any).finish_reason) || (detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) || (detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens) || (detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens) || (detail.log?.cache_hit ?? selected.cache_hit)) && (
         <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
           <div className="text-xs text-muted mb-2">Usage metadata</div>
           <div className="flex flex-wrap gap-2">
             {(detail.log?.finish_reason ?? (detail as any).finish_reason) && (
               <Badge tone="neutral">finish: {detail.log?.finish_reason ?? (detail as any).finish_reason}</Badge>
+            )}
+            {(detail.log?.cache_hit ?? selected.cache_hit) && (
+              <Badge tone="good">gateway cache hit</Badge>
+            )}
+            {(detail.log?.cache_status ?? (detail as any).cache_status) && (
+              <Badge tone={(detail.log?.cache_status ?? (detail as any).cache_status) === 'hit' ? 'good' : 'neutral'}>
+                cache: {detail.log?.cache_status ?? (detail as any).cache_status}
+              </Badge>
             )}
             {!!(detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) && (
               <Badge tone="good">cache read: {(detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens).toLocaleString()}</Badge>
@@ -806,7 +823,12 @@ export default function Logs(){
                   <Td className="whitespace-nowrap text-xs text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
                   <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}`}>{l.model}</span></Td>
                   <Td><span className="block font-mono text-xs truncate max-w-[110px] text-muted" title={String(l.provider_id||'')}>{l.provider_id || '—'}</span></Td>
-                  <Td className="text-center"><Badge tone={statusTone(l.status)} dot>{l.status}</Badge></Td>
+                  <Td className="text-center">
+                    <span className="inline-flex flex-col items-center gap-0.5">
+                      <Badge tone={statusTone(l.status)} dot>{l.status}</Badge>
+                      <CacheState status={(l as any).cache_status ?? ((l as any).cache_hit ? 'hit' : undefined)} />
+                    </span>
+                  </Td>
                   <Td className="text-right tabular-nums text-xs">{l.latency_ms}ms</Td>
                   <Td className="text-right tabular-nums text-xs">
                     <span className="block" title={`${l.prompt_tokens ?? 0} prompt · ${l.completion_tokens ?? 0} completion`}>

@@ -155,6 +155,10 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 
 	var pending []byte // partial SSE event carry-over between reads
 	var promptTok, completionTok int
+	// Usage detail (cache/reasoning/finish) harvested independently of body
+	// logging — same fix as pumpStream: the detail rides the billing parse
+	// so cache_read_tokens reports even with LOG_BODIES off.
+	var liveDetail usageDetail
 	sampleCap := h.sseSampleCap()
 	sample := &bytes.Buffer{}
 	// Assembled-text capture for the usage log (nil when body logging is off).
@@ -170,7 +174,7 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		copyHeader(w.Header(), resp.Header)
-		w.Header().Set("X-Cache", "MISS")
+		w.Header().Set("X-Cache", "BYPASS")
 		w.WriteHeader(resp.StatusCode)
 	}
 
@@ -233,7 +237,7 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		cost := h.costForModel(model, promptTok, completionTok)
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Bool("client_gone", clientGone).Msg("native responses stream terminated abnormally")
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture)
+		h.logRequestStreamed(keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
 		res.committed = true
 		return res
 	}
@@ -298,7 +302,7 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		}
 		cost := h.costForModel(model, promptTok, completionTok)
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture)
+		h.logRequestStreamed(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
 		res.committed = true
 		return res
 	}
@@ -717,7 +721,7 @@ func (h *Handler) emitTranslatedResponsesFailure(w http.ResponseWriter, model, k
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Cache", "MISS")
+	w.Header().Set("X-Cache", "BYPASS")
 	w.WriteHeader(http.StatusOK)
 
 	em := newSSEEventWriter(w, h)
@@ -786,8 +790,11 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		text        strings.Builder
 		promptTok   int
 		completeTok int
-		started     bool // headers committed + created/in_progress emitted
-		blockTypes  = map[int]string{}
+		// Usage detail (cache/reasoning/finish) harvested independently of
+		// body logging — cache_read_tokens reports even with LOG_BODIES off.
+		liveDetail usageDetail
+		started    bool // headers committed + created/in_progress emitted
+		blockTypes = map[int]string{}
 		// Tool-call accumulation (chat delta.tool_calls keyed by their
 		// index; anthropic tool_use blocks keyed by block index).
 		toolCalls = map[int]*respToolCall{}
@@ -851,7 +858,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Cache", "MISS")
+		w.Header().Set("X-Cache", "BYPASS")
 		w.WriteHeader(http.StatusOK)
 		em.emit("response.created", map[string]interface{}{"response": responseBase("in_progress")})
 		em.emit("response.in_progress", map[string]interface{}{"response": responseBase("in_progress")})
@@ -1199,6 +1206,18 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		// input/output_tokens spellings. Zero means "not present here" —
 		// never fabricated.
 		pt, ct, ud := extractUsageDetailFromMap(m)
+		if ud.CacheRead > 0 {
+			liveDetail.CacheRead = ud.CacheRead
+		}
+		if ud.CacheWrite > 0 {
+			liveDetail.CacheWrite = ud.CacheWrite
+		}
+		if ud.Reasoning > 0 {
+			liveDetail.Reasoning = ud.Reasoning
+		}
+		if ud.FinishReason != "" {
+			liveDetail.FinishReason = ud.FinishReason
+		}
 		if ud.CacheRead+ud.CacheWrite > 0 {
 			// Billing fold: ONLY anthropic cache fields are additive — OpenAI's
 			// prompt_tokens_details.cached_tokens is a breakdown of

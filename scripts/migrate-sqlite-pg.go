@@ -1,6 +1,9 @@
 package main
 
-// Copy SQLite production data into Postgres (schema already migrated).
+// Copy SQLite production data into Postgres (schema already migrated:
+// boot the gateway once against the target first). Each table copies in one
+// transaction with ON CONFLICT DO NOTHING (re-runnable for delta passes).
+// schema_migrations is intentionally skipped — the target stamps its own.
 // Usage: go run ./scripts/migrate-sqlite-pg.go <sqlite-path> <postgres-url>
 import (
 	"database/sql"
@@ -13,7 +16,6 @@ import (
 )
 
 var tables = []string{
-	"schema_migrations",
 	"organizations",
 	"dashboard_users",
 	"providers",
@@ -22,6 +24,7 @@ var tables = []string{
 	"model_aliases",
 	"system_config",
 	"audit_logs",
+	"response_turns",
 	"request_logs",
 	"memberships",
 	"lb_rules",
@@ -35,10 +38,12 @@ var tables = []string{
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Println("usage: migrate-sqlite-pg.go <sqlite-path> <postgres-url>")
+	if len(os.Args) != 3 && !(len(os.Args) == 4 && os.Args[3] == "verify") {
+		fmt.Println("usage: migrate-sqlite-pg.go <sqlite-path> <postgres-url> [verify]")
+		fmt.Println("  copy (default) then verify counts; 'verify' alone only compares")
 		os.Exit(2)
 	}
+	verifyOnly := len(os.Args) == 4
 	src, err := sql.Open("sqlite3", os.Args[1])
 	if err != nil {
 		panic(err)
@@ -49,6 +54,9 @@ func main() {
 		panic(err)
 	}
 	defer dst.Close()
+	if verifyOnly {
+		os.Exit(verifyCounts(src, dst))
+	}
 	if _, err := dst.Exec("SET session_replication_role='replica'"); err != nil {
 		fmt.Println("warn: cannot disable FK checks:", err)
 	}
@@ -100,7 +108,21 @@ func main() {
 		}
 		stmt := fmt.Sprintf(`INSERT INTO "%s" ("%s") VALUES (%s) ON CONFLICT DO NOTHING`,
 			t, strings.Join(cols, `","`), strings.Join(place, ","))
+		tx, err := dst.Begin()
+		if err != nil {
+			fmt.Printf("%s: begin fail %v\n", t, err)
+			sel.Close()
+			continue
+		}
+		istmt, err := tx.Prepare(stmt)
+		if err != nil {
+			fmt.Printf("%s: prepare fail %v\n", t, err)
+			sel.Close()
+			_ = tx.Rollback()
+			continue
+		}
 		copied := 0
+		failed := false
 		for sel.Next() {
 			vals := make([]any, len(cols))
 			ptrs := make([]any, len(cols))
@@ -109,6 +131,7 @@ func main() {
 			}
 			if err := sel.Scan(ptrs...); err != nil {
 				fmt.Printf("%s: scan fail %v\n", t, err)
+				failed = true
 				break
 			}
 			for i, c := range cols {
@@ -125,13 +148,65 @@ func main() {
 					vals[i] = !(s == "0" || s == "" || s == "false" || s == "f")
 				}
 			}
-			if _, err := dst.Exec(stmt, vals...); err != nil {
+			if _, err := istmt.Exec(vals...); err != nil {
 				fmt.Printf("%s: insert fail %v\n", t, err)
+				failed = true
 				break
 			}
 			copied++
 		}
 		sel.Close()
+		_ = istmt.Close()
+		if failed {
+			_ = tx.Rollback()
+			fmt.Printf("%s: ROLLED BACK after %d rows\n", t, copied)
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			fmt.Printf("%s: commit fail %v\n", t, err)
+			continue
+		}
 		fmt.Printf("%s: copied %d rows\n", t, copied)
 	}
+	fmt.Println("---- verifying ----")
+	os.Exit(verifyCounts(src, dst))
+}
+
+// verifyCounts compares per-table row counts; exit 0 when every source row
+// is present on the target (target may hold extra rows, e.g. a fresher
+// models.dev catalog sync — reported, not failed).
+func verifyCounts(src, dst *sql.DB) int {
+	bad := 0
+	for _, t := range tables {
+		var srcName string
+		if err := src.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, t).Scan(&srcName); err != nil {
+			fmt.Printf("%-22s absent in sqlite, nothing to migrate\n", t)
+			continue
+		}
+		var a, b int
+		if err := src.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, t)).Scan(&a); err != nil {
+			fmt.Printf("%-22s sqlite unreadable: %v\n", t, err)
+			bad++
+			continue
+		}
+		if err := dst.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, t)).Scan(&b); err != nil {
+			fmt.Printf("%-22s pg unreadable: %v\n", t, err)
+			bad++
+			continue
+		}
+		status := "ok"
+		if b < a {
+			status = "MISSING ROWS"
+			bad++
+		} else if b > a {
+			status = "ok (target has extra rows)"
+		}
+		fmt.Printf("%-22s sqlite=%-7d pg=%-7d %s\n", t, a, b, status)
+	}
+	if bad > 0 {
+		fmt.Printf("%d TABLE(S) NEED ATTENTION\n", bad)
+		return 1
+	}
+	fmt.Println("VERIFY PASSED")
+	return 0
 }

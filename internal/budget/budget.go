@@ -200,11 +200,29 @@ func (d *DBLimiter) backfillFromRequestLogs() {
 			return
 		}
 		for _, a := range aggs {
-			d.seedLocked(countersKey(a.prefix), period, start, a.tokens, usdToMicros(a.cost))
+			d.seedOrRepairLocked(countersKey(a.prefix), period, start, a.tokens, usdToMicros(a.cost))
 		}
 	}
 	seed("day", day)
 	seed("month", month)
+}
+
+// repairTailSQL is the ON CONFLICT clause for backfill: the stored total is
+// raised to the historical sum ONLY when it is lower. Updates that failed
+// (e.g. the Postgres int4 overflow that froze month counters) leave the row
+// behind history; retention purges leave history behind the row — this
+// direction-aware max repairs the former and never undoes the latter.
+func repairTailSQL() string {
+	if db.Dialect() == "postgres" {
+		return ` ON CONFLICT(scope,period,start_utc) DO UPDATE SET` + `
+	tokens = CASE WHEN spend_counters.tokens < excluded.tokens THEN excluded.tokens ELSE spend_counters.tokens END,` + `
+	cost_micros = CASE WHEN spend_counters.cost_micros < excluded.cost_micros THEN excluded.cost_micros ELSE spend_counters.cost_micros END,` + `
+	updated_at = excluded.updated_at`
+	}
+	return ` ON CONFLICT(scope,period,start_utc) DO UPDATE SET` + `
+	tokens = MAX(tokens, excluded.tokens),` + `
+	cost_micros = MAX(cost_micros, excluded.cost_micros),` + `
+	updated_at = excluded.updated_at`
 }
 
 // usdToMicros converts a float USD amount into integer micro-USD (1e-6).
@@ -249,13 +267,13 @@ func (d *DBLimiter) recordLocked(scope, period string, start time.Time, tokensDe
 	return err
 }
 
-// seedLocked seeds a counter row from authoritative history exactly once:
-// an existing row already reflects all live increments, so re-seeding would
-// double-count. Idempotent via DO NOTHING.
-func (d *DBLimiter) seedLocked(scope, period string, start time.Time, tokens, costMicros int64) error {
+// seedOrRepairLocked seeds a counter row, or raises an existing one to the
+// historical sum when it has fallen behind (failed updates). Monotonic: a
+// stored total higher than history (retention purges, live increments) is
+// never lowered.
+func (d *DBLimiter) seedOrRepairLocked(scope, period string, start time.Time, tokens, costMicros int64) error {
 	_, err := d.DB.Exec(
-		db.Q(`INSERT INTO spend_counters(scope,period,start_utc,tokens,cost_micros,updated_at) VALUES(?,?,?,?,?,?)`)+
-			` ON CONFLICT(scope,period,start_utc) DO NOTHING`,
+		db.Q(`INSERT INTO spend_counters(scope,period,start_utc,tokens,cost_micros,updated_at) VALUES(?,?,?,?,?,?)`)+repairTailSQL(),
 		scope, period, start.Format(time.RFC3339Nano), tokens, costMicros, time.Now().UTC())
 	return err
 }

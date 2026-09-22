@@ -280,6 +280,10 @@ func (s *Service) upsert(p *models.Provider, m rawModel) error {
 		// don't overwrite manual
 		return nil
 	}
+	if err == sql.ErrNoRows && s.isExcluded(p.ID, m.ID) {
+		// Operator removed this model; only a manual add brings it back.
+		return nil
+	}
 	if err == nil {
 		_, err = s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, source=?, updated_at=? WHERE id=?`),
 			m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), existingID)
@@ -428,8 +432,28 @@ func (s *Service) UpdateManual(id string, upd models.ProviderModel) error {
 }
 
 func (s *Service) Delete(id string) error {
-	_, err := s.db.Exec(db.Q(`DELETE FROM provider_models WHERE id=?`), id)
-	return err
+	var providerID, modelID string
+	err := s.db.QueryRow(db.Q(`SELECT provider_id, model_id FROM provider_models WHERE id=?`), id).Scan(&providerID, &modelID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(db.Q(`DELETE FROM provider_models WHERE id=?`), id); err != nil {
+		tx.Rollback()
+		return err
+	}
+	// Remember the removal so the next auto-discovery does not reinsert it.
+	if err := s.excludeTx(tx, providerID, modelID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel) (string, error) {
@@ -441,9 +465,25 @@ func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel
 			maxOut = cm.MaxOutput
 		}
 	}
-	_, err := s.db.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	// A manual add is the only way back in after a removal.
+	if _, err := tx.Exec(db.Q(`DELETE FROM provider_model_exclusions WHERE provider_id=? AND model_id=?`), providerID, modelID); err != nil {
+		tx.Rollback()
+		return "", err
+	}
+	_, err = tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		id, providerID, modelID, upd.DisplayName, upd.OwnedBy, ctx, maxOut, upd.InputCost, upd.OutputCost, upd.CacheReadCost, upd.CacheWriteCost, upd.Reasoning, upd.ToolCall, upd.StructuredOutput, upd.Attachment, upd.Modalities, upd.ReasoningType, upd.ReasoningLevels, upd.ReasoningOutputLimits, "manual", time.Now().UTC(), time.Now().UTC())
-	return id, err
+	if err != nil {
+		tx.Rollback()
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *Service) DiscoverAll() (int, error) {

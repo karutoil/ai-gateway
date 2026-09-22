@@ -101,15 +101,15 @@ RequestID -> Recovery -> Logger -> audit.Middleware -> forwardedHeaders -> secur
 
 ## Data Model
 
-Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 011_routing_strategies.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). Highlights:
+Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 020_lb_rules_member_options.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). Highlights:
 
 - `providers` (AES-GCM `api_key_enc`, `base_url`, `health_status`, optional `org_id`)
 - `gateway_keys` (prefix + SHA256 hash, RPM/RPH/RPD/TPM, daily/monthly token & cost limits, `allowed_models`, optional `org_id`)
-- `request_logs` (model/endpoint/status/latency/ttft, tokens, cost, stream flag, optional bodies, error)
+- `request_logs` (model/endpoint/status/latency/ttft, tokens, cost, stream flag, optional bodies, error, `cache_hit` for gateway response-cache hits)
 - `models_catalog`, `provider_models`, `model_aliases`, `system_config`
 - `audit_logs` (actor, action, target, meta)
 - `organizations`, `memberships` (org scaffold; org scope resolved from memberships)
-- `lb_rules` (per-model provider groups: ordered members with `strategy`, `model_override`, `weight`)
+- `lb_rules` (per-model ordered option groups: `provider_id` + `model_override` + `strategy` + `weight`; a provider may repeat with distinct models)
 
 SQLite (WAL, single-conn writes) is the default dialect; `postgres://` DSNs switch to lib/pq — functional but **beta** (not yet soak-tested).
 
@@ -138,9 +138,9 @@ Reasoning mapping: OpenAI `reasoning_effort` (low/medium/high/max) <-> Anthropic
 
 ## Routing, Resilience & Metering (all wired)
 
-- **Routing rules** (`lb`): per-model provider group with a **strategy** — `round_robin` (default; rotate evenly across requests), `random`, `weighted` (per-member weight 1–100, proportional pick), or `failover` (first healthy member in position order; later members only on retriable failure — the only strategy with cross-provider failover). Down members and open circuits are skipped where a healthy sibling exists; non-failover strategies serve each request with ONE member (a failing member returns its own error after same-provider retries). Members may carry a `model_override` — the model id rewritten onto the outbound request for that member. Unrouted bare model names are rejected with **404 `model_not_routed`**; `ROUTING_LEGACY_FALLBACK=true` restores the old heuristic resolution (provider-models ownership, name heuristics, default provider) as a migration escape hatch. Qualified `provider/model` IDs and `X-Provider:` pin requests bypass rules; aliases resolve first. Model lists for rules come from per-provider discovery (`POST /api/providers/{id}/discover` fetches the provider's `/models` API).
+- **Routing rules** (`lb`): per-model ordered groups of **(provider, model) options** with a **strategy** — `round_robin` (default; rotate evenly across requests), `random`, `weighted` (per-member weight 1–100, proportional pick), or `failover` (first healthy member in position order; later members only on retriable failure — the only strategy with cross-provider failover). A provider may appear multiple times in one rule with different `model_override` values (e.g. `openai+gpt-4o` and `openai+gpt-4o-mini` as separate options); exact duplicate (provider, model) pairs are rejected. Down members and open circuits are skipped where a healthy sibling exists; non-failover strategies serve each request with ONE member (a failing member returns its own error after same-provider retries). Each member may carry a `model_override` — the model id rewritten onto the outbound request for that member. Unrouted bare model names are rejected with **404 `model_not_routed`**; `ROUTING_LEGACY_FALLBACK=true` restores the old heuristic resolution (provider-models ownership, name heuristics, default provider) as a migration escape hatch. Qualified `provider/model` IDs and `X-Provider:` pin requests bypass rules; aliases resolve first. Model lists for rules come from per-provider discovery (`POST /api/providers/{id}/discover` fetches the provider's `/models` API).
 - **Retries**: `RETRY_MAX_RETRIES` (default 2) with exponential backoff on 5xx/429 — only while **nothing is committed**; streaming requests retry until the first byte is committed, then fail honestly.
-- **Cache**: exact-match response cache (`X-Cache: HIT|MISS`), in-memory or Redis; `CACHE_TTL_SECONDS`.
+- **Cache**: exact-match response cache (`X-Cache: HIT|MISS|BYPASS`), in-memory or Redis; `CACHE_TTL_SECONDS`. `CACHE_STREAMS=true` (opt-in) extends it to streaming requests: a clean stream's exact client-bound SSE bytes are stored (bounded to 1 MiB) and replayed verbatim for identical requests — the classic cache only ever serves non-streaming traffic. Every request logs its cache disposition (`request_logs.cache_status`: `hit` / `miss` / `bypass`, mirrored by the `X-Cache` header; the models-list endpoint logs rows too), cached responses carry `cache_hit=1` (zero tokens — not re-billed), and the dashboard shows the state per request (Requests list, detail, Analytics hit/miss/bypass breakdown with the rate over eligible requests) plus Prometheus `gateway_cache_hits_total`. Request bodies up to 4 MiB are cache-eligible (agentic prompts run large); larger bodies bypass.
 - **Budgets**: per-key daily/monthly token + cost quotas enforced in `budget.Middleware` with a ledger (`429 over_quota_error`).
 - **Usage metering**: `STREAM_USAGE_INJECT` (default **true**) injects `include_usage` so OpenAI-compatible streams are metered; opt out with `STREAM_USAGE_INJECT=0`.
 - **Webhooks**: `webhook.Global` delivers audit + billing-export + over-quota events asynchronously (bounded queue, 2 attempts); `WEBHOOK_SECRET` signs deliveries as `X-Webhook-Signature: sha256=<hex HMAC>`.

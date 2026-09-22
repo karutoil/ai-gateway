@@ -53,6 +53,11 @@ type Config struct {
 	MaxProxyBodyMB            int // proxy request-body cap in MiB (0 = unlimited)
 
 	CacheTTLSeconds int
+	// CacheStreams extends the exact-match response cache to STREAMING
+	// requests (opt-in): a clean stream's exact SSE bytes are stored and
+	// replayed verbatim for identical requests. Most production traffic is
+	// streaming, which the classic non-stream cache can never serve.
+	CacheStreams bool
 
 	RetryMaxRetries  int
 	RetryBaseDelayMs int
@@ -365,6 +370,7 @@ func Load() (*Config, error) {
 		MaxProxyBodyMB: getInt("MAX_PROXY_BODY_MB", 64),
 
 		CacheTTLSeconds: getInt("CACHE_TTL_SECONDS", 10),
+		CacheStreams:    getBool("CACHE_STREAMS"),
 
 		RetryMaxRetries:  getInt("RETRY_MAX_RETRIES", 2),
 		RetryBaseDelayMs: getInt("RETRY_BASE_DELAY_MS", 200),

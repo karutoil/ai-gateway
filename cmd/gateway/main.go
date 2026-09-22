@@ -161,6 +161,10 @@ func main() {
 		proxyHandler.MaxBodyBytes = int64(cfg.MaxProxyBodyMB) << 20
 	}
 	proxyHandler.CacheTTLSeconds = cfg.CacheTTLSeconds
+	proxyHandler.CacheStreams = cfg.CacheStreams
+	if cfg.CacheStreams {
+		log.Info().Int("ttl_seconds", cfg.CacheTTLSeconds).Msg("stream response cache enabled: identical streaming requests replay the cached SSE bytes (X-Cache: HIT)")
+	}
 	proxyHandler.LogBodies = cfg.LogBodies
 	proxyHandler.BodyLogMaxBytes = cfg.BodyLogMaxBytes
 	proxyHandler.StreamUsageInject = cfg.StreamUsageInject
@@ -426,19 +430,23 @@ func main() {
 		})
 	})
 
+	// Per-key gateway rate limits for /v1/* (and the bare aliases): key RPM
+	// wins (default 60 when unset), plus any RPH/RPD ceilings.
+	gatewayRateLimits := func(req *http.Request) middleware.RateLimits {
+		if k, ok := middleware.GatewayKeyFromContext(req.Context()); ok && k != nil {
+			rpm := k.RateLimitRPM
+			if rpm == 0 {
+				rpm = 60
+			}
+			return middleware.RateLimits{RPM: rpm, RPH: k.RateLimitRPH, RPD: k.RateLimitRPD}
+		}
+		return middleware.RateLimits{RPM: 60}
+	}
+
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.GatewayAuthWithJWTRevocation(apiKeyStore, cfg.JWTSecret, userStore))
 		r.Use(budget.Middleware(limiter))
-		r.Use(middleware.GatewayRateLimitWithLimits(rl, func(req *http.Request) middleware.RateLimits {
-			if k, ok := middleware.GatewayKeyFromContext(req.Context()); ok && k != nil {
-				rpm := k.RateLimitRPM
-				if rpm == 0 {
-					rpm = 60
-				}
-				return middleware.RateLimits{RPM: rpm, RPH: k.RateLimitRPH, RPD: k.RateLimitRPD}
-			}
-			return middleware.RateLimits{RPM: 60}
-		}))
+		r.Use(middleware.GatewayRateLimitWithLimits(rl, gatewayRateLimits))
 		r.Post("/v1/chat/completions", proxyHandler.ChatCompletions)
 		r.Post("/chat/completions", proxyHandler.ChatCompletions)
 		r.Post("/v1/completions", proxyHandler.Completions)
@@ -447,13 +455,33 @@ func main() {
 		r.Post("/embeddings", proxyHandler.Embeddings)
 		r.Get("/v1/models", proxyHandler.Models)
 		r.Get("/v1/models/{id}", proxyHandler.GetModel)
-		r.Get("/models", proxyHandler.Models)
 		// Anthropic compat — handle both /v1/messages and /messages for SDK baseURL flexibility
 		r.Post("/v1/messages", proxyHandler.AnthropicMessages)
 		r.Post("/messages", proxyHandler.AnthropicMessages)
 		// Responses API — both with and without /v1
 		r.Post("/v1/responses", proxyHandler.Responses)
 		r.Post("/responses", proxyHandler.Responses)
+	})
+
+	// The bare GET /models alias (for SDK baseURLs without /v1) collides with
+	// the dashboard's client-side /models screen: a browser refresh there
+	// must serve the SPA, not the gateway's JSON model list. It cannot live
+	// inside the gateway-auth group above — auth answers (401 envelope or
+	// raw JSON) before any SPA fallback could run — so API requests are
+	// dispatched to a private sub-router carrying the exact same middleware
+	// chain (gateway auth + budget + rate limits), while browser navigations
+	// (Accept: text/html) fall through to the embedded UI.
+	gatewayModelsAPI := chi.NewRouter()
+	gatewayModelsAPI.Use(middleware.GatewayAuthWithJWTRevocation(apiKeyStore, cfg.JWTSecret, userStore))
+	gatewayModelsAPI.Use(budget.Middleware(limiter))
+	gatewayModelsAPI.Use(middleware.GatewayRateLimitWithLimits(rl, gatewayRateLimits))
+	gatewayModelsAPI.Get("/models", proxyHandler.Models)
+	r.Get("/models", func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept"), "text/html") {
+			serveWeb(database)(w, r)
+			return
+		}
+		gatewayModelsAPI.ServeHTTP(w, r)
 	})
 
 	// openapi: served from the embedded spec so the binary is self-contained

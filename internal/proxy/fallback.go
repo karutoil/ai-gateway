@@ -134,26 +134,33 @@ func orgAllows(keyOrg string, p *models.Provider) bool {
 
 func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) []*models.Provider {
 	cands, _ := h.candidateProvidersWithRule(rawModel, model, hint, keyOrg, pred)
-	return cands
+	out := make([]*models.Provider, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.Provider)
+	}
+	return out
 }
 
 // candidateProvidersWithRule is candidateProviders plus the curated rule that
-// governed selection (nil for pins, legacy resolution, or no-route). Callers
-// pass it to proxyCandidates so per-member model overrides apply only to
-// rule-routed traffic — never to pinned requests.
-func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) ([]*models.Provider, *lb.Rule) {
-	out := make([]*models.Provider, 0, 1)
+// governed selection (nil for pins, legacy resolution, or no-route). Each
+// returned candidate carries its own rule member — and with it that member's
+// model override — so rules with several options on one provider route
+// correctly. Callers pass the rule to proxyCandidates for strategy context
+// (e.g. logging); overrides come from the candidates, never by provider id.
+func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) ([]lb.Candidate, *lb.Rule) {
+	out := make([]lb.Candidate, 0, 1)
 	consider := func(p *models.Provider) bool {
 		if p == nil || p.ID == "" || (pred != nil && !pred(p)) {
 			return false
 		}
-		out = append(out, p)
+		out = append(out, lb.Candidate{Provider: p})
 		return true
 	}
 
-	// 1. Explicit provider hint = hard pin.
+	// 1. Explicit provider hint = hard pin (case-insensitive: display names
+	// keep their casing, e.g. "AIHubMix", while callers send any case).
 	if hint != "" {
-		if p, err := h.ProviderStore.GetByName(hint); err == nil && orgAllows(keyOrg, p) {
+		if p, err := h.ProviderStore.GetByNameCI(hint); err == nil && orgAllows(keyOrg, p) {
 			consider(p)
 			return out, nil
 		}
@@ -169,7 +176,7 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 	if idx := strings.Index(model, "/"); idx > 0 {
 		prefix := strings.ToLower(strings.TrimSpace(model[:idx]))
 		if prefix != "" {
-			if p, err := h.ProviderStore.GetByName(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
+			if p, err := h.ProviderStore.GetByNameCI(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
 				return out, nil
 			}
 			if p, err := h.ProviderStore.GetByType(prefix); err == nil && orgAllows(keyOrg, p) && consider(p) {
@@ -180,7 +187,7 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 
 	// 3. Curated LB rule (checked on post-alias model name first, then the
 	// raw/alias spelling). The rule's strategy orders healthy members;
-	// failover rules hand the full ordering to proxyCandidates as ordered
+	// failover rules hand the whole ordering to proxyCandidates as ordered
 	// fallback candidates.
 	if h.LB != nil {
 		for _, key := range []string{model, rawModel} {
@@ -189,15 +196,15 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 				continue
 			}
 			if rule := h.LB.RuleForModel(key); rule != nil {
-				ordered := h.LB.Select(rule)
+				ordered := h.LB.SelectCandidates(rule)
 				if len(ordered) == 0 {
 					continue
 				}
 				// Org-scoped keys may only route to providers their org
 				// owns (or global ones).
-				eligible := make([]*models.Provider, 0, len(ordered))
+				eligible := make([]lb.Candidate, 0, len(ordered))
 				for _, cand := range ordered {
-					if orgAllows(keyOrg, cand) {
+					if orgAllows(keyOrg, cand.Provider) {
 						eligible = append(eligible, cand)
 					}
 				}
@@ -210,9 +217,7 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 					// retriable failures.
 					picked = eligible
 				}
-				for _, p := range picked {
-					consider(p)
-				}
+				out = append(out, picked...)
 				return out, rule
 			}
 		}
@@ -256,12 +261,12 @@ func shouldFailoverFrom(status int) bool {
 	return status >= 500
 }
 
-func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []*models.Provider, rule *lb.Rule, prepare prepareFn) {
+func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []lb.Candidate, rule *lb.Rule, prepare prepareFn) {
 	if len(candidates) == 0 {
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
 	}
-	primaryID := candidates[0].ID
+	primaryID := candidates[0].Provider.ID
 
 	// One client-facing first-byte budget per client request, shared across
 	// the whole candidate chain: every upstream attempt is bounded by the
@@ -299,13 +304,16 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		chain []providerAttempt
 	)
 
-	for idx, p := range candidates {
-		// Per-member model override: rule members may send a different model
-		// id upstream (e.g. a pinned date version). Only rule-routed traffic
-		// gets rewrites — pins and legacy routes have no rule, hence no
-		// override. The override also feeds usage logging via candModel below.
+	for idx, cand := range candidates {
+		p := cand.Provider
+		// Per-member model override: each rule member may send a different
+		// model id upstream (e.g. a pinned date version, or a sibling model
+		// on the same provider). The override travels on the candidate — a
+		// rule may list one provider several times with different models.
+		// Pins and legacy routes carry no member, hence no override. The
+		// override also feeds usage logging via candModel below.
 		candBody, candModel := body, model
-		if override, ok := rule.ModelOverrideFor(p.ID); ok && override != model {
+		if override := cand.ModelOverrideForRequest(); override != "" && override != model {
 			candBody = replaceModelInBody(body, override)
 			candModel = override
 		}
@@ -316,7 +324,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		attempted = true
 
 		fallbackName := ""
-		if p.ID != primaryID && idx > 0 && candidates[0] != nil {
+		if p.ID != primaryID && idx > 0 && candidates[0].Provider != nil {
 			fallbackName = p.Name
 		}
 		callOpts := proxyOpts{fallbackFrom: fallbackName, attempts: chain, rule: rule, ttfb: ttfb}
@@ -370,7 +378,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		if bw.code > 0 && bw.code < 400 {
 			if p.ID != primaryID {
 				bw.Header().Set("X-Fallback-Used", p.Name)
-				log.Info().Str("fallback_used", p.Name).Str("from", candidates[0].Name).Str("model", model).Msg("fallback_used")
+				log.Info().Str("fallback_used", p.Name).Str("from", candidates[0].Provider.Name).Str("model", model).Msg("fallback_used")
 			}
 			bw.flushTo(w)
 			return

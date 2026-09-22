@@ -273,8 +273,10 @@ func TestResponsesStreamChatGoldenSequence(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Fatalf("expected text/event-stream, got %q", ct)
 	}
-	if v := resp.Header.Get("X-Cache"); v != "MISS" {
-		t.Fatalf("expected X-Cache MISS header, got %q", v)
+	// The responses endpoint does not consult the response cache, so its
+	// disposition is BYPASS (never a misleading MISS).
+	if v := resp.Header.Get("X-Cache"); v != "BYPASS" {
+		t.Fatalf("expected X-Cache BYPASS header, got %q", v)
 	}
 
 	raw, rawErr := io.ReadAll(resp.Body)

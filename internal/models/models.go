@@ -106,6 +106,13 @@ type RequestLog struct {
 	CacheReadTokens  int       `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int       `json:"cache_write_tokens,omitempty"`
 	ReasoningTokens  int       `json:"reasoning_tokens,omitempty"`
+	// CacheHit marks rows served from the gateway's exact-match response
+	// cache (X-Cache: HIT) — distinct from the upstream prompt-cache token
+	// counters above.
+	CacheHit bool `json:"cache_hit,omitempty"`
+	// CacheStatus is the request's disposition against the response cache:
+	// hit | miss | bypass. NULL on rows written before it existed.
+	CacheStatus string `json:"cache_status,omitempty"`
 }
 
 // CatalogModel is enriched from models.dev

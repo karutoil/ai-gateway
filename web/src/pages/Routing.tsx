@@ -21,13 +21,17 @@ type ProviderModelRow = {
 }
 
 const STRATEGIES: { value: RoutingStrategy; label: string; hint: string }[] = [
-  { value: 'round_robin', label: 'Round robin', hint: 'Rotate evenly across members, one provider per request.' },
-  { value: 'random', label: 'Random', hint: 'Pick a healthy member at random per request.' },
-  { value: 'weighted', label: 'Weighted', hint: 'Split traffic proportionally to each member\u2019s weight (1\u2013100).' },
-  { value: 'failover', label: 'Failover', hint: 'Always use the first healthy member in order; later members only on failure.' },
+  { value: 'round_robin', label: 'Round robin', hint: 'Rotate evenly across options, one per request.' },
+  { value: 'random', label: 'Random', hint: 'Pick a healthy option at random per request.' },
+  { value: 'weighted', label: 'Weighted', hint: 'Split traffic proportionally to each option\u2019s weight (1\u2013100).' },
+  { value: 'failover', label: 'Failover', hint: 'Always use the first healthy option in order; later ones only on failure.' },
 ]
 
-type BuilderMember = LBMemberInput & { name?: string; type?: string; health_status?: string | null }
+/** One builder row = one routing option: a specific provider + specific model. */
+type BuilderMember = LBMemberInput & { uid: string; name?: string; type?: string; health_status?: string | null }
+
+let uidSeq = 0
+const nextUid = () => `m${++uidSeq}`
 
 export default function Routing({ role = 'admin' }: { role?: string }){
   // LB rules (read AND write) are admin-only server-side.
@@ -39,12 +43,15 @@ export default function Routing({ role = 'admin' }: { role?: string }){
   const [providerModels, setProviderModels] = useState<ProviderModelRow[]>([])
   const [discovering, setDiscovering] = useState(false)
 
-  // Builder state. `members` holds ordered member inputs; array order is the
-  // member position / failover order sent to PUT /lb/rules/{model}.
+  // Builder state. `members` holds ordered option inputs; array order is the
+  // member position / failover order sent to PUT /lb/rules/{model}. The same
+  // provider may appear multiple times with different models — each row is
+  // keyed by uid, not provider id.
   const [model, setModel] = useState('')
   const [strategy, setStrategy] = useState<RoutingStrategy>('round_robin')
   const [members, setMembers] = useState<BuilderMember[]>([])
   const [editing, setEditing] = useState<string | null>(null) // model being edited; null = creating
+  const [pickerId, setPickerId] = useState('')
 
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -99,7 +106,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     return Array.from(ids).sort((a,b)=> a.localeCompare(b))
   }, [providerModels, rules])
 
-  // Discovered model ids for a given provider (override dropdown options).
+  // Discovered model ids for a given provider (option model dropdowns).
   const modelsOfProvider = useMemo(()=>{
     const byProvider = new Map<string, string[]>()
     for(const pm of providerModels){
@@ -130,27 +137,46 @@ export default function Routing({ role = 'admin' }: { role?: string }){
 
   const metaOf = (id:string): ProviderRow => providerMeta.get(id) ?? { id, name:id, type:'', health_status:null }
 
-  const addProvider = (id:string)=>{
-    if(members.some(m=> m.provider_id === id)) return
-    const meta = providerMeta.get(id)
+  /** Uniqueness key for an option: (provider, model) pair — mirrors the backend. */
+  const optionKey = (providerId: string, override?: string) =>
+    `${providerId}\u0000${(override || '').trim().toLowerCase()}`
+
+  // Duplicate options block saving: two identical (provider, model) pairs can
+  // never be distinguished at request time.
+  const duplicateUids = useMemo(()=>{
+    const seen = new Map<string, boolean>()
+    const dup = new Map<string, boolean>()
+    for(const m of members){
+      const k = optionKey(m.provider_id, m.model_override)
+      if(seen.get(k)) dup.set(m.uid, true)
+      else seen.set(k, false)
+    }
+    return dup
+  }, [members])
+  const hasDuplicates = duplicateUids.size > 0
+
+  const addOption = (providerId: string)=>{
+    if(!providerId) return
+    const meta = providerMeta.get(providerId)
     const w = strategy === 'weighted' ? 50 : undefined
-    setMembers(prev => [...prev, { provider_id: id, weight: w, name: meta?.name, type: meta?.type, health_status: meta?.health_status }])
+    setMembers(prev => [...prev, { uid: nextUid(), provider_id: providerId, weight: w, name: meta?.name, type: meta?.type, health_status: meta?.health_status }])
   }
-  const removeMember = (id:string)=> setMembers(prev => prev.filter(m=> m.provider_id !== id))
-  const moveMember = (idx:number, dir:-1|1)=>{
+  const removeMember = (uid:string)=> setMembers(prev => prev.filter(m=> m.uid !== uid))
+  const moveMember = (uid:string, dir:-1|1)=>{
     setMembers(prev=>{
-      const next = [...prev]
+      const idx = prev.findIndex(m=> m.uid === uid)
       const to = idx + dir
-      if(to < 0 || to >= next.length) return prev
+      if(idx < 0 || to < 0 || to >= prev.length) return prev
+      const next = [...prev]
       ;[next[idx], next[to]] = [next[to], next[idx]]
       return next
     })
   }
-  const setMemberOverride = (id:string, override:string)=>{
-    setMembers(prev => prev.map(m=> m.provider_id === id ? { ...m, model_override: override || undefined } : m))
+  const setMemberOverride = (uid:string, override:string)=>{
+    setMembers(prev => prev.map(m=> m.uid === uid ? { ...m, model_override: override || undefined } : m))
   }
-  const setMemberWeight = (id:string, weight:number)=>{
-    setMembers(prev => prev.map(m=> m.provider_id === id ? { ...m, weight } : m))
+  const setMemberWeight = (uid:string, weight:number)=>{
+    setMembers(prev => prev.map(m=> m.uid === uid ? { ...m, weight } : m))
   }
 
   const startEdit = (r:LBRule)=>{
@@ -158,6 +184,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     setModel(r.model)
     setStrategy(r.strategy || 'round_robin')
     setMembers((r.providers || []).map(m=> ({
+      uid: nextUid(),
       provider_id: m.provider_id,
       weight: m.weight || undefined,
       model_override: m.model_override || undefined,
@@ -166,7 +193,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     setErr('')
     requestAnimationFrame(()=> builderRef.current?.scrollIntoView({ behavior:'smooth', block:'start' }))
   }
-  const resetBuilder = ()=>{ setEditing(null); setModel(''); setMembers([]); setStrategy('round_robin'); setErr('') }
+  const resetBuilder = ()=>{ setEditing(null); setModel(''); setMembers([]); setStrategy('round_robin'); setErr(''); setPickerId('') }
 
   const save = async ()=>{
     const m = model.trim().toLowerCase()
@@ -207,7 +234,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     }
   }
 
-  const canSave = !!model.trim() && members.length > 0 && !busy
+  const canSave = !!model.trim() && members.length > 0 && !hasDuplicates && !busy
   const activeStrategy = STRATEGIES.find(s=> s.value === strategy)
 
   /** Ordered-member chip controls share one ghost icon-button style. */
@@ -220,7 +247,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
         eyebrow="Connect · Traffic shaping"
         title="Routing"
         description={
-          'Bare model names fan out through provider groups — round robin, random, weighted, or failover. Pin with openai/gpt-4o or X-Provider to bypass.'
+          'Bare model names fan out through ordered provider+model options — round robin, random, weighted, or failover. Add as many options as you want, several per provider. Pin with openai/gpt-4o or X-Provider to bypass.'
         }
         actions={
           <div className="flex items-center gap-2">
@@ -258,7 +285,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           <EmptyState
             icon="route"
             title="No routing rules yet."
-            hint="Build a provider group below for a bare model name. Requests without a rule or a pin are rejected with model_not_routed, so every model your clients call should have a group (or be pinned with provider/model)."
+            hint="Build a group of provider+model options below for a bare model name. Requests without a rule or a pin are rejected with model_not_routed, so every model your clients call should have a group (or be pinned with provider/model)."
           />
         </Card>
       ) : (
@@ -268,7 +295,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
               <tr>
                 <Th>Model</Th>
                 <Th>Strategy</Th>
-                <Th>Providers (in order)</Th>
+                <Th>Options (in order)</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
             </thead>
@@ -353,42 +380,53 @@ export default function Routing({ role = 'admin' }: { role?: string }){
             </Field>
           </div>
 
+          {/* Add options: any provider, as many times as you want. */}
           <div className="mt-5">
             <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
-              Providers — check to add / uncheck to remove
+              Add option — pick a provider
             </div>
             {providers.length===0 ? (
               <div className="border border-dashed border-stone rounded-xl p-4 text-muted text-sm">No providers yet — add one on the Providers page first.</div>
             ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-                {providers.map(p=> {
-                  const checked = members.some(m=> m.provider_id === p.id)
-                  return (
-                    <label key={p.id} className={`flex items-center gap-2.5 border rounded-lg px-3 py-2 cursor-pointer transition-colors focus-within:ring-2 focus-within:ring-accent/30 ${checked ? 'border-accent/50 bg-accent/5' : 'border-stone hover:bg-app/60'}`}>
-                      <input type="checkbox" checked={checked} onChange={()=> checked ? removeMember(p.id) : addProvider(p.id)} className="accent-accent rounded shrink-0"/>
-                      <HealthDot health={p.health_status} />
-                      <span className="truncate text-sm flex-1 min-w-0">{p.name}</span>
-                      {p.type && <Badge tone="neutral">{p.type}</Badge>}
-                    </label>
-                  )
-                })}
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={pickerId}
+                  onChange={e=>{
+                    const id = e.target.value
+                    setPickerId('')
+                    if(id) addOption(id)
+                  }}
+                  className="min-w-[260px] rounded-lg border border-stone bg-raised px-3 py-2 text-sm"
+                  title="The same provider can be added multiple times with different models"
+                >
+                  <option value="">Select a provider…</option>
+                  {providers.map(p=> (
+                    <option key={p.id} value={p.id}>
+                      {p.name}{p.type ? ` (${p.type})` : ''}{members.some(m=> m.provider_id === p.id) ? ' — already in group' : ''}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-muted">
+                  Add as many options as you need — the same provider can serve several models in one group.
+                </span>
               </div>
             )}
           </div>
 
           <div className="mt-5">
             <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
-              Ordered members ({members.length})
+              Ordered options ({members.length})
             </div>
             {members.length===0 ? (
-              <div className="flex min-h-[36px] items-center rounded-lg bg-app/50 border border-stone px-3 py-1.5 text-muted text-xs">No providers selected yet.</div>
+              <div className="flex min-h-[36px] items-center rounded-lg bg-app/50 border border-stone px-3 py-1.5 text-muted text-xs">No options yet — pick a provider above.</div>
             ) : (
               <div className="space-y-2">
                 {members.map((m, i)=> {
                   const meta = providerMeta.get(m.provider_id) ?? { id: m.provider_id, name: m.name || m.provider_id, type: m.type || '', health_status: m.health_status }
                   const modelChoices = modelsOfProvider.get(m.provider_id) ?? []
+                  const isDup = duplicateUids.get(m.uid) === true
                   return (
-                    <div key={m.provider_id} className="flex flex-wrap items-center gap-2 rounded-lg bg-app/50 border border-stone px-2 py-1.5">
+                    <div key={m.uid} className={`flex flex-wrap items-center gap-2 rounded-lg bg-app/50 border px-2 py-1.5 ${isDup ? 'border-red-500/60' : 'border-stone'}`}>
                       <span className="w-5 h-5 rounded-full bg-stone text-xs flex items-center justify-center shrink-0">{i+1}</span>
                       <HealthDot health={meta.health_status} />
                       <span className="max-w-[160px] truncate text-xs font-mono">{meta.name}</span>
@@ -397,7 +435,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                           w
                           <input
                             type="number" min={1} max={100} value={m.weight ?? 50}
-                            onChange={e=> setMemberWeight(m.provider_id, Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
+                            onChange={e=> setMemberWeight(m.uid, Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
                             className="w-14 rounded border border-stone bg-raised px-1.5 py-0.5 text-xs font-mono"
                           />
                         </label>
@@ -406,23 +444,26 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                         model
                         <select
                           value={m.model_override ?? ''}
-                          onChange={e=> setMemberOverride(m.provider_id, e.target.value)}
+                          onChange={e=> setMemberOverride(m.uid, e.target.value)}
                           className="max-w-[220px] rounded border border-stone bg-raised px-1.5 py-0.5 text-xs font-mono truncate"
                         >
                           <option value="">same as rule</option>
                           {modelChoices.map(id=> <option key={id} value={id}>{id}</option>)}
                         </select>
                       </label>
+                      {isDup && (
+                        <span className="text-[11px] text-red-400">duplicate option — same provider + model</span>
+                      )}
                       <span className="flex-1"/>
-                      <button type="button" onClick={()=>moveMember(i,-1)} disabled={i===0}
+                      <button type="button" onClick={()=>moveMember(m.uid,-1)} disabled={i===0}
                         aria-label={`Move ${meta.name} up`} title="Move up" className={chipBtnCls}>
                         <Icon name="chevronDown" size={12} className="rotate-180"/>
                       </button>
-                      <button type="button" onClick={()=>moveMember(i,1)} disabled={i===members.length-1}
+                      <button type="button" onClick={()=>moveMember(m.uid,1)} disabled={i===members.length-1}
                         aria-label={`Move ${meta.name} down`} title="Move down" className={chipBtnCls}>
                         <Icon name="chevronDown" size={12}/>
                       </button>
-                      <button type="button" onClick={()=>removeMember(m.provider_id)} aria-label={`Remove ${meta.name}`} title="Remove"
+                      <button type="button" onClick={()=>removeMember(m.uid)} aria-label={`Remove ${meta.name}`} title="Remove"
                         className={`${chipBtnCls} hover:!text-red-400`}>
                         <Icon name="x" size={12}/>
                       </button>
@@ -438,7 +479,9 @@ export default function Routing({ role = 'admin' }: { role?: string }){
               <Icon name="check" size={15}/> {busy ? 'Saving' : editing ? 'Save changes' : 'Create group'}
             </Button>
             {!canSave && !busy && (
-              <span className="font-mono text-[11px] text-muted">Needs a model name and at least one provider.</span>
+              <span className="font-mono text-[11px] text-muted">
+                {hasDuplicates ? 'Remove duplicate provider + model options first.' : 'Needs a model name and at least one option.'}
+              </span>
             )}
           </div>
           {err && <div className="mt-3"><ErrorNote message={err} /></div>}
@@ -449,10 +492,12 @@ export default function Routing({ role = 'admin' }: { role?: string }){
         <div className="font-mono text-xs text-muted uppercase tracking-wide">Tip</div>
         <p className="text-xs text-muted mt-1 leading-relaxed">
           Rules are keyed by lowercased model name. Saving an edit under a new name moves the rule.
-          Requests pinned to <span className="text-paper">provider/model</span> or via{' '}
-          <span className="text-paper">X-Provider</span> skip these groups entirely. Use{' '}
-          <span className="text-paper">Refresh models</span> to pull each provider's model list from its API
-          so overrides and suggestions stay current.
+          Each option routes to a specific provider + model — set the model to something other than{' '}
+          <span className="text-paper">same as rule</span> to rewrite it upstream, and add the same provider
+          again with another model to offer more choices. Requests pinned to{' '}
+          <span className="text-paper">provider/model</span> or via <span className="text-paper">X-Provider</span>{' '}
+          skip these groups entirely. Use <span className="text-paper">Refresh models</span> to pull each
+          provider's model list from its API so options and suggestions stay current.
         </p>
       </Card>
 

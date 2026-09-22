@@ -1026,7 +1026,16 @@ paths:
           required: false
           schema: { type: string, example: 7d }
       responses:
-        '200': { description: stats }
+        '200':
+          description: |
+            Aggregates. Range responses add `daily` buckets (each with
+            `cache_hits` — gateway response-cache hits in the bucket),
+            `range_cache_hits` (gateway X-Cache: HIT count for the range),
+            `range_cache_eligible` (hit + miss count), `range_cache_bypassed`
+            (requests that never consult the cache) and
+            `gateway_cache_hit_rate` (hits / eligible requests), alongside
+            the prompt-cache fields `cache_hit_rate` / `cache_read_tokens`.
+            Log rows carry `cache_status`: hit | miss | bypass.
   /api/logs:
     get:
       summary: Request logs with pagination and filters (default latest 100)
@@ -1245,10 +1254,12 @@ paths:
     get:
       summary: List load-balancer routing rules (admin)
       description: |
-        Each rule maps a model name to an ORDERED provider group. Rotation
-        happens across requests (round-robin by position). There is no
-        automatic failover: members never chain within one request. Qualified
-        model IDs ("provider/model") and X-Provider headers bypass rules.
+        Each rule maps a model name to an ORDERED group of (provider, model)
+        options. A provider may appear multiple times with different
+        model_override values. Rotation happens across requests (round-robin
+        by position); failover rules walk options in position order on
+        retriable failures. Qualified model IDs ("provider/model") and
+        X-Provider headers bypass rules.
       tags: [admin]
       security: [{ bearerAuth: [] }]
       responses:
@@ -1261,7 +1272,14 @@ paths:
                 items: { $ref: '#/components/schemas/LBRule' }
   /api/lb/rules/{model}:
     put:
-      summary: Create or replace the provider group for a model (admin)
+      summary: Create or replace the option group for a model (admin)
+      description: |
+        Accepts the rich member form (`members`: provider + optional
+        per-member `model_override` + `weight`, with `strategy` one of
+        round_robin | random | weighted | failover) or the legacy bare-id
+        list (`providers`). The same provider may be listed multiple times
+        with distinct model overrides; exact duplicate (provider, model)
+        pairs are rejected with 400.
       tags: [admin]
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1275,17 +1293,38 @@ paths:
           application/json:
             schema:
               type: object
-              required: [providers]
               properties:
+                strategy:
+                  type: string
+                  enum: [round_robin, random, weighted, failover]
+                  default: round_robin
+                members:
+                  type: array
+                  maxItems: 50
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [provider_id]
+                    properties:
+                      provider_id: { type: string }
+                      model_override:
+                        type: string
+                        maxLength: 256
+                        description: Model id sent upstream for this option ("" = the rule's model name)
+                      weight:
+                        type: integer
+                        minimum: 1
+                        maximum: 100
+                        description: Relative traffic share (weighted strategy; ignored otherwise)
                 providers:
                   type: array
                   maxItems: 50
                   minItems: 1
                   items: { type: string }
-                  description: Provider IDs in round-robin order.
+                  description: 'Legacy form: provider IDs in order (round_robin, no overrides)'
       responses:
         '201': { $ref: '#/components/responses/LBRuleSaved' }
-        '400': { description: Unknown/duplicate provider or invalid body }
+        '400': { description: Unknown provider, duplicate (provider, model) option, or invalid body }
         '403': { description: Org-scoped caller referencing another org's provider }
     delete:
       summary: Delete the routing rule for a model (admin)
@@ -1328,14 +1367,22 @@ components:
         model:
           type: string
           example: gpt-4o-mini
+        strategy:
+          type: string
+          enum: [round_robin, random, weighted, failover]
         providers:
           type: array
+          description: Ordered options; a provider may repeat with distinct model_override values
           items:
             type: object
             properties:
               provider_id: { type: string }
               name: { type: string, example: openai }
               type: { type: string, example: openai }
+              model_override:
+                type: string
+                description: Model id sent upstream for this option (absent = the rule's model)
+              weight: { type: integer, minimum: 1, maximum: 100 }
               health_status: { type: string, nullable: true, enum: [up, down, unknown, ""] }
     CreateProvider:
       type: object
