@@ -3,8 +3,9 @@ import { api } from '../lib/api'
 import type { LBRule, LBMemberInput, RoutingStrategy } from '../lib/api'
 import {
   Badge, Button, Card, Confirm, EmptyState, ErrorNote, Field, HealthDot,
-  Icon, Input, PageHeader, TableShell, Td, Th, useToast,
+  Icon, PageHeader, SegmentedControl, TableShell, Td, Th, useToast,
 } from '../components/ui'
+import ModelCombobox from '../components/ModelCombobox'
 
 type ProviderRow = {
   id: string
@@ -14,17 +15,20 @@ type ProviderRow = {
   last_health?: string
 }
 
+/** One discovered (provider, model) pair — the unit the picker selects. */
 type ProviderModelRow = {
   provider_id?: string
   provider_name?: string
+  provider_type?: string
   model_id?: string
+  display_name?: string
 }
 
 const STRATEGIES: { value: RoutingStrategy; label: string; hint: string }[] = [
-  { value: 'round_robin', label: 'Round robin', hint: 'Rotate evenly across options, one per request.' },
-  { value: 'random', label: 'Random', hint: 'Pick a healthy option at random per request.' },
-  { value: 'weighted', label: 'Weighted', hint: 'Split traffic proportionally to each option\u2019s weight (1\u2013100).' },
-  { value: 'failover', label: 'Failover', hint: 'Always use the first healthy option in order; later ones only on failure.' },
+  { value: 'failover', label: 'Failover', hint: 'Try the primary model first. If it fails before a response starts, walk the rest of the list in order.' },
+  { value: 'round_robin', label: 'Round robin', hint: 'Rotate evenly through the list, one model per request. Order is the rotation order.' },
+  { value: 'random', label: 'Random', hint: 'Pick one healthy model from the list at random for each request.' },
+  { value: 'weighted', label: 'Weighted', hint: 'Split traffic by each model\u2019s weight (1\u2013100). A weight of 70 against 30 sends about 70% of requests there.' },
 ]
 
 /** One builder row = one routing option: a specific provider + specific model. */
@@ -33,14 +37,19 @@ type BuilderMember = LBMemberInput & { uid: string; name?: string; type?: string
 let uidSeq = 0
 const nextUid = () => `m${++uidSeq}`
 
+/** Picker value for a discovered pair. Provider name can contain anything but a newline. */
+const pairValue = (providerName: string, modelId: string) => `${providerName}\n${modelId}`
+
 export default function Routing({ role = 'admin' }: { role?: string }){
   // LB rules (read AND write) are admin-only server-side.
   const isAdmin = role === 'admin'
   const [rules, setRules] = useState<LBRule[]>([])
   const [providers, setProviders] = useState<ProviderRow[]>([])
-  // Discovered (provider, model) pairs — powers model suggestions and
-  // per-member override dropdowns.
+  // Discovered (provider, model) pairs — powers the option picker. Each
+  // provider keeps its own model id, so "claude-sonnet" on Anthropic and
+  // "claude-3-5-sonnet" on Bedrock are two distinct options.
   const [providerModels, setProviderModels] = useState<ProviderModelRow[]>([])
+  const [modelsLoading, setModelsLoading] = useState(true)
   const [discovering, setDiscovering] = useState(false)
 
   // Builder state. `members` holds ordered option inputs; array order is the
@@ -48,10 +57,9 @@ export default function Routing({ role = 'admin' }: { role?: string }){
   // provider may appear multiple times with different models — each row is
   // keyed by uid, not provider id.
   const [model, setModel] = useState('')
-  const [strategy, setStrategy] = useState<RoutingStrategy>('round_robin')
+  const [strategy, setStrategy] = useState<RoutingStrategy>('failover')
   const [members, setMembers] = useState<BuilderMember[]>([])
   const [editing, setEditing] = useState<string | null>(null) // model being edited; null = creating
-  const [pickerId, setPickerId] = useState('')
 
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -79,8 +87,9 @@ export default function Routing({ role = 'admin' }: { role?: string }){
       }catch{}
       try{
         const pm = await api.providerModels.list()
-        setProviderModels(Array.isArray(pm) ? (pm as ProviderModelRow[]) : [])
+        setProviderModels(Array.isArray(pm?.data) ? pm.data : [])
       }catch{}
+      finally{ setModelsLoading(false) }
     })()
   }, [])
 
@@ -89,37 +98,11 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     try{
       await api.providerModels.discoverAll()
       const pm = await api.providerModels.list()
-      setProviderModels(Array.isArray(pm) ? (pm as ProviderModelRow[]) : [])
+      setProviderModels(Array.isArray(pm?.data) ? pm.data : [])
       toast.success('Models refreshed from provider APIs')
     }catch(e:any){ toast.error(e?.message || String(e)) }
     finally{ setDiscovering(false) }
   }
-
-  // Model input suggestions: distinct discovered model_ids plus existing rule keys.
-  const modelOptions = useMemo(()=>{
-    const ids = new Set<string>()
-    for(const pm of providerModels){
-      const id = pm?.model_id
-      if(typeof id === 'string' && id.trim()) ids.add(id.trim())
-    }
-    for(const r of rules){ if(r.model) ids.add(r.model) }
-    return Array.from(ids).sort((a,b)=> a.localeCompare(b))
-  }, [providerModels, rules])
-
-  // Discovered model ids for a given provider (option model dropdowns).
-  const modelsOfProvider = useMemo(()=>{
-    const byProvider = new Map<string, string[]>()
-    for(const pm of providerModels){
-      const pid = pm?.provider_id || ''
-      const id = pm?.model_id
-      if(!pid || typeof id !== 'string' || !id.trim()) continue
-      const arr = byProvider.get(pid) ?? []
-      arr.push(id)
-      byProvider.set(pid, arr)
-    }
-    for(const arr of byProvider.values()) arr.sort((a,b)=> a.localeCompare(b))
-    return byProvider
-  }, [providerModels])
 
   // Resolve member id → display info. Falls back to data embedded in rules
   // when the provider list doesn't cover every member.
@@ -134,8 +117,6 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     }
     return m
   }, [providers, rules])
-
-  const metaOf = (id:string): ProviderRow => providerMeta.get(id) ?? { id, name:id, type:'', health_status:null }
 
   /** Uniqueness key for an option: (provider, model) pair — mirrors the backend. */
   const optionKey = (providerId: string, override?: string) =>
@@ -154,13 +135,99 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     return dup
   }, [members])
   const hasDuplicates = duplicateUids.size > 0
+  const missingModel = members.some(m => !(m.model_override || '').trim())
 
-  const addOption = (providerId: string)=>{
-    if(!providerId) return
+  // One picker entry per discovered pair, grouped by provider — same shape
+  // the playground uses. Selecting one fills both the provider and the model
+  // id that provider actually serves.
+  const comboboxOptions = useMemo(()=>{
+    const seen = new Set<string>()
+    const out: { value: string; label: string; group: string }[] = []
+    for(const pm of providerModels){
+      const name = (pm.provider_name || '').trim()
+      const id = (pm.model_id || '').trim()
+      if(!name || !id) continue
+      const key = pairValue(name, id)
+      if(seen.has(key)) continue
+      seen.add(key)
+      out.push({
+        value: key,
+        label: pm.display_name && pm.display_name !== id ? `${id} — ${pm.display_name}` : id,
+        group: name,
+      })
+    }
+    // An existing primary may no longer be in the discovered list. Keep it
+    // selectable so the picker still shows what the chain starts with.
+    const head = members[0]
+    if(head){
+      const name = (providerMeta.get(head.provider_id)?.name || head.name || '').trim()
+      const id = (head.model_override || '').trim()
+      const key = name && id ? pairValue(name, id) : ''
+      if(key && !seen.has(key)) out.unshift({ value: key, label: id, group: name })
+    }
+    return out
+  }, [providerModels, members, providerMeta])
+
+  const pairByValue = useMemo(()=>{
+    const m = new Map<string, ProviderModelRow>()
+    for(const pm of providerModels){
+      const name = (pm.provider_name || '').trim()
+      const id = (pm.model_id || '').trim()
+      if(!name || !id || !pm.provider_id) continue
+      if(!m.has(pairValue(name, id))) m.set(pairValue(name, id), pm)
+    }
+    return m
+  }, [providerModels])
+
+  const addOption = (pair: ProviderModelRow)=>{
+    const providerId = pair.provider_id || ''
+    const modelId = (pair.model_id || '').trim()
+    if(!providerId || !modelId) return
     const meta = providerMeta.get(providerId)
     const w = strategy === 'weighted' ? 50 : undefined
-    setMembers(prev => [...prev, { uid: nextUid(), provider_id: providerId, weight: w, name: meta?.name, type: meta?.type, health_status: meta?.health_status }])
+    setMembers(prev => [...prev, {
+      uid: nextUid(),
+      provider_id: providerId,
+      model_override: modelId,
+      weight: w,
+      name: meta?.name || pair.provider_name,
+      type: meta?.type || pair.provider_type,
+      health_status: meta?.health_status,
+    }])
   }
+
+  const onPickPrimary = (next: string[])=>{
+    const value = next[next.length - 1]
+    if(!value) return
+    const pair = pairByValue.get(value)
+    if(!pair) return
+    const modelId = (pair.model_id || '').trim()
+    const providerId = pair.provider_id || ''
+    if(!modelId || !providerId) return
+    const meta = providerMeta.get(providerId)
+    setModel(modelId)
+    setMembers(prev => {
+      const head: BuilderMember = {
+        uid: prev[0]?.uid || nextUid(),
+        provider_id: providerId,
+        model_override: modelId,
+        weight: prev[0]?.weight,
+        name: meta?.name || pair.provider_name,
+        type: meta?.type || pair.provider_type,
+        health_status: meta?.health_status,
+      }
+      return [head, ...prev.slice(1)]
+    })
+  }
+
+  const onPickFallback = (next: string[])=>{
+    const value = next[next.length - 1]
+    if(!value) return
+    const pair = pairByValue.get(value)
+    if(!pair) return
+    addOption(pair)
+  }
+
   const removeMember = (uid:string)=> setMembers(prev => prev.filter(m=> m.uid !== uid))
   const moveMember = (uid:string, dir:-1|1)=>{
     setMembers(prev=>{
@@ -171,9 +238,6 @@ export default function Routing({ role = 'admin' }: { role?: string }){
       ;[next[idx], next[to]] = [next[to], next[idx]]
       return next
     })
-  }
-  const setMemberOverride = (uid:string, override:string)=>{
-    setMembers(prev => prev.map(m=> m.uid === uid ? { ...m, model_override: override || undefined } : m))
   }
   const setMemberWeight = (uid:string, weight:number)=>{
     setMembers(prev => prev.map(m=> m.uid === uid ? { ...m, weight } : m))
@@ -193,11 +257,11 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     setErr('')
     requestAnimationFrame(()=> builderRef.current?.scrollIntoView({ behavior:'smooth', block:'start' }))
   }
-  const resetBuilder = ()=>{ setEditing(null); setModel(''); setMembers([]); setStrategy('round_robin'); setErr(''); setPickerId('') }
+  const resetBuilder = ()=>{ setEditing(null); setModel(''); setMembers([]); setStrategy('failover'); setErr('') }
 
   const save = async ()=>{
     const m = model.trim().toLowerCase()
-    if(!m || members.length===0) return
+    if(!m || members.length===0 || missingModel || hasDuplicates) return
     setBusy(true); setErr('')
     try{
       await api.lb.saveRule(m, {
@@ -234,12 +298,23 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     }
   }
 
-  const canSave = !!model.trim() && members.length > 0 && !hasDuplicates && !busy
+  const canSave = !!model.trim() && members.length > 0 && !hasDuplicates && !missingModel && !busy
   const activeStrategy = STRATEGIES.find(s=> s.value === strategy)
 
   /** Ordered-member chip controls share one ghost icon-button style. */
   const chipBtnCls =
     'w-6 h-6 rounded-full flex items-center justify-center text-muted hover:text-paper hover:bg-stone transition-colors disabled:opacity-30 disabled:pointer-events-none'
+
+  const chainLabel = (m: BuilderMember) => (m.model_override || '').trim() || m.name || m.provider_id
+
+  const primaryValue = useMemo(()=>{
+    const head = members[0]
+    if(!head) return ''
+    const name = providerMeta.get(head.provider_id)?.name || head.name || ''
+    const id = (head.model_override || '').trim()
+    if(!name || !id) return ''
+    return pairValue(name, id)
+  }, [members, providerMeta])
 
   return (
     <div className="space-y-6">
@@ -247,7 +322,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
         eyebrow="Connect · Traffic shaping"
         title="Routing"
         description={
-          'Bare model names fan out through ordered provider+model options — round robin, random, weighted, or failover. Add as many options as you want, several per provider. Pin with openai/gpt-4o or X-Provider to bypass.'
+          'Pick a primary model, then the other models in the list — the same model on another provider, or a different one. Failover walks the list when one fails; round robin, random, and weighted each pick one model per request. The provider comes with the model. Pin with openai/gpt-4o or X-Provider to bypass.'
         }
         actions={
           <div className="flex items-center gap-2">
@@ -285,7 +360,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           <EmptyState
             icon="route"
             title="No routing rules yet."
-            hint="Build a group of provider+model options below for a bare model name. Requests without a rule or a pin are rejected with model_not_routed, so every model your clients call should have a group (or be pinned with provider/model)."
+            hint="Pick a primary model below, then the other models in the list. Choose how traffic is split — failover, round robin, random, or weighted. Requests without a rule or a pin are rejected with model_not_routed."
           />
         </Card>
       ) : (
@@ -293,9 +368,9 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           <table className="w-full text-sm min-w-[640px]">
             <thead>
               <tr>
-                <Th>Model</Th>
+                <Th>Primary model</Th>
                 <Th>Strategy</Th>
-                <Th>Options (in order)</Th>
+                <Th>Models</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
             </thead>
@@ -303,20 +378,27 @@ export default function Routing({ role = 'admin' }: { role?: string }){
               {rules.map(r=> (
                 <tr key={r.model} className={`transition-colors ${editing===r.model ? 'bg-amber/5' : 'hover:bg-app/40'}`}>
                   <Td><span className="font-mono text-sm">{r.model}</span></Td>
-                  <Td><Badge tone="neutral">{r.strategy || 'round_robin'}</Badge></Td>
+                  <Td><Badge tone="neutral">{strategyLabel(r.strategy)}</Badge></Td>
                   <Td>
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {(r.providers || []).map((m, i)=> (
-                        <span key={`${m.provider_id}-${i}`}
-                          className="inline-flex items-center gap-1.5 bg-app/60 border border-stone rounded-full pl-1 pr-2.5 py-1 text-xs font-mono">
-                          <span className="w-5 h-5 rounded-full bg-stone text-xs flex items-center justify-center shrink-0">{i+1}</span>
-                          <HealthDot health={m.health_status} />
-                          <span className="max-w-[180px] truncate">{m.name}</span>
-                          {m.model_override && <span className="text-muted">→ {m.model_override}</span>}
-                          {!!m.weight && strategyAllowsWeight(r.strategy || 'round_robin') && <span className="text-muted">w:{m.weight}</span>}
+                        <span key={`${m.provider_id}-${i}`} className="contents">
+                          {i > 0 && <Icon name="chevronDown" size={11} className="-rotate-90 text-muted/60"/>}
+                          <span
+                            className="inline-flex items-center gap-1.5 bg-app/60 border border-stone rounded-full pl-1 pr-2.5 py-1 text-xs font-mono">
+                            <span className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center shrink-0 ${i===0 ? 'bg-accent text-onaccent' : 'bg-stone'}`}>
+                              {i===0 ? '1' : i+1}
+                            </span>
+                            <HealthDot health={m.health_status} />
+                            <span className="max-w-[180px] truncate" title={`${m.name} · ${m.model_override || r.model}`}>
+                              {m.model_override || r.model}
+                            </span>
+                            <span className="text-muted/70 max-w-[90px] truncate">via {m.name}</span>
+                            {!!m.weight && r.strategy === 'weighted' && <span className="text-muted">w:{m.weight}</span>}
+                          </span>
                         </span>
                       ))}
-                      {(r.providers||[]).length===0 && <span className="text-muted text-xs">no members</span>}
+                      {(r.providers||[]).length===0 && <span className="text-muted text-xs">no models</span>}
                     </div>
                   </Td>
                   <Td className="text-right whitespace-nowrap">
@@ -345,9 +427,8 @@ export default function Routing({ role = 'admin' }: { role?: string }){
             <div>
               <h2 className="font-semibold tracking-tight flex items-center gap-2">
                 <Icon name="route" size={16} className="text-accent"/>
-                {editing ? <>Edit <span className="font-mono">"{editing}"</span></> : 'New route group'}
+                {editing ? <>Edit <span className="font-mono">"{editing}"</span></> : 'New route'}
               </h2>
-              <div className="font-mono text-xs text-muted mt-1">{activeStrategy?.hint}</div>
             </div>
             {editing && (
               <Button variant="ghost" size="sm" onClick={resetBuilder} disabled={busy}>
@@ -357,79 +438,90 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">
-            <Field label="Model" className="max-w-xl">
-              <Input
-                list="routing-model-suggestions"
-                value={model}
-                onChange={e=>setModel(e.target.value)}
-                placeholder="bare model name — e.g. gpt-4o-mini"
-                className="font-mono"
+            <Field
+              label="Primary model"
+              hint="What callers send. The provider comes with the pick. Under failover this is also the first model tried."
+              className="max-w-xl"
+            >
+              <ModelCombobox
+                mode="single"
+                allowCustom={false}
+                value={primaryValue ? [primaryValue] : []}
+                onChange={onPickPrimary}
+                options={comboboxOptions}
+                loading={modelsLoading || discovering}
+                placeholder="Search the primary model"
+                emptyHint="No models discovered yet. Use Refresh models."
+                footer="Clients call this model id"
+                chipLabel={v => v.split('\n').pop() || v}
               />
-              <datalist id="routing-model-suggestions">
-                {modelOptions.map(id=> <option key={id} value={id} />)}
-              </datalist>
             </Field>
-            <Field label="Strategy">
-              <select
+            <Field label="How to choose" hint={activeStrategy?.hint}>
+              <SegmentedControl<RoutingStrategy>
+                options={STRATEGIES.map(s => ({ value: s.value, label: s.label }))}
                 value={strategy}
-                onChange={e=>setStrategy(e.target.value as RoutingStrategy)}
-                className="w-full max-w-xs rounded-lg border border-stone bg-raised px-3 py-2 text-sm"
-              >
-                {STRATEGIES.map(s=> <option key={s.value} value={s.value}>{s.label}</option>)}
-              </select>
+                onChange={setStrategy}
+              />
             </Field>
           </div>
 
-          {/* Add options: any provider, as many times as you want. */}
           <div className="mt-5">
             <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
-              Add option — pick a provider
+              {strategy === 'failover'
+                ? 'Add a fallback — tried only if the models above fail'
+                : 'Add a model — another choice in the pool'}
             </div>
             {providers.length===0 ? (
               <div className="border border-dashed border-stone rounded-xl p-4 text-muted text-sm">No providers yet — add one on the Providers page first.</div>
             ) : (
-              <div className="flex flex-wrap items-center gap-2">
-                <select
-                  value={pickerId}
-                  onChange={e=>{
-                    const id = e.target.value
-                    setPickerId('')
-                    if(id) addOption(id)
-                  }}
-                  className="min-w-[260px] rounded-lg border border-stone bg-raised px-3 py-2 text-sm"
-                  title="The same provider can be added multiple times with different models"
-                >
-                  <option value="">Select a provider…</option>
-                  {providers.map(p=> (
-                    <option key={p.id} value={p.id}>
-                      {p.name}{p.type ? ` (${p.type})` : ''}{members.some(m=> m.provider_id === p.id) ? ' — already in group' : ''}
-                    </option>
-                  ))}
-                </select>
-                <span className="text-xs text-muted">
-                  Add as many options as you need — the same provider can serve several models in one group.
-                </span>
-              </div>
+              <>
+                <ModelCombobox
+                  mode="single"
+                  allowCustom={false}
+                  value={[]}
+                  onChange={onPickFallback}
+                  options={comboboxOptions}
+                  loading={modelsLoading || discovering}
+                  placeholder={members.length ? (strategy === 'failover' ? 'Search a fallback model' : 'Search another model') : 'Pick the primary model first'}
+                  emptyHint="No models discovered yet. Use Refresh models."
+                  footer={strategy === 'failover'
+                    ? 'Tried in order only after the models above fail'
+                    : 'Same model on another provider, or a different model entirely'}
+                  disabled={members.length === 0}
+                />
+                {!modelsLoading && comboboxOptions.length === 0 && (
+                  <div className="mt-1.5 flex items-center gap-1.5 text-xs text-amber">
+                    <Icon name="alert" size={12}/> No models discovered. Refresh models, or add them on the Models page.
+                  </div>
+                )}
+              </>
             )}
           </div>
 
           <div className="mt-5">
             <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
-              Ordered options ({members.length})
+              {strategy === 'failover' ? 'Fallback chain' : 'Model pool'} ({members.length === 0 ? 'empty' : `${members.length} model${members.length===1?'':'s'}`})
             </div>
             {members.length===0 ? (
-              <div className="flex min-h-[36px] items-center rounded-lg bg-app/50 border border-stone px-3 py-1.5 text-muted text-xs">No options yet — pick a provider above.</div>
+              <div className="flex min-h-[36px] items-center rounded-lg bg-app/50 border border-stone px-3 py-1.5 text-muted text-xs">
+                {strategy === 'failover'
+                  ? 'Pick a primary model above. Fallbacks are optional — without them, a failure is just a failure.'
+                  : 'Pick a primary model above, then add the other models this strategy chooses from.'}
+              </div>
             ) : (
               <div className="space-y-2">
                 {members.map((m, i)=> {
                   const meta = providerMeta.get(m.provider_id) ?? { id: m.provider_id, name: m.name || m.provider_id, type: m.type || '', health_status: m.health_status }
-                  const modelChoices = modelsOfProvider.get(m.provider_id) ?? []
                   const isDup = duplicateUids.get(m.uid) === true
+                  const noModel = !(m.model_override || '').trim()
                   return (
-                    <div key={m.uid} className={`flex flex-wrap items-center gap-2 rounded-lg bg-app/50 border px-2 py-1.5 ${isDup ? 'border-red-500/60' : 'border-stone'}`}>
-                      <span className="w-5 h-5 rounded-full bg-stone text-xs flex items-center justify-center shrink-0">{i+1}</span>
+                    <div key={m.uid} className={`flex flex-wrap items-center gap-2 rounded-lg bg-app/50 border px-2 py-1.5 ${isDup || noModel ? 'border-red-500/60' : 'border-stone'}`}>
+                      <span className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center shrink-0 ${i===0 ? 'bg-accent text-onaccent' : 'bg-stone'}`}>{i+1}</span>
                       <HealthDot health={meta.health_status} />
-                      <span className="max-w-[160px] truncate text-xs font-mono">{meta.name}</span>
+                      <span className="min-w-0">
+                        <span className="text-xs font-mono">{m.model_override || '—'}</span>
+                        <span className="ml-1.5 text-[11px] text-muted">{memberRole(strategy, i)} · via {meta.name}</span>
+                      </span>
                       {strategy === 'weighted' && (
                         <label className="inline-flex items-center gap-1 text-xs text-muted">
                           w
@@ -440,30 +532,22 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                           />
                         </label>
                       )}
-                      <label className="inline-flex items-center gap-1 text-xs text-muted min-w-0">
-                        model
-                        <select
-                          value={m.model_override ?? ''}
-                          onChange={e=> setMemberOverride(m.uid, e.target.value)}
-                          className="max-w-[220px] rounded border border-stone bg-raised px-1.5 py-0.5 text-xs font-mono truncate"
-                        >
-                          <option value="">same as rule</option>
-                          {modelChoices.map(id=> <option key={id} value={id}>{id}</option>)}
-                        </select>
-                      </label>
                       {isDup && (
                         <span className="text-[11px] text-red-400">duplicate option — same provider + model</span>
                       )}
+                      {noModel && (
+                        <span className="text-[11px] text-red-400">no model — remove and pick one from the list</span>
+                      )}
                       <span className="flex-1"/>
                       <button type="button" onClick={()=>moveMember(m.uid,-1)} disabled={i===0}
-                        aria-label={`Move ${meta.name} up`} title="Move up" className={chipBtnCls}>
+                        aria-label={`Move ${chainLabel(m)} up`} title="Move up" className={chipBtnCls}>
                         <Icon name="chevronDown" size={12} className="rotate-180"/>
                       </button>
                       <button type="button" onClick={()=>moveMember(m.uid,1)} disabled={i===members.length-1}
-                        aria-label={`Move ${meta.name} down`} title="Move down" className={chipBtnCls}>
+                        aria-label={`Move ${chainLabel(m)} down`} title="Move down" className={chipBtnCls}>
                         <Icon name="chevronDown" size={12}/>
                       </button>
-                      <button type="button" onClick={()=>removeMember(m.uid)} aria-label={`Remove ${meta.name}`} title="Remove"
+                      <button type="button" onClick={()=>removeMember(m.uid)} aria-label={`Remove ${chainLabel(m)}`} title="Remove"
                         className={`${chipBtnCls} hover:!text-red-400`}>
                         <Icon name="x" size={12}/>
                       </button>
@@ -476,11 +560,15 @@ export default function Routing({ role = 'admin' }: { role?: string }){
 
           <div className="mt-5 flex flex-wrap items-center gap-3">
             <Button variant="primary" onClick={save} disabled={!canSave}>
-              <Icon name="check" size={15}/> {busy ? 'Saving' : editing ? 'Save changes' : 'Create group'}
+              <Icon name="check" size={15}/> {busy ? 'Saving' : editing ? 'Save changes' : 'Create route'}
             </Button>
             {!canSave && !busy && (
               <span className="font-mono text-[11px] text-muted">
-                {hasDuplicates ? 'Remove duplicate provider + model options first.' : 'Needs a model name and at least one option.'}
+                {hasDuplicates
+                  ? 'Remove duplicate provider + model options first.'
+                  : missingModel
+                    ? 'Every option needs a model — remove any that were saved without one and pick again.'
+                    : 'Pick a primary model to start the list.'}
               </span>
             )}
           </div>
@@ -491,13 +579,15 @@ export default function Routing({ role = 'admin' }: { role?: string }){
       <Card className="bg-app/40">
         <div className="font-mono text-xs text-muted uppercase tracking-wide">Tip</div>
         <p className="text-xs text-muted mt-1 leading-relaxed">
-          Rules are keyed by lowercased model name. Saving an edit under a new name moves the rule.
-          Each option routes to a specific provider + model — set the model to something other than{' '}
-          <span className="text-paper">same as rule</span> to rewrite it upstream, and add the same provider
-          again with another model to offer more choices. Requests pinned to{' '}
+          The primary model is what callers send. Every other row is another model — the same one on a
+          different provider, or a different model — and the strategy decides how the list is used.{' '}
+          <span className="text-paper">Failover</span> tries them in order and moves on only when one fails
+          before a response starts. <span className="text-paper">Round robin</span> rotates,{' '}
+          <span className="text-paper">random</span> picks one per request, and{' '}
+          <span className="text-paper">weighted</span> splits traffic by the weights on each row.
+          Each pick carries the provider that serves it. Requests pinned to{' '}
           <span className="text-paper">provider/model</span> or via <span className="text-paper">X-Provider</span>{' '}
-          skip these groups entirely. Use <span className="text-paper">Refresh models</span> to pull each
-          provider's model list from its API so options and suggestions stay current.
+          skip the list. Use <span className="text-paper">Refresh models</span> to pull each provider's list.
         </p>
       </Card>
 
@@ -517,6 +607,12 @@ export default function Routing({ role = 'admin' }: { role?: string }){
   )
 }
 
-function strategyAllowsWeight(s: RoutingStrategy): boolean {
-  return s === 'weighted'
+function strategyLabel(s: string): string {
+  return STRATEGIES.find(x => x.value === s)?.label || s || 'Failover'
+}
+
+function memberRole(strategy: RoutingStrategy, index: number): string {
+  if (index === 0) return 'primary'
+  if (strategy === 'failover') return 'fallback'
+  return 'in pool'
 }

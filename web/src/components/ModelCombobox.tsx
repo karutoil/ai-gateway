@@ -10,6 +10,17 @@ type Props = {
   placeholder?: string
   disabled?: boolean
   loading?: boolean
+  /**
+   * 'multi' (default) accumulates a list — key allowlists.
+   * 'single' replaces the selection and closes — one provider+model pair.
+   */
+  mode?: 'multi' | 'single'
+  /** Hide the free-text "add custom" row. Routing only offers discovered pairs. */
+  allowCustom?: boolean
+  emptyHint?: string
+  footer?: string
+  /** Chip text for a selected value, when the value itself isn't what to show. */
+  chipLabel?: (value: string) => string
 }
 
 function normalizeOptions(options: Option[]): { value: string; label: string; group: string }[] {
@@ -18,7 +29,11 @@ function normalizeOptions(options: Option[]): { value: string; label: string; gr
   )
 }
 
-export default function ModelCombobox({ value, onChange, options, placeholder = 'Search models...', disabled, loading }: Props) {
+export default function ModelCombobox({
+  value, onChange, options, placeholder = 'Search models...', disabled, loading,
+  mode = 'multi', allowCustom = true, emptyHint, footer, chipLabel,
+}: Props) {
+  const single = mode === 'single'
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
   const [highlight, setHighlight] = useState(0)
@@ -29,7 +44,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
 
   const opts = normalizeOptions(options)
   const trimmed = query.trim()
-  const showAddCustom = trimmed.length > 0 && !value.includes(trimmed)
+  const showAddCustom = allowCustom && trimmed.length > 0 && !value.includes(trimmed)
   const filtered = (() => {
     const q = query.toLowerCase().trim()
     const match = (o: { value: string; label: string; group: string }) =>
@@ -71,13 +86,22 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
 
   const add = (v: string) => {
     const t = v.trim()
-    if (!t || value.includes(t)) return
+    if (!t) return
+    if (single) {
+      onChange([t])
+      setQuery(''); setOpen(false); setHighlight(0)
+      return
+    }
+    if (value.includes(t)) return
     onChange([...value, t])
     setQuery(''); setOpen(true); setHighlight(0)
     requestAnimationFrame(() => inputRef.current?.focus())
   }
   const remove = (v: string) => { onChange(value.filter(x => x !== v)) }
-  const toggle = (v: string) => { if (selectedSet.has(v)) remove(v); else add(v) }
+  const toggle = (v: string) => {
+    if (single) { add(v); return }
+    if (selectedSet.has(v)) remove(v); else add(v)
+  }
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'ArrowDown') {
@@ -121,7 +145,7 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
         <div className="max-h-[260px] overflow-auto py-1.5">
           {rows.length === 0 ? (
             <div className="px-3 py-4 text-xs text-muted text-center">
-              {loading ? 'Loading models…' : query ? 'No matches — press Enter to add as wildcard' : 'No models found'}
+              {loading ? 'Loading models…' : query ? (allowCustom ? 'No matches — press Enter to add as wildcard' : 'No matches') : (emptyHint || 'No models found')}
             </div>
           ) : (
             rows.map((r, idx) => {
@@ -165,8 +189,10 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
           )}
         </div>
         <div className="border-t border-stone/60 px-3 py-2 flex items-center justify-between bg-raised/30">
-          <span className="font-mono text-[10px] text-muted">{value.length === 0 ? 'Empty = all models allowed' : `${value.length} model${value.length===1?'':'s'} restricted`}</span>
-          {value.length > 0 && (
+          <span className="font-mono text-[10px] text-muted">
+            {footer ?? (value.length === 0 ? 'Empty = all models allowed' : `${value.length} model${value.length===1?'':'s'} restricted`)}
+          </span>
+          {value.length > 0 && !single && (
             <button type="button" onMouseDown={e=>{e.preventDefault(); onChange([])}} className="font-mono text-[10px] text-muted hover:text-paper underline">Clear all</button>
           )}
         </div>
@@ -180,16 +206,18 @@ export default function ModelCombobox({ value, onChange, options, placeholder = 
         className={`flex flex-wrap items-center gap-1.5 min-h-[44px] bg-app/70 border rounded-xl px-2.5 py-2 cursor-text transition-all ${open ? 'border-accent/50 ring-2 ring-accent/20' : 'border-stone/70 hover:border-stone'} ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
         {value.map(v => (
           <span key={v} className="inline-flex items-center gap-1 bg-raised border border-accent/25 rounded-full pl-2.5 pr-1 py-1 text-xs font-mono text-paper">
-            <span className="max-w-[180px] truncate" title={v}>{v}</span>
-            <button type="button" onClick={e => { e.stopPropagation(); remove(v) }}
-              className="ml-0.5 w-5 h-5 flex items-center justify-center rounded-full hover:bg-stone text-muted hover:text-paper leading-none" aria-label={`Remove ${v}`}>×</button>
+            <span className="max-w-[180px] truncate" title={chipLabel ? chipLabel(v) : v}>{chipLabel ? chipLabel(v) : v}</span>
+            {!single && (
+              <button type="button" onClick={e => { e.stopPropagation(); remove(v) }}
+                className="ml-0.5 w-5 h-5 flex items-center justify-center rounded-full hover:bg-stone text-muted hover:text-paper leading-none" aria-label={`Remove ${v}`}>×</button>
+            )}
           </span>
         ))}
         <input ref={inputRef} value={query}
           onChange={e => { setQuery(e.target.value); setOpen(true); setHighlight(0) }}
           onFocus={() => { setOpen(true); updateRect() }}
           onKeyDown={onKeyDown}
-          placeholder={value.length === 0 ? placeholder : 'Add model...'}
+          placeholder={value.length === 0 || single ? placeholder : 'Add model...'}
           className="flex-1 min-w-[140px] bg-transparent outline-none text-sm placeholder:text-muted/50 px-1 py-0.5"
           disabled={disabled} autoComplete="off" spellCheck={false} />
         {loading && <span className="font-mono text-[10px] text-muted px-1">loading…</span>}
