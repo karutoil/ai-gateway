@@ -101,7 +101,7 @@ RequestID -> Recovery -> Logger -> audit.Middleware -> forwardedHeaders -> secur
 
 ## Data Model
 
-Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 020_lb_rules_member_options.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). Highlights:
+Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 020_lb_rules_member_options.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). Because the proxy's `request_logs` INSERT names its columns explicitly, a missing column fails every request log write rather than one field, so `repairRequestLogsColumns` additionally reconciles the live `request_logs` against the expected column set on every boot (additive, no-op when healthy) — `schema_migrations` alone does not prove the DDL is present. Highlights:
 
 - `providers` (AES-GCM `api_key_enc`, `base_url`, `health_status`, optional `org_id`)
 - `gateway_keys` (prefix + SHA256 hash, RPM/RPH/RPD/TPM, daily/monthly token & cost limits, `allowed_models`, optional `org_id`)
@@ -145,6 +145,7 @@ Reasoning mapping: OpenAI `reasoning_effort` (low/medium/high/max) <-> Anthropic
 - **Usage metering**: `STREAM_USAGE_INJECT` (default **true**) injects `include_usage` so OpenAI-compatible streams are metered; opt out with `STREAM_USAGE_INJECT=0`.
 - **Webhooks**: `webhook.Global` delivers audit + billing-export + over-quota events asynchronously (bounded queue, 2 attempts); `WEBHOOK_SECRET` signs deliveries as `X-Webhook-Signature: sha256=<hex HMAC>`.
 - **Metrics**: Prometheus at `/metrics` — `gateway_requests_total{provider,model,endpoint,status}`, `gateway_latency_ms{provider,endpoint}`, `gateway_cache_hits_total{result}`; `METRICS_PROTECT=true` gates it behind admin auth. OpenTelemetry metrics API is scaffolded but OTLP export is pending.
+- **Access log**: one `request` line per request (`method`, `path`, `status`, `req_id`, `key_prefix`, `bytes`) plus a cache section — `cache` = `hit` | `miss` | `bypass` | `none` and `cache_hit` (bool). `cache` is the disposition from the `X-Cache` response header, lowercased to the same vocabulary as `request_logs.cache_status` (`none` = handler outside the cache path, e.g. dashboard/health), so a cache's behaviour is diagnosable from logs alone without correlating against the request-log table.
 
 ---
 
