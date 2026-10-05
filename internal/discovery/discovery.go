@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-gateway/internal/cache"
@@ -20,6 +21,11 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// probeBudgetPerDiscover caps how many real completion requests one Discover
+// run may spend on context probes. Probes are issued concurrently; the cap is
+// on total requests, not on concurrency.
+const probeBudgetPerDiscover = 8
 
 type Service struct {
 	db            *sql.DB
@@ -346,17 +352,44 @@ func (s *Service) Discover(providerID string) (int, error) {
 		return 0, fmt.Errorf("no models discovered (check provider base_url and key)")
 	}
 	count := 0
-	probeBudget := 8 // cap context probes per provider per run — each costs a request
-	for _, m := range fetched {
-		// Providers whose /models carries no detail (kourier et al.) get
-		// catalog numbers describing the model's FULL capacity, not what
-		// this reseller serves (kourier caps deepseek-v4.1-flash at 262k,
-		// catalog says 1M). Probe once per bare-listed model until budget
-		// is spent; providers that declared their own numbers are trusted.
-		if err := s.upsert(p, m, apiKey, &probeBudget); err == nil {
-			count++
+		// Cap context probes per provider per run — each one is a real completion
+		// request against the upstream. Providers whose /models carries no detail
+		// (kourier et al.) get catalog numbers describing the model's FULL capacity,
+		// not what this reseller serves (kourier caps deepseek-v4.1-flash at 262k,
+		// catalog says 1M), so probing corrects a real inaccuracy.
+		//
+		// Run the probes CONCURRENTLY. Serial probes made one Discover call cost up
+		// to 8 sequential upstream round-trips: measured 38s for a provider whose
+		// /models answered in 2ms (18 models, 8 probed), versus 1.4s for a 43-model
+		// provider that declared its own numbers and probed zero times. The probes
+		// are independent, so wall-clock collapses to roughly one round-trip while
+		// the request budget and the per-model probe decision are unchanged.
+			probed := make(map[string]int, probeBudgetPerDiscover)
+		var mu sync.Mutex
+		budgetLeft := probeBudgetPerDiscover
+		var wg sync.WaitGroup
+		for _, m := range fetched {
+			if m.Meta == nil && budgetLeft > 0 {
+				mu.Lock()
+				budgetLeft--
+				mu.Unlock()
+				wg.Add(1)
+				go func(m rawModel) {
+					defer wg.Done()
+					if probe := s.probeContextLimit(p, apiKey, m.ID); probe > 0 {
+						mu.Lock()
+						probed[m.ID] = probe
+						mu.Unlock()
+					}
+				}(m)
+			}
 		}
-	}
+		wg.Wait()
+		for _, m := range fetched {
+			if err := s.upsert(p, m, apiKey, probed[m.ID]); err == nil {
+				count++
+			}
+		}
 	if s.Cache != nil && count > 0 {
 		s.Cache.Invalidate("models:")
 	}
@@ -444,24 +477,23 @@ func (s *Service) fetchAnthropic(p *models.Provider, apiKey string) []rawModel {
 	return nil
 }
 
-func (s *Service) upsert(p *models.Provider, m rawModel, apiKey string, probeBudget *int) error {
+func (s *Service) upsert(p *models.Provider, m rawModel, apiKey string, probeLimit int) error {
 	e := s.resolveEnrichment(m)
 	// Providers whose /models carries no detail (kourier et al.) get the
 	// model's catalog numbers — which describe the model's FULL capacity,
 	// not what this reseller actually serves (kourier caps deepseek-v4.1-
-	// flash at 262k, catalog says 1M). Probe once per bare-listed model
-	// while budget lasts; providers that declared numbers are trusted.
-	if m.Meta == nil && probeBudget != nil && *probeBudget > 0 {
-		*probeBudget--
-		if probe := s.probeContextLimit(p, apiKey, m.ID); probe > 0 {
-			if e.ctx == 0 || probe < e.ctx {
-				e.ctx = probe
-			}
-			if e.maxOut == 0 || probe < e.maxOut {
-				e.maxOut = probe
-			}
-			e.source = "provider"
+	// flash at 262k, catalog says 1M). Discover probes those models up
+	// front (concurrently) and passes the answer in as probeLimit (0 = no
+	// probe ran, or it revealed nothing).
+	if m.Meta == nil && probeLimit > 0 {
+		probe := probeLimit
+		if e.ctx == 0 || probe < e.ctx {
+			e.ctx = probe
 		}
+		if e.maxOut == 0 || probe < e.maxOut {
+			e.maxOut = probe
+		}
+		e.source = "provider"
 	}
 	// check existing to preserve manual overrides
 	var existingID string
