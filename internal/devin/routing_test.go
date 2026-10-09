@@ -113,6 +113,9 @@ func TestCollapseModels(t *testing.T) {
 	if !reflect.DeepEqual(got[1].Routing, map[string]string{"high": "swe-2-high", "max": "swe-2-max"}) {
 		t.Errorf("swe-2 routing = %v, want constructed suffix map", got[1].Routing)
 	}
+	if _, ok := got[1].Routing[defaultRouteKey]; ok {
+		t.Errorf("swe-2 (bare member present) must not carry a catch-all: %v", got[1].Routing)
+	}
 	if got[1].Name != "SWE-2" {
 		t.Errorf("swe-2 name = %q, want bare member name", got[1].Name)
 	}
@@ -144,5 +147,91 @@ func TestCollapseModelsBareOnlyDefaults(t *testing.T) {
 	// never nil: the proxy must not invent suffixed uids for them.
 	if got[0].Routing == nil || len(got[0].Routing) != 0 {
 		t.Errorf("routing = %v, want empty non-nil map", got[0].Routing)
+	}
+}
+
+func TestCollapseSuffixOnlyGroupCatchAll(t *testing.T) {
+	raw := []DiscoveredModel{
+		{ID: "swe-2-medium", Name: "SWE-2 Medium", ContextWindow: 200000, MaxTokens: 64000, Reasoning: true, ToolCalls: true, ImageInput: true},
+		{ID: "swe-2-high", Name: "SWE-2 High", ContextWindow: 200000, MaxTokens: 64000, Reasoning: true, ToolCalls: true, ImageInput: true},
+		{ID: "swe-2-max", Name: "SWE-2 Max", ContextWindow: 200000, MaxTokens: 64000, Reasoning: true, ToolCalls: true, ImageInput: true, DefaultInFamily: true},
+	}
+	got := CollapseModels(raw)
+	if len(got) != 1 || got[0].ID != "swe-2" {
+		t.Fatalf("groups = %+v, want single swe-2 base row", got)
+	}
+	g := got[0]
+	if !reflect.DeepEqual(g.Levels, []string{"medium", "high", "max"}) {
+		t.Errorf("levels = %v, want [medium high max]", g.Levels)
+	}
+	// The base id never appeared on the wire: the catch-all must target the
+	// server-declared default member, never the bare base.
+	want := map[string]string{
+		"medium": "swe-2-medium", "high": "swe-2-high", "max": "swe-2-max",
+		defaultRouteKey: "swe-2-max",
+	}
+	if !reflect.DeepEqual(g.Routing, want) {
+		t.Fatalf("routing = %v, want %v", g.Routing, want)
+	}
+	cases := []struct{ effort, want string }{
+		{"", "swe-2-max"},      // no effort: declared default member
+		{"off", "swe-2-max"},   // no off route: catch-all, never the bare base
+		{"low", "swe-2-max"},   // unrouted level: catch-all
+		{"high", "swe-2-high"}, // routed level wins
+	}
+	for _, c := range cases {
+		if got := ResolveRuntime("devin/swe-2", c.effort, g.Routing); got != c.want {
+			t.Errorf("ResolveRuntime(swe-2, %q) = %q, want %q", c.effort, got, c.want)
+		}
+	}
+	// Explicit variants keep the verbatim passthrough regardless.
+	if got := ResolveRuntime("devin/swe-2-max", "", g.Routing); got != "swe-2-max" {
+		t.Errorf("explicit variant = %q, want swe-2-max", got)
+	}
+}
+
+func TestCollapseSuffixOnlyGroupFallbackCatchAll(t *testing.T) {
+	// No server-declared default: the lightest observed tier becomes the
+	// catch-all so no-effort requests still reach a real wire id.
+	raw := []DiscoveredModel{
+		{ID: "swe-2-medium", Reasoning: true},
+		{ID: "swe-2-high", Reasoning: true},
+		{ID: "swe-2-max", Reasoning: true},
+	}
+	got := CollapseModels(raw)
+	if len(got) != 1 {
+		t.Fatalf("groups = %+v", got)
+	}
+	if got[0].Routing[defaultRouteKey] != "swe-2-medium" {
+		t.Errorf("catch-all = %q, want lightest tier swe-2-medium", got[0].Routing[defaultRouteKey])
+	}
+	if u := ResolveRuntime("devin/swe-2", "", got[0].Routing); u != "swe-2-medium" {
+		t.Errorf("no-effort = %q, want swe-2-medium", u)
+	}
+}
+
+func TestCollapseBareMemberKeepsVerbatim(t *testing.T) {
+	// A live bare member is a valid wire id: no catch-all may be invented
+	// and bare no-effort requests must stay verbatim.
+	raw := []DiscoveredModel{
+		{ID: "swe-1-7", Reasoning: true},
+		{ID: "swe-1-7-medium", Reasoning: true},
+	}
+	got := CollapseModels(raw)
+	if len(got) != 1 || got[0].ID != "swe-1-7" {
+		t.Fatalf("groups = %+v, want single swe-1-7 base row", got)
+	}
+	g := got[0]
+	if _, ok := g.Routing[defaultRouteKey]; ok {
+		t.Fatalf("routing = %v, catch-all must not exist when a bare member was observed", g.Routing)
+	}
+	if u := ResolveRuntime("devin/swe-1-7", "", g.Routing); u != "swe-1-7" {
+		t.Errorf("no-effort = %q, want verbatim swe-1-7", u)
+	}
+	if u := ResolveRuntime("devin/swe-1-7", "off", g.Routing); u != "swe-1-7" {
+		t.Errorf("off = %q, want base swe-1-7", u)
+	}
+	if u := ResolveRuntime("devin/swe-1-7", "high", g.Routing); u != "swe-1-7" {
+		t.Errorf("unrouted level = %q, want bare base passthrough", u)
 	}
 }
