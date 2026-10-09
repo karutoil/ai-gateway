@@ -423,6 +423,11 @@ func Migrate(db *sql.DB) error {
 	// ALTERs above.
 	widenSpendCountersPostgres(db)
 
+	// The proxy INSERT names its request_logs columns explicitly, so a missing
+	// one is not a degraded field — it fails EVERY request log write. Reconcile
+	// the live table with that column set (see repairRequestLogsColumns).
+	repairRequestLogsColumns(db)
+
 	// Legacy fallback: ensure base schema/tables exist even if a DB pre-dates versioning
 	// and the embedded 001 was somehow skipped (e.g. legacy binary). This is the
 	// original Migrate logic kept verbatim but now also guarded by IF NOT EXISTS.
@@ -734,6 +739,93 @@ func ExecSchemaIdempotent(db *sql.DB, stmt string) { execSchemaIdempotent(db, st
 // ExecAlterIdempotent is the exported wrapper for additive ALTERs outside
 // the db package.
 func ExecAlterIdempotent(db *sql.DB, stmt string) { execAlterIdempotent(db, stmt) }
+
+// requestLogColumns is the exact column set internal/proxy names in its
+// request_logs INSERT. Anything absent here fails every request log write
+// ("table request_logs has no column named X"), so the boot-time repair and
+// the INSERT must agree.
+var requestLogColumns = []struct{ name, ddl string }{
+	{"ttft_ms", "ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT 0"},
+	{"response_ms", "ALTER TABLE request_logs ADD COLUMN response_ms INTEGER DEFAULT 0"},
+	{"error", "ALTER TABLE request_logs ADD COLUMN error TEXT"},
+	{"request_body", "ALTER TABLE request_logs ADD COLUMN request_body TEXT"},
+	{"response_body", "ALTER TABLE request_logs ADD COLUMN response_body TEXT"},
+	{"finish_reason", "ALTER TABLE request_logs ADD COLUMN finish_reason TEXT"},
+	{"fallback_chain", "ALTER TABLE request_logs ADD COLUMN fallback_chain TEXT"},
+	{"cache_read_tokens", "ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0"},
+	{"cache_write_tokens", "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER DEFAULT 0"},
+	{"reasoning_tokens", "ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER DEFAULT 0"},
+	{"key_id", "ALTER TABLE request_logs ADD COLUMN key_id TEXT"},
+	{"cache_hit", "ALTER TABLE request_logs ADD COLUMN cache_hit INTEGER DEFAULT 0"},
+	{"cache_status", "ALTER TABLE request_logs ADD COLUMN cache_status TEXT"},
+}
+
+// repairRequestLogsColumns adds any request_logs column the proxy INSERT
+// names but the live table lacks.
+//
+// schema_migrations alone cannot be trusted to have done it: a database can
+// carry a version stamped as applied whose DDL never landed. The 020
+// lb_rules rebuild ends in DROP TABLE lb_rules, and any DDL replayed around
+// that window — or a restore from a copy taken mid-migration — leaves a table
+// missing columns that later migrations "already applied". When that happens
+// to request_logs the proxy logs an error per request and DROPS every row, so
+// the dashboard, spend rollups and /api/logs all read as if no traffic
+// happened, while traffic is still being served at 200.
+//
+// Reconciling against the actual columns is dialect-agnostic (introspect,
+// ALTER only what is missing) and is a no-op on healthy databases. Additive
+// only: existing rows keep their data, and the new columns take their
+// declared defaults.
+func repairRequestLogsColumns(db *sql.DB) {
+	rows, err := db.Query(Rebind(`SELECT column_name FROM information_schema.columns WHERE table_name = 'request_logs'`))
+	if err == nil {
+		defer rows.Close()
+	}
+	// information_schema is Postgres-only; SQLite has no such table.
+	have := map[string]bool{}
+	// Fall back to a cheap probe that works on both dialects: try to select
+	// every expected column; a missing one errors and the per-column ALTER
+	// below repairs it. Introspection keeps the common path (all present) to
+	// a single successful query with no ALTERs attempted.
+	if err == nil {
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err == nil {
+				have[strings.ToLower(name)] = true
+			}
+		}
+	} else {
+		have = sqliteRequestLogColumns(db)
+	}
+	for _, c := range requestLogColumns {
+		if have[c.name] {
+			continue
+		}
+		execAlterIdempotent(db, c.ddl)
+	}
+}
+
+// sqliteRequestLogColumns introspects request_logs on SQLite, which has no
+// information_schema. PRAGMA table_info cannot be parameterised, so the table
+// name is a compile-time constant here rather than caller input.
+func sqliteRequestLogColumns(db *sql.DB) map[string]bool {
+	out := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(request_logs)`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+			out[strings.ToLower(name)] = true
+		}
+	}
+	return out
+}
 
 // widenSpendCountersPostgres grows spend_counters.tokens and
 // spend_counters.cost_micros from int4 to int8. No-op on SQLite (its INTEGER
