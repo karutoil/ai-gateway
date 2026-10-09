@@ -58,6 +58,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
   // keyed by uid, not provider id.
   const [model, setModel] = useState('')
   const [strategy, setStrategy] = useState<RoutingStrategy>('failover')
+  const [quotaThreshold, setQuotaThreshold] = useState('90')
   const [members, setMembers] = useState<BuilderMember[]>([])
   const [editing, setEditing] = useState<string | null>(null) // model being edited; null = creating
 
@@ -247,6 +248,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     setEditing(r.model)
     setModel(r.model)
     setStrategy(r.strategy || 'round_robin')
+    setQuotaThreshold(String(r.quota_threshold_pct ?? 90))
     setMembers((r.providers || []).map(m=> ({
       uid: nextUid(),
       provider_id: m.provider_id,
@@ -257,15 +259,22 @@ export default function Routing({ role = 'admin' }: { role?: string }){
     setErr('')
     requestAnimationFrame(()=> builderRef.current?.scrollIntoView({ behavior:'smooth', block:'start' }))
   }
-  const resetBuilder = ()=>{ setEditing(null); setModel(''); setMembers([]); setStrategy('failover'); setErr('') }
+  const resetBuilder = ()=>{ setEditing(null); setModel(''); setMembers([]); setStrategy('failover'); setQuotaThreshold('90'); setErr('') }
 
   const save = async ()=>{
     const m = model.trim().toLowerCase()
     if(!m || members.length===0 || missingModel || hasDuplicates) return
     setBusy(true); setErr('')
     try{
+      const thresholdText = quotaThreshold.trim()
+      const parsedThreshold = thresholdText === '' ? 90 : Number(thresholdText)
+      if (!Number.isInteger(parsedThreshold) || parsedThreshold < 1 || parsedThreshold > 100) {
+        setErr('Quota threshold must be a whole percentage from 1 to 100.')
+        return
+      }
       await api.lb.saveRule(m, {
         strategy,
+        quota_threshold_pct: parsedThreshold,
         members: members.map(({ provider_id, model_override, weight })=> ({ provider_id, model_override, weight })),
       })
       toast.success('Routing rule saved')
@@ -380,7 +389,12 @@ export default function Routing({ role = 'admin' }: { role?: string }){
             {rules.map(r=> (
               <tr key={r.model} className={`transition-colors ${editing===r.model ? 'bg-accent/5' : 'hover:bg-raised/60'}`}>
                 <Td><span className="font-mono text-sm">{r.model}</span></Td>
-                <Td><Badge tone="neutral">{strategyLabel(r.strategy)}</Badge></Td>
+                <Td>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge tone="neutral">{strategyLabel(r.strategy)}</Badge>
+                    {r.quota_threshold_pct != null && <span className="text-[11px] text-muted font-mono">OAuth ≥{r.quota_threshold_pct}% used → skip</span>}
+                  </div>
+                </Td>
                 <Td>
                   <div className="flex flex-wrap items-center gap-1.5">
                     {(r.providers || []).map((m, i)=> (
@@ -462,6 +476,18 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                 value={strategy}
                 onChange={setStrategy}
               />
+            </Field>
+          </div>
+
+          <div className="mt-4 max-w-xl">
+            <Field
+              label="OAuth quota fallback"
+              hint="Consumed-quota threshold. At 90%, for example, a Gemini subscription with 90% or more used is skipped and the next eligible subscription is selected."
+            >
+              <div className="flex items-center gap-2">
+                <Input type="number" min={1} max={100} step={1} value={quotaThreshold} onChange={e=>setQuotaThreshold(e.target.value)} placeholder="90" className="font-mono text-xs max-w-[130px]" />
+                <span className="text-xs text-muted">% consumed</span>
+              </div>
             </Field>
           </div>
 

@@ -289,6 +289,26 @@ func (s *Store) Create(name string, typ models.ProviderType, baseURL string, api
 	return s.CreateWithOrg(name, typ, baseURL, apiKey, "")
 }
 
+// UniqueName returns name when available, otherwise appends a stable human
+// suffix. OAuth accounts deliberately use separate provider rows, and the
+// providers.name UNIQUE constraint is the only identity constraint needed.
+func (s *Store) UniqueName(name string) string {
+	base := strings.TrimSpace(name)
+	if base == "" {
+		base = "provider"
+	}
+	if _, err := s.GetByName(base); err != nil {
+		return base
+	}
+	for n := 2; n < 10000; n++ {
+		candidate := fmt.Sprintf("%s-%d", base, n)
+		if _, err := s.GetByName(candidate); err != nil {
+			return candidate
+		}
+	}
+	return fmt.Sprintf("%s-%d", base, time.Now().UnixNano())
+}
+
 func (s *Store) CreateWithOrg(name string, typ models.ProviderType, baseURL string, apiKey string, orgID string) (*models.Provider, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {

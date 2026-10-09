@@ -202,6 +202,36 @@ func TestValidateRuleInputsDuplicateMembers(t *testing.T) {
 	}
 }
 
+func TestReplaceRuleWithQuotaThreshold(t *testing.T) {
+	for _, threshold := range []int{1, 90, 100} {
+		v := threshold
+		if err := validateQuotaThresholdPct(&v); err != nil {
+			t.Fatalf("threshold %d rejected: %v", threshold, err)
+		}
+	}
+	for _, threshold := range []int{0, 101} {
+		v := threshold
+		if err := validateQuotaThresholdPct(&v); err == nil {
+			t.Fatalf("threshold %d should be rejected", threshold)
+		}
+	}
+	if err := validateQuotaThresholdPct(nil); err != nil {
+		t.Fatalf("nil threshold should disable quota routing: %v", err)
+	}
+}
+
+func TestFilteredPoolEmptyForEveryStrategy(t *testing.T) {
+	for _, strategy := range []string{StrategyRoundRobin, StrategyRandom, StrategyWeighted, StrategyFailover} {
+		t.Run(strategy, func(t *testing.T) {
+			rule := testRule(strategy, member("a", 90), member("b", 10))
+			got := (&Store{}).orderMembersFiltered(rule, func(Member) bool { return false })
+			if len(got) != 0 {
+				t.Fatalf("exhausted members must not be restored: %v", memberIDs(got))
+			}
+		})
+	}
+}
+
 // SelectCandidates carries each member's own model override — with several
 // members on one provider, the provider id alone must not decide the model.
 func TestSelectCandidatesPerMemberOverride(t *testing.T) {

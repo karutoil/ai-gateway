@@ -226,10 +226,10 @@ export default function Providers({ role = 'admin' }: { role?: string }){
     return ()=>{ if (pollTimer.current) clearTimeout(pollTimer.current) }
   },[])
 
-  const startOAuth = async (defId: string, providerId?: string, providerName?: string) => {
+  const startOAuth = async (defId: string, providerId?: string, providerName?: string, newSubscription = false) => {
     setOauthError(''); setOauthBusy(true)
     try {
-      const s = await api.oauth.start(defId, providerName, providerId)
+      const s = await api.oauth.start(defId, providerName, providerId, newSubscription)
       setOauthSession({ auth_url: s.auth_url, state: s.state, provider_id: s.provider_id, provider_name: s.provider_name, redirect_uri: s.redirect_uri })
       setPasteUrl('')
       window.open(s.auth_url, '_blank', 'noopener')
@@ -377,7 +377,10 @@ export default function Providers({ role = 'admin' }: { role?: string }){
           </div>
           <div className="flex flex-wrap gap-2 mt-3">
             {oauthDefs.map((d: any) => (
-              <Button key={d.id} variant="secondary" onClick={()=>startOAuth(d.id)} disabled={oauthBusy || !canWrite}>Connect {d.name || d.id}</Button>
+              <div key={d.id} className="inline-flex gap-1.5">
+                <Button variant="secondary" onClick={()=>startOAuth(d.id)} disabled={oauthBusy || !canWrite}>Connect {d.name || d.id}</Button>
+                <Button variant="ghost" onClick={()=>startOAuth(d.id, undefined, `${d.id} subscription`, true)} disabled={oauthBusy || !canWrite} title="Add another independent subscription">+ another</Button>
+              </div>
             ))}
           </div>
           {oauthError && <div className="mt-3"><ErrorNote message={oauthError} /></div>}

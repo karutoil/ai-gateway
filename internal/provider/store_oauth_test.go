@@ -72,3 +72,19 @@ func TestOAuthTokenRoundTrip(t *testing.T) {
 	}
 	_ = context.Background
 }
+
+func TestUniqueNameSupportsMultipleOAuthSubscriptions(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.Create("antigravity", models.ProviderAntigravity, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.UniqueName("antigravity"); got != "antigravity-2" {
+		t.Fatalf("second subscription name = %q, want antigravity-2", got)
+	}
+	if _, err := s.Create("antigravity-2", models.ProviderAntigravity, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.UniqueName("antigravity"); got != "antigravity-3" {
+		t.Fatalf("third subscription name = %q, want antigravity-3", got)
+	}
+}

@@ -286,6 +286,7 @@ export type LBRule = {
   model: string
   strategy: RoutingStrategy
   providers: LBMember[] // array order = member position / failover order; a provider may repeat with distinct models
+  quota_threshold_pct?: number | null // consumed percentage; OAuth members above it are skipped
 }
 
 // Write-path member shape for saveRule.
@@ -307,8 +308,8 @@ export const api = {
   },
   oauth: {
     listDefs: (): Promise<{ id: string; name: string; scopes?: string[] }[]> => req('/api/oauth/providers'),
-    start: (def_id: string, provider_name?: string, provider_id?: string) =>
-      req('/api/oauth/start', { method:'POST', body: JSON.stringify({ def_id, provider_name, provider_id }) }) as Promise<{ auth_url: string; state: string; provider_id: string; provider_name: string; mode: string; redirect_uri: string }>,
+    start: (def_id: string, provider_name?: string, provider_id?: string, new_subscription?: boolean) =>
+      req('/api/oauth/start', { method:'POST', body: JSON.stringify({ def_id, provider_name, provider_id, new_subscription }) }) as Promise<{ auth_url: string; state: string; provider_id: string; provider_name: string; mode: string; redirect_uri: string }>,
     exchange: (data: { state: string; provider_id?: string; callback_url?: string; code?: string }) =>
       req('/api/oauth/exchange', { method:'POST', body: JSON.stringify(data) }) as Promise<{ ok: boolean; provider_id: string; email?: string; project_id?: string }>,
     status: (id: string) => req(`/api/providers/${encodeURIComponent(id)}/oauth/status`) as Promise<{ provider_id: string; connected: boolean; def_id?: string; email?: string; project_id?: string; expires_at?: string | null }>,
@@ -319,8 +320,8 @@ export const api = {
   lb: {
     listRules: (): Promise<LBRule[]> => req('/api/lb/rules'),
     // PUT is an upsert: replaces the member set and strategy for the model.
-    saveRule: (model: string, opts: { strategy?: RoutingStrategy; members: LBMemberInput[] }): Promise<LBRule> =>
-      req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'PUT', body: JSON.stringify({ strategy: opts.strategy, members: opts.members })}),
+    saveRule: (model: string, opts: { strategy?: RoutingStrategy; members: LBMemberInput[]; quota_threshold_pct?: number | null }): Promise<LBRule> =>
+      req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'PUT', body: JSON.stringify({ strategy: opts.strategy, members: opts.members, quota_threshold_pct: opts.quota_threshold_pct })}),
     deleteRule: (model: string): Promise<null> =>
       req(`/api/lb/rules/${encodeURIComponent(model)}`, { method:'DELETE'}),
   },

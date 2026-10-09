@@ -13,6 +13,7 @@ import (
 
 	"ai-gateway/internal/antigravity"
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/lb"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/translate"
 
@@ -22,6 +23,18 @@ import (
 // isAntigravity reports whether a provider speaks the Cloud Code Assist wire protocol.
 func isAntigravity(p *models.Provider) bool {
 	return p != nil && p.Type == models.ProviderAntigravity
+}
+
+func allAntigravity(candidates []lb.Candidate) bool {
+	if len(candidates) == 0 {
+		return false
+	}
+	for _, cand := range candidates {
+		if !isAntigravity(cand.Provider) {
+			return false
+		}
+	}
+	return true
 }
 
 // antigravityPublicID strips an optional "antigravity/" or provider-name prefix.
@@ -207,6 +220,124 @@ tried:
 	default:
 		h.serveAntigravityAsOpenAI(w, r, resp, model, publicID, usedRuntime, keyPrefix, start, p.ID, isStream)
 	}
+}
+
+// oauthCommitWriter lets an OAuth provider report an upstream failure without
+// committing it to the client. Once the translated provider response is known
+// to be successful, the first WriteHeader commits the real response and all
+// subsequent stream bytes pass through unchanged. This gives failover rules
+// the same pre-commit behavior as the normal OpenAI/Anthropic proxy path.
+type oauthCommitWriter struct {
+	dst       http.ResponseWriter
+	hdr       http.Header
+	code      int
+	committed bool
+	buf       bytes.Buffer
+}
+
+func newOAuthCommitWriter(dst http.ResponseWriter) *oauthCommitWriter {
+	return &oauthCommitWriter{dst: dst, hdr: make(http.Header)}
+}
+
+func (w *oauthCommitWriter) Header() http.Header { return w.hdr }
+
+func (w *oauthCommitWriter) WriteHeader(code int) {
+	if w.code != 0 {
+		return
+	}
+	w.code = code
+	if code >= 200 && code < 400 {
+		w.commit()
+	}
+}
+
+func (w *oauthCommitWriter) Write(p []byte) (int, error) {
+	if w.code == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.committed {
+		return w.dst.Write(p)
+	}
+	return w.buf.Write(p)
+}
+
+func (w *oauthCommitWriter) Flush() {
+	if !w.committed {
+		return
+	}
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *oauthCommitWriter) commit() {
+	if w.committed {
+		return
+	}
+	copyHeader(w.dst.Header(), w.hdr)
+	w.dst.WriteHeader(w.code)
+	w.committed = true
+	if w.buf.Len() > 0 {
+		_, _ = w.dst.Write(w.buf.Bytes())
+		w.buf.Reset()
+	}
+}
+
+func (w *oauthCommitWriter) flushFailure() {
+	if w.committed {
+		return
+	}
+	code := w.code
+	if code == 0 {
+		code = http.StatusBadGateway
+	}
+	copyHeader(w.dst.Header(), w.hdr)
+	w.dst.WriteHeader(code)
+	if w.buf.Len() > 0 {
+		_, _ = w.dst.Write(w.buf.Bytes())
+	}
+}
+
+// proxyAntigravityCandidates serves an all-Antigravity candidate chain. Quota
+// filtering normally removes near-exhausted subscriptions before this point;
+// failover rules also advance when the selected account returns a retriable
+// upstream status. Non-failover strategies pass one candidate by contract.
+func (h *Handler) proxyAntigravityCandidates(w http.ResponseWriter, r *http.Request, originalBody, chatBody []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []lb.Candidate, rule *lb.Rule) {
+	if len(candidates) == 0 {
+		httperr.Proxy(w, http.StatusServiceUnavailable, "no OAuth subscription available")
+		return
+	}
+	var last *oauthCommitWriter
+	for idx, cand := range candidates {
+		if !isAntigravity(cand.Provider) {
+			break
+		}
+		candModel := model
+		candOriginal, candChat := originalBody, chatBody
+		if override := cand.ModelOverrideForRequest(); override != "" && override != model {
+			candModel = override
+			candOriginal = replaceModelInBody(originalBody, override)
+			candChat = replaceModelInBody(chatBody, override)
+		}
+		cw := newOAuthCommitWriter(w)
+		last = cw
+		if idx > 0 {
+			cw.Header().Set("X-Fallback-Used", cand.Provider.Name)
+		}
+		h.proxyAntigravity(cw, r, candOriginal, candChat, isStream, candModel, endpoint, keyPrefix, start, cand.Provider)
+		if cw.committed {
+			return
+		}
+		if rule == nil || rule.Strategy != lb.StrategyFailover || !shouldFailoverFrom(cw.code) {
+			cw.flushFailure()
+			return
+		}
+	}
+	if last != nil {
+		last.flushFailure()
+		return
+	}
+	http.Error(w, "all OAuth subscriptions failed", http.StatusBadGateway)
 }
 
 func (h *Handler) clientOrDefault() *http.Client {

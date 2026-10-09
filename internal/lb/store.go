@@ -80,12 +80,21 @@ type RuleMemberInput struct {
 	Weight        int    `json:"weight"`
 }
 
+const (
+	MinQuotaThresholdPct = 1
+	MaxQuotaThresholdPct = 100
+)
+
 // Rule is the UI-facing shape: model, strategy, and its ordered member list.
 type Rule struct {
 	Model    string   `json:"model"`
 	Strategy string   `json:"strategy"`
 	Members  []Member `json:"providers"`
-	PinnedOK bool     `json:"-"` // informational: qualified IDs still bypass (always true)
+	// QuotaThresholdPct is the consumed-quota percentage at which an OAuth
+	// subscription is removed from the eligible pool. Nil disables quota-aware
+	// routing for this rule; 90 means skip at 90% consumed or more.
+	QuotaThresholdPct *int `json:"quota_threshold_pct,omitempty"`
+	PinnedOK          bool `json:"-"` // informational: qualified IDs still bypass (always true)
 }
 
 // normalizeModel canonicalizes rule keys: trimmed, lowercase, no slash-form
@@ -156,11 +165,21 @@ func memberKey(m RuleMemberInput) string {
 	return strings.ToLower(strings.TrimSpace(m.ProviderID)) + "\x00" + strings.ToLower(strings.TrimSpace(m.ModelOverride))
 }
 
+func ruleMemberKey(m Member) string {
+	return strings.ToLower(strings.TrimSpace(m.ProviderID)) + "\x00" + strings.ToLower(strings.TrimSpace(m.ModelOverride))
+}
+
 // ReplaceRule atomically swaps the member set AND strategy for a model.
 // Empty members deletes the rule. strategy "" defaults to round_robin. The
 // same provider may appear more than once with distinct model overrides;
 // exact duplicate (provider, model) pairs are rejected.
 func (s *Store) ReplaceRule(model, strategy string, members []RuleMemberInput) error {
+	return s.ReplaceRuleWithQuota(model, strategy, members, nil)
+}
+
+// ReplaceRuleWithQuota atomically swaps a rule and its optional consumed-quota
+// threshold. Keeping ReplaceRule as a wrapper preserves older API callers.
+func (s *Store) ReplaceRuleWithQuota(model, strategy string, members []RuleMemberInput, quotaThresholdPct *int) error {
 	if s.DB == nil {
 		return fmt.Errorf("lb store unavailable")
 	}
@@ -173,6 +192,9 @@ func (s *Store) ReplaceRule(model, strategy string, members []RuleMemberInput) e
 	}
 	strategy = NormalizeStrategy(strategy)
 	if err := validateStrategyAndInputs(strategy, members); err != nil {
+		return err
+	}
+	if err := validateQuotaThresholdPct(quotaThresholdPct); err != nil {
 		return err
 	}
 	tx, err := s.DB.Begin()
@@ -193,12 +215,26 @@ func (s *Store) ReplaceRule(model, strategy string, members []RuleMemberInput) e
 		if weight < MinWeight {
 			weight = MinWeight
 		}
-		if _, err := tx.Exec(db.Q(`INSERT INTO lb_rules(id,model,provider_id,position,created_at,strategy,model_override,weight) VALUES(?,?,?,?,?,?,?,?)`),
-			uuid.NewString(), model, m.ProviderID, pos, now, strategy, m.ModelOverride, weight); err != nil {
+		if _, err := tx.Exec(db.Q(`INSERT INTO lb_rules(id,model,provider_id,position,created_at,strategy,model_override,weight,quota_threshold_pct) VALUES(?,?,?,?,?,?,?,?,?)`),
+			uuid.NewString(), model, m.ProviderID, pos, now, strategy, m.ModelOverride, weight, quotaThresholdValue(quotaThresholdPct)); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+func validateQuotaThresholdPct(v *int) error {
+	if v != nil && (*v < MinQuotaThresholdPct || *v > MaxQuotaThresholdPct) {
+		return fmt.Errorf("quota_threshold_pct must be between %d and %d", MinQuotaThresholdPct, MaxQuotaThresholdPct)
+	}
+	return nil
+}
+
+func quotaThresholdValue(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 // DeleteRule removes the rule for a model entirely.
@@ -213,7 +249,7 @@ func (s *Store) DeleteRule(model string) error {
 // retry/failure handling report honestly.
 func (s *Store) RuleForModel(model string) *Rule {
 	model = normalizeModel(model)
-	rows, err := s.DB.Query(db.Q(`SELECT lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE lr.model=? ORDER BY lr.position ASC`), model)
+	rows, err := s.DB.Query(db.Q(`SELECT lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE lr.model=? ORDER BY lr.position ASC`), model)
 	if err != nil {
 		return nil
 	}
@@ -223,12 +259,17 @@ func (s *Store) RuleForModel(model string) *Rule {
 		var m Member
 		var strategy, override string
 		var hs sql.NullString
-		if err := rows.Scan(&m.ProviderID, &m.Name, &m.Type, &m.Position, &strategy, &override, &m.Weight, &hs); err != nil {
+		var quotaThreshold sql.NullInt64
+		if err := rows.Scan(&m.ProviderID, &m.Name, &m.Type, &m.Position, &strategy, &override, &m.Weight, &hs, &quotaThreshold); err != nil {
 			continue
 		}
 		if rule.Strategy == "" || rule.Strategy == StrategyRoundRobin {
 			// First row wins; rows are written with identical strategy.
 			rule.Strategy = strategy
+		}
+		if quotaThreshold.Valid {
+			v := int(quotaThreshold.Int64)
+			rule.QuotaThresholdPct = &v
 		}
 		m.ModelOverride = override
 		if m.Weight < MinWeight {
@@ -248,7 +289,7 @@ func (s *Store) RuleForModel(model string) *Rule {
 // AllRules lists every configured rule with joined provider metadata,
 // ordered by model then position.
 func (s *Store) AllRules() ([]Rule, error) {
-	rows, err := s.DB.Query(db.Q(`SELECT lr.model, lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id ORDER BY lr.model ASC, lr.position ASC`))
+	rows, err := s.DB.Query(db.Q(`SELECT lr.model, lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id ORDER BY lr.model ASC, lr.position ASC`))
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +300,8 @@ func (s *Store) AllRules() ([]Rule, error) {
 		var model, pid, pname, ptype, strategy, override string
 		var pos, weight int
 		var hs sql.NullString
-		if err := rows.Scan(&model, &pid, &pname, &ptype, &pos, &strategy, &override, &weight, &hs); err != nil {
+		var quotaThreshold sql.NullInt64
+		if err := rows.Scan(&model, &pid, &pname, &ptype, &pos, &strategy, &override, &weight, &hs, &quotaThreshold); err != nil {
 			continue
 		}
 		m := Member{ProviderID: pid, Name: pname, Type: ptype, Position: pos, ModelOverride: override, Weight: weight}
@@ -272,6 +314,10 @@ func (s *Store) AllRules() ([]Rule, error) {
 		r, ok := byModel[model]
 		if !ok {
 			r = &Rule{Model: model, Strategy: strategy}
+			if quotaThreshold.Valid {
+				v := int(quotaThreshold.Int64)
+				r.QuotaThresholdPct = &v
+			}
 			byModel[model] = r
 			order = append(order, model)
 		}
@@ -305,10 +351,19 @@ func (c Candidate) ModelOverrideForRequest() string {
 // Down members are filtered; if every member is down the full set returns
 // and lets normal retry/failure handling report honestly.
 func (s *Store) SelectCandidates(rule *Rule) []Candidate {
+	return s.SelectCandidatesFiltered(rule, nil)
+}
+
+// SelectCandidatesFiltered orders only members accepted by keep, then resolves
+// the selected members to providers. Filtering before ordering is important for
+// round-robin and weighted rules: an exhausted member must be removed from the
+// pool before the strategy picks a position, not after it has already won.
+// A nil filter preserves the historical health-only behavior.
+func (s *Store) SelectCandidatesFiltered(rule *Rule, keep func(Member) bool) []Candidate {
 	if rule == nil || len(rule.Members) == 0 {
 		return nil
 	}
-	ordered := s.orderMembers(rule)
+	ordered := s.orderMembersFiltered(rule, keep)
 	out := make([]Candidate, 0, len(ordered))
 	for _, m := range ordered {
 		p, err := (&providerFetcher{s}).byID(m.ProviderID)
@@ -336,15 +391,31 @@ func (s *Store) Select(rule *Rule) []*models.Provider {
 // it filters down members, applies the strategy ordering, and returns the
 // walk order for this request.
 func (s *Store) orderMembers(rule *Rule) []Member {
+	return s.orderMembersFiltered(rule, nil)
+}
+
+func (s *Store) orderMembersFiltered(rule *Rule, keep func(Member) bool) []Member {
 	var eligible []Member
+	var kept []Member
 	for _, m := range rule.Members {
+		if keep != nil && !keep(m) {
+			continue
+		}
+		kept = append(kept, m)
 		if m.HealthStatus != nil && *m.HealthStatus == "down" {
 			continue
 		}
 		eligible = append(eligible, m)
 	}
 	if len(eligible) == 0 {
-		eligible = rule.Members // let honest errors surface instead of silence
+		// If every kept member is marked down, retain the old behavior and let
+		// the normal request path surface the upstream error. If keep rejected
+		// every member, return no candidates instead of resurrecting exhausted
+		// subscriptions.
+		eligible = kept
+	}
+	if len(eligible) == 0 {
+		return nil
 	}
 
 	ordered := make([]Member, len(eligible))

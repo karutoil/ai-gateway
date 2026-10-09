@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -141,6 +142,10 @@ func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred 
 	return out
 }
 
+func (h *Handler) candidateProvidersWithRuleContext(ctx context.Context, rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) ([]lb.Candidate, *lb.Rule) {
+	return h.candidateProvidersWithRuleContextAndRule(ctx, rawModel, model, hint, keyOrg, pred)
+}
+
 // candidateProvidersWithRule is candidateProviders plus the curated rule that
 // governed selection (nil for pins, legacy resolution, or no-route). Each
 // returned candidate carries its own rule member — and with it that member's
@@ -148,6 +153,10 @@ func (h *Handler) candidateProviders(rawModel, model, hint, keyOrg string, pred 
 // correctly. Callers pass the rule to proxyCandidates for strategy context
 // (e.g. logging); overrides come from the candidates, never by provider id.
 func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) ([]lb.Candidate, *lb.Rule) {
+	return h.candidateProvidersWithRuleContext(context.Background(), rawModel, model, hint, keyOrg, pred)
+}
+
+func (h *Handler) candidateProvidersWithRuleContextAndRule(ctx context.Context, rawModel, model, hint, keyOrg string, pred func(*models.Provider) bool) ([]lb.Candidate, *lb.Rule) {
 	out := make([]lb.Candidate, 0, 1)
 	consider := func(p *models.Provider) bool {
 		if p == nil || p.ID == "" || (pred != nil && !pred(p)) {
@@ -196,17 +205,36 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 				continue
 			}
 			if rule := h.LB.RuleForModel(key); rule != nil {
-				ordered := h.LB.SelectCandidates(rule)
+				quotaEligible := make(map[string]bool, len(rule.Members))
+				for _, member := range rule.Members {
+					p, err := h.ProviderStore.GetByID(member.ProviderID)
+					if err != nil || p == nil {
+						continue
+					}
+					quotaModel := model
+					if override := member.ModelOverride; override != "" {
+						quotaModel = override
+					}
+					if h.providerQuotaAllows(ctx, p, quotaModel, rule.QuotaThresholdPct) {
+						quotaEligible[quotaRuleMemberKey(member)] = true
+					}
+				}
+				ordered := h.LB.SelectCandidatesFiltered(rule, func(member lb.Member) bool {
+					return quotaEligible[quotaRuleMemberKey(member)]
+				})
 				if len(ordered) == 0 {
-					continue
+					// A configured rule with no quota-eligible members is still a
+					// route. Do not silently fall back to legacy provider heuristics.
+					return nil, rule
 				}
 				// Org-scoped keys may only route to providers their org
 				// owns (or global ones).
 				eligible := make([]lb.Candidate, 0, len(ordered))
 				for _, cand := range ordered {
-					if orgAllows(keyOrg, cand.Provider) {
-						eligible = append(eligible, cand)
+					if !orgAllows(keyOrg, cand.Provider) {
+						continue
 					}
+					eligible = append(eligible, cand)
 				}
 				if len(eligible) == 0 {
 					continue
@@ -244,6 +272,17 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 		}
 	}
 	return out, nil
+}
+
+func valueOrZero(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func quotaRuleMemberKey(m lb.Member) string {
+	return strings.ToLower(strings.TrimSpace(m.ProviderID)) + "\x00" + strings.ToLower(strings.TrimSpace(m.ModelOverride))
 }
 
 type prepareFn func(p *models.Provider, body []byte) (target, apiKey string, outBody []byte, isAnth bool, err error)

@@ -58,9 +58,10 @@ func (h *RoutingHandler) ListRules(w http.ResponseWriter, r *http.Request) {
 //   - {"strategy":"weighted","members":[{"provider_id":"...","model_override":"...","weight":30}]}
 //   - {"providers":["id-a","id-b"]} (back-compat: round_robin, no overrides)
 type putRuleBody struct {
-	Providers []string             `json:"providers"`
-	Strategy  string               `json:"strategy"`
-	Members   []lb.RuleMemberInput `json:"members"`
+	Providers         []string             `json:"providers"`
+	Strategy          string               `json:"strategy"`
+	Members           []lb.RuleMemberInput `json:"members"`
+	QuotaThresholdPct *int                 `json:"quota_threshold_pct"`
 }
 
 // members resolves the effective member list, preferring the rich form.
@@ -90,6 +91,13 @@ func (h *RoutingHandler) PutRule(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "providers required (ordered provider ids or members)")
 		return
 	}
+	// Quota-aware subscription routing defaults to skipping an OAuth member at
+	// 90% consumed. Direct lb.Store callers can still use nil to preserve the
+	// low-level/backward-compatible behavior in tests and integrations.
+	if body.QuotaThresholdPct == nil {
+		defaultThreshold := 90
+		body.QuotaThresholdPct = &defaultThreshold
+	}
 	orgID := h.ProviderID(r)
 	if orgID != "" {
 		for _, m := range members {
@@ -100,7 +108,7 @@ func (h *RoutingHandler) PutRule(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if err := h.LB.ReplaceRule(model, body.Strategy, members); err != nil {
+	if err := h.LB.ReplaceRuleWithQuota(model, body.Strategy, members, body.QuotaThresholdPct); err != nil {
 		httperr.Invalid(w, err.Error())
 		return
 	}

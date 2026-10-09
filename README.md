@@ -75,7 +75,7 @@ SDKs only need a `baseURL` change plus your `sk-gw-*` key. OpenAI, Anthropic (`/
 - **Gateway keys** — `sk-gw-*`, per-key rate limits and token/cost quotas
 - **Auth** — dashboard JWT, passkeys + recovery codes, optional OIDC SSO, org/team RBAC
 - **Catalog** — 6k+ models with $/1M pricing; virtual aliases (`fast` → `openai/gpt-4o-mini`)
-- **Routing** — curated provider groups per model with selectable strategies: round-robin, random, weighted (per-member 1–100), or failover (priority order); per-member model overrides; down-member skipping; unrouted bare model names are rejected (`model_not_routed`) unless `ROUTING_LEGACY_FALLBACK=true`
+- **Routing** — curated provider groups per model with selectable strategies: round-robin, random, weighted (per-member 1–100), or failover (priority order); per-member model overrides; down-member skipping; multiple OAuth subscriptions can be separate provider members; optional per-rule quota threshold (default 90% consumed) skips near-exhausted Gemini subscriptions; unrouted bare model names are rejected (`model_not_routed`) unless `ROUTING_LEGACY_FALLBACK=true`
 - **Resilience** — bounded retries with exponential backoff, cross-provider failover, exact-match response cache (in-memory or Redis)
 - **Ops** — Prometheus `/metrics`, OpenTelemetry scaffold, request logs with retention purge, audit trail + webhooks, production hardening that refuses weak configs
 

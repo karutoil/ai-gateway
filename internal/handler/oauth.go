@@ -55,6 +55,10 @@ type oauthStartReq struct {
 	DefID        string `json:"def_id"`
 	ProviderName string `json:"provider_name"`
 	ProviderID   string `json:"provider_id"`
+	// NewSubscription forces a fresh provider row even when another OAuth
+	// connection of the same type already exists. This is how multiple Gemini
+	// subscriptions are represented: one provider row per account/token.
+	NewSubscription bool `json:"new_subscription"`
 }
 
 func defToProviderType(defID string) models.ProviderType {
@@ -113,9 +117,15 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			name = body.DefID
 		}
-		if existing, err := h.Providers.GetByName(name); err == nil && existing != nil {
-			p = existing
-		} else {
+		if !body.NewSubscription {
+			if existing, err := h.Providers.GetByName(name); err == nil && existing != nil {
+				p = existing
+			}
+		}
+		if p == nil {
+			if body.NewSubscription {
+				name = h.Providers.UniqueName(name)
+			}
 			created, err := h.Providers.CreateWithOrg(name, defToProviderType(body.DefID), "", "", "")
 			if err != nil {
 				httperr.Invalid(w, err.Error())

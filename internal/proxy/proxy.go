@@ -69,6 +69,10 @@ type Handler struct {
 	// CACHE_STREAMS=true — all-streaming deployments get zero benefit from
 	// the classic non-stream cache.
 	CacheStreams bool
+	// quotaCache stores short-lived OAuth subscription quota snapshots used by
+	// quota-aware routing rules. It is intentionally process-local and optional.
+	quotaCacheMu sync.Mutex
+	quotaCache   *quotaCache
 	// Usage, when set, records actual per-request token/cost outcomes.
 	Usage UsageSink
 	// LogBodies enables captured request/response body logging (opt-in),
@@ -101,6 +105,7 @@ func New(ps *provider.Store, db *sql.DB) *Handler {
 		CacheTTLSeconds: 10,
 		BodyLogMaxBytes: 8192,
 		MaxBodyBytes:    DefaultMaxProxyRequestBodyBytes,
+		quotaCache:      newQuotaCache(),
 	}
 }
 
@@ -3144,10 +3149,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type != models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
+		if rule != nil {
+			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
+			return
+		}
 		if h.unroutedModel() {
 			noRouteFor(w, model)
 			return
@@ -3175,8 +3184,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	// Antigravity speaks Cloud Code Assist (OAuth), not OpenAI — translate.
-	if p0 := candidates[0].Provider; isAntigravity(p0) {
-		h.proxyAntigravity(w, r, body, body, isStream, model, "chat.completions", keyPrefix, start, p0)
+	if p0 := candidates[0].Provider; isAntigravity(p0) && allAntigravity(candidates) {
+		h.proxyAntigravityCandidates(w, r, body, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule)
 		return
 	}
 	// Devin speaks Connect-proto (OAuth session token), not OpenAI — translate.
@@ -3240,8 +3249,12 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates, _ := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
+		if rule != nil {
+			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
+			return
+		}
 		if h.unroutedModel() {
 			noRouteFor(w, model)
 			return
@@ -3422,10 +3435,14 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		return p.Type != models.ProviderAnthropic
 	})
 	if len(candidates) == 0 {
+		if rule != nil {
+			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
+			return
+		}
 		if h.unroutedModel() {
 			noRouteFor(w, model)
 			return
@@ -3814,7 +3831,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
 		if p.Type == models.ProviderAnthropic {
 			return true
 		}
@@ -3830,6 +3847,10 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return isMultiProtocolProvider(p)
 	})
 	if len(candidates) == 0 {
+		if rule != nil {
+			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
+			return
+		}
 		if h.unroutedModel() {
 			noRouteFor(w, model)
 			return
@@ -3858,14 +3879,14 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Antigravity via OAuth: normalize Anthropic -> OpenAI chat, then translate.
-	if p0 := candidates[0].Provider; isAntigravity(p0) {
+	if p0 := candidates[0].Provider; isAntigravity(p0) && allAntigravity(candidates) {
 		chatBody, _, err := translate.AnthropicToOpenAI(body)
 		if err != nil {
 			httperr.Invalid(w, "invalid anthropic body: "+err.Error())
 			return
 		}
 		start := time.Now()
-		h.proxyAntigravity(w, r, body, chatBody, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, p0)
+		h.proxyAntigravityCandidates(w, r, body, chatBody, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule)
 		return
 	}
 	// Devin via OAuth: normalize Anthropic -> OpenAI chat, then translate.
@@ -3954,8 +3975,12 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates, _ := h.candidateProvidersWithRule(rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), nil)
 	if len(candidates) == 0 {
+		if rule != nil {
+			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
+			return
+		}
 		if h.unroutedModel() {
 			noRouteFor(w, model)
 			return
@@ -3974,13 +3999,13 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Antigravity via OAuth: normalize Responses -> OpenAI chat, then translate.
-	if isAntigravity(p) {
+	if isAntigravity(p) && allAntigravity(candidates) {
 		chatBody, _, err := translate.ResponsesToChat(body)
 		if err != nil {
 			httperr.Invalid(w, "invalid responses body: "+err.Error())
 			return
 		}
-		h.proxyAntigravity(w, r, body, chatBody, isStream, model, "responses", r.Header.Get("X-Gateway-Key-Prefix"), time.Now(), p)
+		h.proxyAntigravityCandidates(w, r, body, chatBody, isStream, model, "responses", r.Header.Get("X-Gateway-Key-Prefix"), time.Now(), candidates, rule)
 		return
 	}
 	// Devin via OAuth: normalize Responses -> OpenAI chat, then translate.
