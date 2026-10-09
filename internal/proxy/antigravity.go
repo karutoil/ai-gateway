@@ -84,7 +84,7 @@ func (h *Handler) proxyAntigravity(w http.ResponseWriter, r *http.Request, origi
 	access, project, _, err := h.ProviderStore.EnsureFreshAccess(ctx, p, h.Client)
 	if err != nil {
 		httperr.Write(w, http.StatusBadGateway, "antigravity oauth not connected or refresh failed — reconnect in Providers", httperr.TypeProxy)
-		h.logRequestExtended(keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logRequestExtended(ctx, keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
 	if project == "" {
@@ -194,7 +194,7 @@ tried:
 		}
 		msg := friendlyAntigravityMessage(status, lastErrText)
 		httperr.Proxy(w, status, msg)
-		h.logRequestExtended(keyPrefix, p.ID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logRequestExtended(ctx, keyPrefix, p.ID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
 	defer resp.Body.Close()
@@ -349,7 +349,7 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
-		h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
 		if h.Metrics != nil {
 			h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 		}
@@ -375,7 +375,7 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 	}
 	st.Close()
 	cost := antigravityCost(publicID, st.prompt, st.completion)
-	h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, cost, true)
+	h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, cost, true)
 	if h.Metrics != nil {
 		h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 	}
@@ -526,13 +526,13 @@ func mustJSONString(v any) string {
 }
 
 // serveAntigravityAsAnthropic renders Antigravity output in Anthropic messages SSE/JSON.
-func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, _ *http.Request, resp *http.Response, model, publicID, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, r *http.Request, resp *http.Response, model, publicID, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	chunks, err := collectAntigravityChunks(resp)
 	if err != nil {
 		httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
 		return
 	}
-	h.serveChunksAsAnthropic(w, chunks, model, "messages", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
+	h.serveChunksAsAnthropic(r.Context(), w, chunks, model, "messages", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
 }
 
 // antigravityCostFor binds a public model id to a usage->USD function.
@@ -544,7 +544,7 @@ func antigravityCostFor(publicID string) func(prompt, completion int) float64 {
 
 // serveChunksAsAnthropic renders normalized chunks in the Anthropic messages
 // dialect. Shared by OAuth transports; costFn maps usage to USD.
-func (h *Handler) serveChunksAsAnthropic(w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
+func (h *Handler) serveChunksAsAnthropic(ctx context.Context, w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
 	var texts []string
 	var toolCalls []antigravity.ParsedToolCall
 	prompt, completion := 0, 0
@@ -581,7 +581,7 @@ func (h *Handler) serveChunksAsAnthropic(w http.ResponseWriter, chunks []antigra
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
-		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -613,22 +613,22 @@ func (h *Handler) serveChunksAsAnthropic(w http.ResponseWriter, chunks []antigra
 	}
 	emit("message_delta", mustJSONString(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": finish}, "usage": map[string]any{"output_tokens": completion}}))
 	emit("message_stop", mustJSONString(map[string]any{"type": "message_stop"}))
-	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
+	h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
 }
 
 // serveAntigravityAsResponses renders Antigravity output in OpenAI Responses dialect.
-func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, _ *http.Request, resp *http.Response, model, publicID, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Request, resp *http.Response, model, publicID, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	chunks, err := collectAntigravityChunks(resp)
 	if err != nil {
 		httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
 		return
 	}
-	h.serveChunksAsResponses(w, chunks, model, "responses", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
+	h.serveChunksAsResponses(r.Context(), w, chunks, model, "responses", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
 }
 
 // serveChunksAsResponses renders normalized chunks in the OpenAI Responses
 // dialect. Shared by OAuth transports; costFn maps usage to USD.
-func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
+func (h *Handler) serveChunksAsResponses(ctx context.Context, w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
 	var texts []string
 	var toolCalls []antigravity.ParsedToolCall
 	prompt, completion := 0, 0
@@ -661,7 +661,7 @@ func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigra
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
-		h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -698,5 +698,5 @@ func (h *Handler) serveChunksAsResponses(w http.ResponseWriter, chunks []antigra
 		emit(map[string]any{"type": "response.output_item.done", "output_index": outIdx, "item": fcItem})
 	}
 	emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": respID, "model": model, "status": "completed", "output": output, "usage": map[string]any{"input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion}}})
-	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
+	h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
 }

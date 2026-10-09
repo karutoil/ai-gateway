@@ -130,12 +130,21 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	res := nativeStreamResult{}
 	ctx := r.Context()
 	upstreamCtx := resp.Request.Context()
+	var ttftMs int64 // ms to the upstream's first chunk (0 = none before death)
 
 	flusher, _ := w.(http.Flusher)
 
 	idle := h.Timeouts.StreamIdle
 	wd := newIdleWatchdog(idle)
 	defer wd.stop()
+
+	// Pre-first-chunk silence breaker: response headers already arrived (the
+	// attempt watchdog disarmed), but the client is byteless until the first
+	// real event commits — a body-late upstream burns the edge's first-byte
+	// window in that gap. The umbra timer commits keepalive frames if the
+	// budget expires first (see ttfbController.armFirstChunkUmbra).
+	umbraC, stopUmbra := ttfb.armFirstChunkUmbra()
+	defer stopUmbra()
 
 	chunks := make(chan nativeStreamChunk) // sized copies avoid aliasing
 	go func() {
@@ -168,14 +177,18 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 	}
 
 	commit := func() {
-		if ttfb.headersCommitted() {
+		stopUmbra() // real bytes are committing; the keepalive deadline is moot
+		if !ttfb.claimCommit() {
 			// Keepalive umbra already on the wire; real frames take over.
 			ttfb.stop()
 			return
 		}
 		copyHeader(w.Header(), resp.Header)
 		w.Header().Set("X-Cache", "BYPASS")
+		// Never relay a pinned length on a stream (see pumpStream's commit).
+		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
+		ttfb.sent.Store(true) // any later WriteHeader must be swallowed
 	}
 
 	harvestFrame := func(frame []byte) {
@@ -234,10 +247,10 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		if clientGone {
 			logStatus = 499 // nginx convention: client closed request
 		}
-		cost := h.costForModel(model, promptTok, completionTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completionTok, liveDetail))
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Bool("client_gone", clientGone).Msg("native responses stream terminated abnormally")
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
+		h.logRequestStreamed(ctx, keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), ttftMs, promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
 		res.committed = true
 		return res
 	}
@@ -300,9 +313,9 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 			res.committed = false
 			return res
 		}
-		cost := h.costForModel(model, promptTok, completionTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completionTok, liveDetail))
 		h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
+		h.logRequestStreamed(ctx, keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), ttftMs, promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
 		res.committed = true
 		return res
 	}
@@ -370,11 +383,16 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 				resp.Body.Close()
 				drainChan(chunks)
 				log.Warn().Str("model", model).Str("provider", providerID).Msg("client disconnected during native responses stream before first byte")
-				h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil)
+				h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil)
 				res.committed = true
 				return res
 			}
 			return fail("gateway client disconnected", true)
+
+		case <-umbraC:
+			// First-byte budget expired while the first real event is still
+			// pending: commit keepalive so the edge keeps the connection.
+			ttfb.commitKeepalive(w, nil)
 
 		case <-wd.c:
 			return fail("upstream idle timeout: no data received within "+idle.String(), false)
@@ -384,6 +402,9 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 
 			// Process payload FIRST: Read may deliver n>0 together with err==io.EOF.
 			if cm.n > 0 {
+				if ttftMs == 0 {
+					ttftMs = time.Since(start).Milliseconds()
+				}
 				buf := cm.data[:cm.n]
 				pending = append(pending, buf...)
 				for {
@@ -647,43 +668,43 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 		// stream commits keepalive headers, then either retries under the
 		// umbra or terminates with the protocol's response.failed event.
 		if ttfb.expired() && !ttfb.headersCommitted() {
-			ttfb.commitKeepalive(w, "")
+			ttfb.commitKeepalive(w, nil)
 		}
 		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, upstreamBody, true, isAnthropicUpstream)
 		if err != nil {
 			if ttfb.headersCommitted() {
 				ttfb.stop()
-				h.emitTranslatedResponsesFailure(w, model, keyPrefix, providerID, "upstream_error", "failed to create upstream request: "+err.Error(), start)
+				h.emitTranslatedResponsesFailure(r.Context(), w, model, keyPrefix, providerID, "upstream_error", "failed to create upstream request: "+err.Error(), start)
 				return
 			}
-			h.emitTranslatedResponsesFailure(w, model, keyPrefix, providerID, "upstream_error", "failed to create upstream request: "+err.Error(), start)
+			h.emitTranslatedResponsesFailure(r.Context(), w, model, keyPrefix, providerID, "upstream_error", "failed to create upstream request: "+err.Error(), start)
 			return
 		}
 		attemptCtx, attemptCancel := context.WithCancel(ctx)
 		defer attemptCancel()
 		req = req.WithContext(attemptCtx)
+		// The watchdog stays armed past Client.Do so the body read below is
+		// also bounded by the client's first-byte budget; it stops only where
+		// the long-lived pump takes over the connection.
 		ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 		resp, err := h.Client.Do(req)
-		if ttfbTimer != nil {
-			ttfbTimer.Stop()
-		}
 		if err != nil {
 			if ctx.Err() != nil {
 				// Client cancelled during the retry window: stop silently.
 				log.Warn().Str("model", model).Str("provider", providerID).Msg("client disconnected during translated responses retry window")
-				h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil)
+				h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil)
 				return
 			}
 			if ttfb.expired() && !ttfb.headersCommitted() {
 				// Out of first-byte budget: commit keepalive so the client
 				// (and any edge) stays connected through remaining retries.
-				ttfb.commitKeepalive(w, "")
+				ttfb.commitKeepalive(w, nil)
 			}
 			if retry.ShouldRetry(attempt, retryableCode(0)) {
 				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
 				continue
 			}
-			h.emitTranslatedResponsesFailure(w, model, keyPrefix, providerID, "upstream_error", "upstream unavailable: "+err.Error(), start)
+			h.emitTranslatedResponsesFailure(r.Context(), w, model, keyPrefix, providerID, "upstream_error", "upstream unavailable: "+err.Error(), start)
 			return
 		}
 
@@ -697,12 +718,15 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 				sleepCtx(r.Context(), retryAfterDelay(resp.Header, retry.Backoff(attempt)))
 				continue
 			}
-			h.emitTranslatedResponsesFailure(w, model, keyPrefix, providerID, "upstream_error",
+			h.emitTranslatedResponsesFailure(r.Context(), w, model, keyPrefix, providerID, "upstream_error",
 				"upstream returned status "+itoaCacheFree(status)+": "+upstreamErrorMessage(bodyBytes, "non-streamable upstream response"), start)
 			return
 		}
 
 		// Usable 200 + text/event-stream: hand over to the translation pump.
+		if ttfbTimer != nil {
+			ttfbTimer.Stop() // long-lived pump governs from here
+		}
 		res := h.pumpResponsesFromStream(w, r, resp, model, keyPrefix, providerID, start, isAnthropicUpstream, ttfb)
 		// Chain support for the next turn (chat-shaped upstreams only —
 		// see the non-streaming storeTranslatedTurn for why anthropic
@@ -717,7 +741,7 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 // emitTranslatedResponsesFailure commits a minimal but protocol-clean SSE
 // exchange whose single event is response.failed. Used for failures that
 // occur inside the pre-commit retry window once retries are exhausted.
-func (h *Handler) emitTranslatedResponsesFailure(w http.ResponseWriter, model, keyPrefix, providerID, code, reason string, start time.Time) {
+func (h *Handler) emitTranslatedResponsesFailure(ctx context.Context, w http.ResponseWriter, model, keyPrefix, providerID, code, reason string, start time.Time) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -736,7 +760,7 @@ func (h *Handler) emitTranslatedResponsesFailure(w http.ResponseWriter, model, k
 	}
 	em.emit("response.failed", map[string]interface{}{"response": respObj})
 	log.Error().Str("model", model).Str("provider", providerID).Str("code", code).Str("reason", reason).Msg("translated responses stream failed before commit")
-	h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, em.sample())
+	h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, em.sample())
 }
 
 // pumpResponsesFromStream reads the committed upstream SSE body and re-emits
@@ -785,6 +809,14 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 	respID := "resp_" + uuid.NewString()
 	itemID := "msg_" + uuid.NewString()[:8]
 	createdAt := time.Now().Unix()
+	var ttftMs int64 // ms to the upstream's first chunk (0 = none before death)
+
+	// Pre-first-chunk silence breaker (see ttfbController.armFirstChunkUmbra):
+	// commit keepalive if the client's first-byte budget expires before the
+	// upstream's first chunk, so a headers-early/body-late upstream cannot
+	// hand the edge a synthesized 524.
+	umbraC, stopUmbra := ttfb.armFirstChunkUmbra()
+	defer stopUmbra()
 
 	var (
 		text        strings.Builder
@@ -848,18 +880,21 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 	}
 
 	commitAndStart := func() {
-		if ttfb.headersCommitted() {
+		stopUmbra() // real bytes are committing; the keepalive deadline is moot
+		if !ttfb.claimCommit() {
 			// Keepalive umbra already on the wire: the status line is sent,
 			// but the protocol preamble below must still flow (the client
 			// needs response.created before any delta). Just end the
 			// heartbeat — real frames take over from here.
 			ttfb.stop()
+		} else {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Cache", "BYPASS")
+			w.WriteHeader(http.StatusOK)
+			ttfb.sent.Store(true) // any later WriteHeader must be swallowed
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Cache", "BYPASS")
-		w.WriteHeader(http.StatusOK)
 		em.emit("response.created", map[string]interface{}{"response": responseBase("in_progress")})
 		em.emit("response.in_progress", map[string]interface{}{"response": responseBase("in_progress")})
 		em.emit("response.output_item.added", map[string]interface{}{
@@ -996,7 +1031,7 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			res.toolCalls = append(res.toolCalls, streamedHistoryCall{ID: id, Name: acc.name, Args: acc.args.String()})
 		}
 
-		cost := h.costForModel(model, promptTok, completeTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completeTok, streamDetail))
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
 		if streamDetail.FinishReason == "" && finishReason != "" {
 			streamDetail.FinishReason = normalizeFinishReason(finishReason)
@@ -1005,14 +1040,15 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		// useful in the usage log than the raw SSE sample; keep the sample
 		// as fallback when assembly produced nothing.
 		if assembled, err := json.Marshal(robj); err == nil && len(assembled) > 0 {
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, assembled, &logMeta{
+			h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, assembled, &logMeta{
 				FinishReason: streamDetail.FinishReason,
 				CacheRead:    streamDetail.CacheRead,
 				CacheWrite:   streamDetail.CacheWrite,
 				Reasoning:    streamDetail.Reasoning,
+				TtftMs:       ttftMs,
 			})
 		} else {
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample())
+			h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample(), &logMeta{TtftMs: ttftMs})
 		}
 	}
 
@@ -1026,17 +1062,17 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			logStatus = 499 // nginx convention: client closed request
 		}
 		log.Error().Str("model", model).Str("provider", providerID).Str("code", code).Bool("client_gone", clientGone).Str("reason", reason).Msg("translated responses stream terminated abnormally")
-		cost := h.costForModel(model, promptTok, completeTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completeTok, streamDetail))
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample())
+		h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", logStatus, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample(), &logMeta{TtftMs: ttftMs})
 	}
 
 	stopSilently := func() {
 		// Client disconnect: no more writes — just honest bookkeeping.
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", "gateway client disconnected").Bool("client_gone", true).Msg("mid-stream failure terminated")
-		cost := h.costForModel(model, promptTok, completeTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completeTok, streamDetail))
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample())
+		h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), promptTok, completeTok, cost, true, nil, em.sample(), &logMeta{TtftMs: ttftMs})
 	}
 
 	handleEvent := func(ev sseEvent) {
@@ -1269,6 +1305,11 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 			stopSilently()
 			return res
 
+		case <-umbraC:
+			// First-byte budget expired while the first chunk is still
+			// pending: commit keepalive so the edge keeps the connection.
+			ttfb.commitKeepalive(w, nil)
+
 		case <-wd.c:
 			resp.Body.Close()
 			drainChan(chunks)
@@ -1284,6 +1325,9 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 
 			// Process payload FIRST: Read may deliver n>0 together with err==io.EOF.
 			if cm.n > 0 {
+				if ttftMs == 0 {
+					ttftMs = time.Since(start).Milliseconds()
+				}
 				if !started {
 					commitAndStart()
 				}

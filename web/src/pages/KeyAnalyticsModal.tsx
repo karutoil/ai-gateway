@@ -61,9 +61,9 @@ const fmtUsd = (n: number) => n === 0 ? '$0' : n < 0.01 ? '<$0.01' : `$${n.toFix
 
 function KPI({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-stone/60 bg-app/60 px-3.5 py-3">
-      <div className="text-[10px] font-bold text-muted uppercase tracking-[0.12em]">{label}</div>
-      <div className="font-display text-xl font-bold tabular-nums mt-1 truncate">{value}</div>
+    <div className="rounded-lg border border-stone bg-app/60 px-3.5 py-3">
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-muted">{label}</div>
+      <div className="text-2xl leading-none font-semibold tabular-nums -tracking-tight mt-1.5 truncate">{value}</div>
     </div>
   )
 }
@@ -73,18 +73,18 @@ function MiniBars({ daily, extract, tip }: { daily: KeyDaily[]; extract: (d: Key
   const max = Math.max(1e-9, ...daily.map(extract))
   return (
     <div className="flex items-end gap-1 overflow-x-auto pb-1">
-      {daily.map(d => {
+      {daily.map((d, i) => {
         const v = extract(d)
         const pct = v > 0 ? Math.max(3, Math.round((v / max) * 100)) : 2
         return (
           <div key={d.day} title={tip(d)} className="flex-1 min-w-[14px] flex flex-col items-center gap-1 group cursor-default">
             <div className="w-full h-20 flex items-end">
               <div
-                className={`w-full rounded-t-sm transition-opacity ${v > 0 ? 'bg-accent opacity-80 group-hover:opacity-100' : 'bg-stone/60'}`}
+                className={`w-full rounded-t-sm transition-opacity ${v > 0 ? 'bg-accent opacity-80 group-hover:opacity-100' : 'bg-raised'}`}
                 style={{ height: `${pct}%` }}
               />
             </div>
-            <span className="font-mono text-[8px] text-muted truncate w-full text-center">{bucketLabel(d.day)}</span>
+            <span className="font-mono text-[11px] text-muted truncate w-full text-center">{i === 0 || i === daily.length - 1 ? bucketLabel(d.day) : ''}</span>
           </div>
         )
       })}
@@ -122,7 +122,7 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
             {data && (
               <div className="flex items-center gap-2 text-xs text-muted">
                 <code className="font-mono bg-app border border-stone rounded-md px-1.5 py-0.5">{data.prefix}</code>
-                <span>All-time: <span className="tabular-nums text-paper">{fmtInt(data.all_time.requests)}</span> reqs · <span className="tabular-nums text-paper">{fmtUsd(data.all_time.cost)}</span></span>
+                <span>All-time: <span className="font-mono tabular-nums text-paper">{fmtInt(data.all_time.requests)}</span> reqs · <span className="font-mono tabular-nums text-paper">{fmtUsd(data.all_time.cost)}</span></span>
               </div>
             )}
           </div>
@@ -130,7 +130,7 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
           {loading && !data ? (
             <div className="space-y-3">
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {[0, 1, 2, 3].map(i => <Skeleton key={i} className="h-16" />)}
+                {[0, 1, 2, 3].map(i => <Skeleton key={i} className="h-[72px]" />)}
               </div>
               <Skeleton className="h-28" />
             </div>
@@ -148,7 +148,7 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
               </div>
 
               <div>
-                <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">Requests over {range}</div>
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">Requests over {range}</div>
                 <MiniBars
                   daily={zeroFill(data.daily, range)}
                   extract={d => d.requests}
@@ -158,16 +158,16 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
 
               <div className="grid sm:grid-cols-2 gap-4">
                 <div>
-                  <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">Latency</div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">Latency</div>
                   <div className="space-y-1.5 text-sm">
-                    <div className="flex justify-between"><span className="text-muted">p50</span><span className="tabular-nums">{data.latency.p50 ? `${data.latency.p50} ms` : '—'}</span></div>
-                    <div className="flex justify-between"><span className="text-muted">p95</span><span className="tabular-nums">{data.latency.p95 ? `${data.latency.p95} ms` : '—'}</span></div>
-                    <div className="flex justify-between"><span className="text-muted">avg</span><span className="tabular-nums">{data.latency.avg ? `${Math.round(data.latency.avg)} ms` : '—'}</span></div>
-                    <div className="flex justify-between"><span className="text-muted">avg TTFT</span><span className="tabular-nums">{data.ttft_avg ? `${Math.round(data.ttft_avg)} ms` : '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-muted">p50</span><span className="font-mono tabular-nums">{data.latency.p50 ? `${data.latency.p50} ms` : '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-muted">p95</span><span className="font-mono tabular-nums">{data.latency.p95 ? `${data.latency.p95} ms` : '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-muted">avg</span><span className="font-mono tabular-nums">{data.latency.avg ? `${Math.round(data.latency.avg)} ms` : '—'}</span></div>
+                    <div className="flex justify-between"><span className="text-muted">avg TTFT</span><span className="font-mono tabular-nums">{data.ttft_avg ? `${Math.round(data.ttft_avg)} ms` : '—'}</span></div>
                   </div>
                 </div>
                 <div>
-                  <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">Top models</div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">Top models</div>
                   {data.top_models.length === 0 ? (
                     <div className="text-sm text-muted">No requests in range.</div>
                   ) : (
@@ -175,7 +175,7 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
                       {data.top_models.slice(0, 5).map(m => (
                         <div key={m.model} className="flex items-center justify-between gap-2">
                           <span className="truncate font-mono text-xs" title={m.model}>{m.model}</span>
-                          <span className="tabular-nums text-xs text-muted shrink-0">{fmtInt(m.requests)} req · {fmtInt(m.tokens)} tok</span>
+                          <span className="font-mono tabular-nums text-xs text-muted shrink-0">{fmtInt(m.requests)} req · {fmtInt(m.tokens)} tok</span>
                         </div>
                       ))}
                     </div>
@@ -185,42 +185,40 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
 
               {data.endpoints.length > 0 && (
                 <div>
-                  <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">Endpoints</div>
-                  <div className="rounded-lg border border-stone overflow-hidden">
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr>
-                          <Th className="text-left">Endpoint</Th>
-                          <Th className="text-right">Requests</Th>
-                          <Th className="text-right">Tokens</Th>
-                          <Th className="text-right">Spend</Th>
-                          <Th className="text-right">Failed</Th>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">Endpoints</div>
+                  <TableShell>
+                    <thead>
+                      <tr>
+                        <Th className="text-left">Endpoint</Th>
+                        <Th className="text-right">Requests</Th>
+                        <Th className="text-right">Tokens</Th>
+                        <Th className="text-right">Spend</Th>
+                        <Th className="text-right">Failed</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.endpoints.map(e => (
+                        <tr key={e.endpoint}>
+                          <Td className="font-mono">{e.endpoint}</Td>
+                          <Td className="text-right font-mono tabular-nums">{fmtInt(e.requests)}</Td>
+                          <Td className="text-right font-mono tabular-nums">{fmtInt(e.tokens)}</Td>
+                          <Td className="text-right font-mono tabular-nums">{fmtUsd(e.cost)}</Td>
+                          <Td className={`text-right font-mono tabular-nums ${e.failed > 0 ? 'text-danger' : 'text-muted'}`}>{fmtInt(e.failed)}</Td>
                         </tr>
-                      </thead>
-                      <tbody>
-                        {data.endpoints.map(e => (
-                          <tr key={e.endpoint} className="border-t border-stone">
-                            <Td className="font-mono">{e.endpoint}</Td>
-                            <Td className="text-right tabular-nums">{fmtInt(e.requests)}</Td>
-                            <Td className="text-right tabular-nums">{fmtInt(e.tokens)}</Td>
-                            <Td className="text-right tabular-nums">{fmtUsd(e.cost)}</Td>
-                            <Td className={`text-right tabular-nums ${e.failed > 0 ? 'text-red-400' : 'text-muted'}`}>{fmtInt(e.failed)}</Td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                      ))}
+                    </tbody>
+                  </TableShell>
                 </div>
               )}
 
               {data.errors.length > 0 && (
                 <div>
-                  <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">Errors in range</div>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">Errors in range</div>
                   <div className="space-y-1.5">
                     {data.errors.map(e => (
                       <div key={e.status} className="flex items-start gap-2 text-sm">
                         <Badge tone={e.status >= 500 ? 'bad' : 'warn'}>{e.status}</Badge>
-                        <span className="tabular-nums text-xs text-muted mt-0.5 shrink-0">×{fmtInt(e.count)}</span>
+                        <span className="font-mono tabular-nums text-xs text-muted mt-0.5 shrink-0">×{fmtInt(e.count)}</span>
                         {e.sample && <span className="text-xs text-muted truncate" title={e.sample}>{e.sample}</span>}
                       </div>
                     ))}
@@ -236,7 +234,7 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
           ) : null}
         </div>
       )}
-      <div className="flex justify-end mt-6">
+      <div className="flex justify-end gap-2 mt-6">
         <Button variant="ghost" onClick={onClose}>Close</Button>
       </div>
     </Modal>

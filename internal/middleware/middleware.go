@@ -115,6 +115,23 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Flush forwards http.Flusher through the recorder. Go promotes only the
+// methods declared on the embedded http.ResponseWriter INTERFACE — Flush()
+// lives on the separate http.Flusher interface — so without this override
+// every w.(http.Flusher) assertion below the Logger fails, keepalive/SSE
+// frames stay trapped in net/http's write buffer, and edge proxies
+// (Cloudflare, ~100s first-byte window) 524 the request. Regression test:
+// flusher_regression_test.go.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController and interface upgrades reach the real
+// connection through this recorder.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w}

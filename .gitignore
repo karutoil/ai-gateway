@@ -33,7 +33,10 @@ __pycache__/
 .pi/
 .catalyst-code/
 .swarm/
+.dsh-code-index/
+.serena/
 
 # Misc scratch
 pi-harness-test/hello-pi.txt
+token
 .DS_Store

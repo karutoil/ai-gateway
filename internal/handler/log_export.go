@@ -60,7 +60,7 @@ func (h *AdminHandler) LogsExport(w http.ResponseWriter, r *http.Request) {
 	}
 	from := " FROM request_logs rl LEFT JOIN providers p ON rl.provider_id = p.id" + whereSQL
 
-	rows, err := h.DB.Query(db.Q(`SELECT rl.id, rl.key_prefix, COALESCE(rl.key_id,''), rl.provider_id, rl.model, rl.endpoint, rl.status, rl.latency_ms, COALESCE(rl.ttft_ms,0), rl.created_at, rl.prompt_tokens, rl.completion_tokens, rl.total_tokens, rl.cost_usd, rl.is_stream, COALESCE(rl.finish_reason,''), COALESCE(rl.error,'')`+from+` ORDER BY rl.created_at DESC LIMIT ?`),
+	rows, err := h.DB.Query(db.Q(`SELECT rl.id, rl.key_prefix, COALESCE(rl.key_id,''), rl.provider_id, rl.model, rl.endpoint, rl.status, rl.latency_ms, COALESCE(rl.ttft_ms,0), rl.created_at, rl.prompt_tokens, rl.completion_tokens, rl.total_tokens, rl.cost_usd, rl.is_stream, COALESCE(rl.finish_reason,''), COALESCE(rl.error,'')`+from+logOrderClause(r.URL.Query())+` LIMIT ?`),
 		append(args, logsExportMaxRows+1)...) // +1 to detect truncation
 	if err != nil {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)

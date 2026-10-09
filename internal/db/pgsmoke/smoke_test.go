@@ -37,8 +37,8 @@ func TestPostgresMigrations(t *testing.T) {
 	if err := database.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if n != 18 {
-		t.Fatalf("migrations = %d, want 18", n)
+	if n != 24 {
+		t.Fatalf("migrations = %d, want 24", n)
 	}
 }
 
@@ -75,8 +75,14 @@ func TestPostgresCRUD(t *testing.T) {
 	if err := database.QueryRow(db.Q(`SELECT `+db.DateBucketExpr("created_at")+` as day, COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? GROUP BY `+db.DateBucketExpr("created_at")), now.Add(-24*time.Hour)).Scan(&day, &sum, &cnt); err != nil {
 		t.Fatalf("date bucket aggregate: %v", err)
 	}
+	if day != now.Format("2006-01-02") {
+		t.Fatalf("date bucket = %q, want UTC date %q", day, now.Format("2006-01-02"))
+	}
 	if err := database.QueryRow(db.Q(`SELECT `+db.HourBucketExpr("created_at")+` FROM request_logs WHERE id=?`), "r1").Scan(&day); err != nil {
 		t.Fatalf("hour bucket expr: %v", err)
+	}
+	if day != now.Format("2006-01-02T15:00:00Z") {
+		t.Fatalf("hour bucket = %q, want UTC hour %q", day, now.Format("2006-01-02T15:00:00Z"))
 	}
 
 	// models_catalog BOOLEAN literal compare.

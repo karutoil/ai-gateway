@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"database/sql"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,10 +28,11 @@ import (
 // commit for streams — both well before any edge can time out.
 
 type ttfbStack struct {
-	srv  *httptest.Server
-	up   *httptest.Server
-	hits *atomic.Int32
-	key  string
+	srv      *httptest.Server
+	up       *httptest.Server
+	hits     *atomic.Int32
+	key      string
+	database *sql.DB
 }
 
 func newTTFBStack(t *testing.T, budget time.Duration, maxRetries int, upstream http.HandlerFunc) *ttfbStack {
@@ -61,7 +63,7 @@ func newTTFBStack(t *testing.T, budget time.Duration, maxRetries int, upstream h
 	r.Post("/v1/chat/completions", h.ChatCompletions)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
-	return &ttfbStack{srv: srv, up: up, hits: &atomic.Int32{}, key: k.Key}
+	return &ttfbStack{srv: srv, up: up, hits: &atomic.Int32{}, key: k.Key, database: database}
 }
 
 const ttfbStreamBody = `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`
@@ -238,5 +240,93 @@ func TestTTFBControllerExpiryMath(t *testing.T) {
 	}
 	if c.remaining() != 0 {
 		t.Fatalf("committed controller must disarm the watchdog, got %v", c.remaining())
+	}
+}
+
+// Headers-early/body-late upstream (a thinking model behind an aggregator):
+// response headers arrive instantly but the first stream chunk takes longer
+// than the whole first-byte budget. The pre-first-chunk umbra must commit
+// keepalive bytes BEFORE the first chunk — this is the exact silence window
+// in which a Cloudflare edge synthesizes a 524 the gateway never sees.
+func TestTTFBStreamHeadersFastFirstChunkLateUmbra(t *testing.T) {
+	var s *ttfbStack
+	s = newTTFBStack(t, 300*time.Millisecond, 0, func(w http.ResponseWriter, r *http.Request) {
+		s.hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush() // headers NOW — the watchdog disarms...
+		time.Sleep(1200 * time.Millisecond)
+		io.WriteString(w, ttfbSSE) // ...first chunk long after the budget
+	})
+	code, body, ttfa := doTTFB(t, s, ttfbStreamBody)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", code, body)
+	}
+	// Keepalive bytes must reach the client within the budget, long before
+	// the upstream's first chunk at ~1.2s.
+	if ttfa >= 1100*time.Millisecond {
+		t.Fatalf("pre-first-chunk umbra must feed the client inside the budget, first byte after %v", ttfa)
+	}
+	if !strings.Contains(body, ": keepalive") {
+		t.Fatalf("expected keepalive frame before first chunk, got %s", body)
+	}
+	if !strings.Contains(body, `"chat.completion.chunk"`) || !strings.Contains(body, "[DONE]") {
+		t.Fatalf("expected real completion frames after keepalive, got %s", body)
+	}
+}
+
+// Buffered upstream whose response HEADERS arrive instantly but whose BODY
+// takes forever: a buffered response reaches the client only when complete,
+// so the body read is part of the first-byte wait. The budget must expire
+// into an honest 504 instead of a silent hang (edge 524).
+func TestTTFBBudgetBufferedSlowBody504(t *testing.T) {
+	var s *ttfbStack
+	s = newTTFBStack(t, 300*time.Millisecond, 0, func(w http.ResponseWriter, r *http.Request) {
+		s.hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()    // headers NOW — the client is still byteless
+		time.Sleep(2 * time.Second) // body far beyond the budget
+		io.WriteString(w, `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}]}`)
+	})
+	code, body, ttfb := doTTFB(t, s, ttfbBufferedBody)
+	if code != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504, got %d body %s", code, body)
+	}
+	if !strings.Contains(body, "first-byte timeout") {
+		t.Fatalf("expected first-byte timeout message, got %s", body)
+	}
+	if ttfb > 2*time.Second {
+		t.Fatalf("504 must arrive within the budget, took %v", ttfb)
+	}
+}
+
+// TTFT/response_ms observability: a completed stream records the upstream's
+// time-to-first-chunk and the post-TTFT streaming window (the TPS
+// denominator) on its request_logs row. Without these the >100s first-token
+// distribution that manufactures edge 524s is invisible.
+func TestStreamLogsTTFTAndResponseWindow(t *testing.T) {
+	var s *ttfbStack
+	s = newTTFBStack(t, 2*time.Second, 0, func(w http.ResponseWriter, r *http.Request) {
+		s.hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(120 * time.Millisecond) // deterministic non-zero TTFT
+		io.WriteString(w, ttfbSSE)
+	})
+	code, _, _ := doTTFB(t, s, ttfbStreamBody)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	var ttft, responseMs, latency int64
+	if err := s.database.QueryRow(`SELECT ttft_ms, response_ms, latency_ms FROM request_logs ORDER BY rowid DESC LIMIT 1`).Scan(&ttft, &responseMs, &latency); err != nil {
+		t.Fatal(err)
+	}
+	if ttft < 100 {
+		t.Fatalf("ttft_ms must capture the first-chunk delay (~120ms), got %d", ttft)
+	}
+	if responseMs != latency-ttft {
+		t.Fatalf("response_ms must be latency-ttft (%d), got %d", latency-ttft, responseMs)
 	}
 }

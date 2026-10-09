@@ -98,3 +98,56 @@ func TestPostgresStores(t *testing.T) {
 		t.Fatalf("pat create: %v", err)
 	}
 }
+
+// Catalog model matching must behave identically to the SQLite test suite on
+// Postgres, whose LIKE is case-sensitive (SQLite's is not): the umans channel
+// decorates ids ("umans-<base>", lab mode "umans-<base>-lab") while catalog
+// rows mix casing ("amd/Qwen3.8-Flash-Next"), so suffix/containment matching
+// runs through LOWER(... ) LIKE LOWER(...) everywhere.
+func TestPostgresCatalogUmansMatch(t *testing.T) {
+	database := openPG(t)
+	cs := catalog.NewStore(database)
+	body := []byte(`{
+		"umans-ai-coding-plan": {"id":"umans-ai-coding-plan","name":"umans-ai-coding-plan","api":"openai","models":{
+			"umans-kimi-k2.7": {"id":"umans-ai-coding-plan/umans-kimi-k2.7","name":"Kimi K2.7","cost":{"input":0,"output":0},"limit":{"context":262144,"output":262144},"reasoning":true,"tool_call":true}
+		}},
+		"zai": {"id":"zai","name":"zai","api":"openai","models":{
+			"glm-5.3-flash": {"id":"zai/glm-5.3-flash","name":"GLM-5.3-Flash","cost":{"input":0.075,"output":0.25},"limit":{"context":1000000,"output":131072},"reasoning":true,"tool_call":true}
+		}},
+		"amd": {"id":"amd","name":"amd","api":"openai","models":{
+			"Qwen3.8-Flash-Next": {"id":"amd/Qwen3.8-Flash-Next","name":"Qwen3.8-Flash-Next","cost":{"input":0.15,"output":0.47},"limit":{"context":262144,"output":65536},"reasoning":true,"tool_call":true}
+		}},
+		"crof": {"id":"crof","name":"crof","api":"openai","models":{
+			"deepseek-v4-flash-vision-exp-20260115": {"id":"crof/deepseek-v4-flash-vision-exp-20260115","name":"DeepSeek-V4-Flash-Vision-Exp","cost":{"input":0.08,"output":0.2},"limit":{"context":1000000,"output":393215},"reasoning":true,"tool_call":true}
+		}},
+		"acme": {"id":"acme","name":"acme","api":"openai","models":{
+			"gemini-3.5-flash": {"id":"acme/gemini-3.5-flash","name":"Gemini Flash","cost":{"input":11,"output":12},"limit":{"context":6000,"output":600},"reasoning":false,"tool_call":true}
+		}}
+	}`)
+	if _, err := cs.SyncFromBytes(body); err != nil {
+		t.Fatalf("catalog sync: %v", err)
+	}
+
+	m, kind, err := cs.FindBestMatch("umans-kimi-k2.7")
+	if err != nil || kind != "exact" || m.ID != "umans-ai-coding-plan/umans-kimi-k2.7" {
+		t.Fatalf("channel row = %v/%q/%v, want exact/umans-ai-coding-plan/umans-kimi-k2.7", kind, m.ID, err)
+	}
+	m, kind, err = cs.FindBestMatch("umans-glm-5.3-flash-lab")
+	if err != nil || kind != "wildcard" || m.ID != "zai/glm-5.3-flash" {
+		t.Fatalf("lab row = %v/%q/%v, want wildcard/zai/glm-5.3-flash", kind, m.ID, err)
+	}
+	// Case-insensitive suffix match: catalog id casing differs from the slug.
+	m, kind, err = cs.FindBestMatch("umans-qwen3.8-flash-next-lab")
+	if err != nil || kind != "wildcard" || m.ID != "amd/Qwen3.8-Flash-Next" {
+		t.Fatalf("mixed-case lab row = %v/%q/%v, want wildcard/amd/Qwen3.8-Flash-Next", kind, m.ID, err)
+	}
+	// Dated variant via containment on the stripped base.
+	m, kind, err = cs.FindBestMatch("umans-deepseek-v4-flash-vision-exp-lab")
+	if err != nil || kind != "wildcard" || m.ID != "crof/deepseek-v4-flash-vision-exp-20260115" {
+		t.Fatalf("dated lab row = %v/%q/%v, want wildcard/crof/deepseek-v4-flash-vision-exp-20260115", kind, m.ID, err)
+	}
+	// Bare-word bases never fuzzy-match unrelated rows.
+	if _, _, err := cs.FindBestMatch("umans-flash-lab"); err == nil {
+		t.Fatal("bare-word base should miss against unrelated flash rows")
+	}
+}

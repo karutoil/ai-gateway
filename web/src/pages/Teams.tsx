@@ -10,9 +10,9 @@ type Role = 'admin' | 'member' | 'readonly'
 type Org = { id: string; name: string; created_at: string }
 type Member = { id: string; org_id: string; user_id: string; role: Role; created_at: string }
 
-const roleTone: Record<Role, 'brand' | 'good' | 'neutral'> = {
-  admin: 'brand',
-  member: 'good',
+const roleTone: Record<Role, 'info' | 'neutral'> = {
+  admin: 'info',
+  member: 'neutral',
   readonly: 'neutral',
 }
 
@@ -161,13 +161,13 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
               const isActive = o.id === active?.id
               return (
                 <button key={o.id} onClick={()=>setActiveId(o.id)}
-                  className={`shrink-0 lg:w-full min-w-[220px] text-left rounded-xl border px-4 py-3.5 transition-all duration-150 ${
-                    isActive ? 'border-accent/50 bg-accent/10' : 'border-stone/60 bg-surface/80 hover:border-stone hover:bg-raised/60'
+                  className={`shrink-0 lg:w-full min-w-[220px] text-left rounded-lg border px-4 py-3 transition-colors duration-150 ${
+                    isActive ? 'border-accent/50 bg-accent/10' : 'border-stone bg-surface hover:border-muted/40 hover:bg-raised/60'
                   }`}>
                   <div className="flex items-center justify-between gap-3">
                     <div className="min-w-0">
-                      <div className={`text-sm truncate ${isActive?'font-semibold':'font-medium'}`}>{o.name}</div>
-                      <div className="text-xs text-muted mt-0.5 tabular-nums">
+                      <div className={`text-sm truncate ${isActive?'font-semibold text-paper':'font-medium text-muted'}`}>{o.name}</div>
+                      <div className="text-xs text-muted mt-0.5 font-mono tabular-nums">
                         {isActive
                           ? `${members.length} member${members.length===1?'':'s'}`
                           : o.created_at ? `since ${new Date(o.created_at).toLocaleDateString()}` : 'organization'}
@@ -184,10 +184,10 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
           <div className="min-w-0 space-y-3">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
               <div>
-                <h2 className="text-sm font-semibold tracking-tight">Members</h2>
+                <h2 className="text-[15px] font-semibold -tracking-tight text-paper">Members</h2>
                 <p className="text-xs text-muted mt-0.5">{active?.name}</p>
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex flex-wrap items-center gap-2">
                 <SegmentedControl<Role|'all'>
                   options={[{value:'all',label:'All'},{value:'admin',label:'Admin'},{value:'member',label:'Member'},{value:'readonly',label:'Readonly'}]}
                   value={filterRole}
@@ -216,7 +216,7 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
               ) : (
                 <tbody>
                   {filtered.map(m=>(
-                    <tr key={m.id}>
+                    <tr key={m.id} className="hover:bg-raised/60 transition-colors">
                       <Td>
                         <span className="inline-flex items-center gap-1 max-w-[260px]">
                           <span className="font-mono text-xs truncate" title={m.user_id}>{m.user_id}</span>
@@ -224,7 +224,7 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
                         </span>
                       </Td>
                       <Td><Badge tone={roleTone[m.role]}>{m.role}</Badge></Td>
-                      <Td className="text-xs text-muted tabular-nums whitespace-nowrap">{m.created_at? new Date(m.created_at).toLocaleDateString():'—'}</Td>
+                      <Td className="text-xs text-muted font-mono tabular-nums whitespace-nowrap">{m.created_at? new Date(m.created_at).toLocaleDateString():'—'}</Td>
                     </tr>
                   ))}
                   {filtered.length===0 && (

@@ -22,11 +22,17 @@ import (
 //   - Each upstream attempt waits at most the client's REMAINING first-byte
 //     budget, so the gateway regains control before the edge does.
 //   - Buffered requests that run out of budget get an honest 504 (which
-//     edges pass through) instead of a synthesized 524.
+//     edges pass through) instead of a synthesized 524 — including when the
+//     budget expires during the response BODY read (buffered responses only
+//     reach the client when complete, so the body is part of the wait).
 //   - Streaming requests commit SSE headers plus keepalive comment frames
 //     (": keepalive"), which keep the edge's first-byte/idle clocks fed; the
 //     upstream may then take as long as it needs while the client stays
-//     connected.
+//     connected. This covers BOTH silent phases of a stream: the wait for
+//     response headers (commitKeepalive after an attempt dies) and the
+//     headers→first-chunk gap (armFirstChunkUmbra inside the pumps) where
+//     headers-early/body-late upstreams — a thinking model behind an
+//     aggregator — used to starve the edge despite the watchdog being done.
 type ttfbController struct {
 	budget    time.Duration // 0 disables every check
 	start     time.Time     // client request start (shared across candidates)
@@ -73,9 +79,10 @@ func (c *ttfbController) remaining() time.Duration {
 	return left
 }
 
-// headersCommitted reports whether keepalive SSE headers are already on the
-// wire — after which a second WriteHeader is impossible and every further
-// failure must be delivered in-band.
+// headersCommitted reports whether a status line is already on the wire —
+// after which a second WriteHeader is impossible and every further failure
+// must be delivered in-band. True for BOTH commit kinds (keepalive umbra and
+// a real first-chunk commit via claimCommit).
 func (c *ttfbController) headersCommitted() bool {
 	return c != nil && c.committed.Load()
 }
@@ -99,12 +106,28 @@ func (c *ttfbController) stop() {
 	})
 }
 
+// claimCommit marks the response as committed — the caller is about to (or
+// just did) write the real response status. Exactly one of claimCommit and
+// commitKeepalive wins the committed flag, so a status line can never be
+// written twice even when the first-chunk umbra timer fires concurrently
+// with the first real chunk. Returns false when the keepalive umbra already
+// owns the wire: the caller must skip its WriteHeader and end the heartbeat
+// so real bytes take over the connection.
+func (c *ttfbController) claimCommit() bool {
+	if c == nil {
+		return true
+	}
+	return c.committed.CompareAndSwap(false, true)
+}
+
 // commitKeepalive writes SSE headers plus the first keepalive comment frame,
-// then starts the background heartbeat. The first call commits; later calls
-// are no-ops. Called only for streaming requests whose first-byte budget is
-// exhausted — buffered requests have no in-band keepalive and get an honest
-// 504 instead.
-func (c *ttfbController) commitKeepalive(w http.ResponseWriter, fallbackFrom string) {
+// then starts the background heartbeat. The first commit wins; later calls
+// (and calls after claimCommit) are no-ops. Called only for streaming
+// requests whose first-byte budget is exhausted — buffered requests have no
+// in-band keepalive and get an honest 504 instead. applyHeader, when
+// non-nil, decorates the committed headers LAST (so it may override the
+// defaults — e.g. X-Cache disposition or X-Fallback-Used).
+func (c *ttfbController) commitKeepalive(w http.ResponseWriter, applyHeader func(http.Header)) {
 	if c == nil || c.budget <= 0 || !c.committed.CompareAndSwap(false, true) {
 		return
 	}
@@ -113,8 +136,12 @@ func (c *ttfbController) commitKeepalive(w http.ResponseWriter, fallbackFrom str
 	hdr.Set("Cache-Control", "no-cache")
 	hdr.Set("Connection", "keep-alive")
 	hdr.Set("X-Cache", "MISS")
-	if fallbackFrom != "" {
-		hdr.Set("X-Fallback-Used", fallbackFrom)
+	// Tell buffering intermediaries (nginx and friends) to pass frames
+	// through unbuffered — the whole point of keepalive frames is to reach
+	// the edge before its first-byte timeout fires.
+	hdr.Set("X-Accel-Buffering", "no")
+	if applyHeader != nil {
+		applyHeader(hdr)
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, keepaliveFrame)
@@ -213,12 +240,36 @@ func writeSSEUpstreamError(w http.ResponseWriter, anthropicDialect bool, msg str
 // response headers within the client's remaining first-byte budget. It uses
 // time.AfterFunc rather than context.WithTimeout so a SUCCESSFUL header
 // arrival disarms the deadline — the response BODY (a long stream) must
-// never be bounded by the first-byte budget. Returns the timer to stop as
-// soon as Client.Do returns.
+// never be bounded by the first-byte budget. Callers handling STREAMS stop
+// the timer as soon as Client.Do returns; buffered callers keep it armed so
+// it also bounds the body read (their response reaches the client only when
+// complete). Returns the timer to stop when the attempt is done with it.
 func armTTFBWatchdog(c *ttfbController, attemptCancel context.CancelFunc) *time.Timer {
 	left := c.remaining()
 	if left <= 0 {
 		return nil
 	}
 	return time.AfterFunc(left, attemptCancel)
+}
+
+// armFirstChunkUmbra arms the PRE-FIRST-CHUNK silence breaker: the attempt
+// watchdog above disarms when response HEADERS arrive, but the gateway stays
+// silent until the stream's first body chunk commits. A headers-early /
+// body-late upstream (long thinking before the first token) burns the whole
+// edge window in that gap and eats a synthesized 524. The returned channel
+// fires when the client's remaining first-byte budget expires — the pump's
+// select loop must then call commitKeepalive so keepalive bytes reach the
+// edge while the first chunk is still pending. Already-committed streams and
+// TTFB-disabled setups get a nil channel (blocks forever in a select).
+// The returned stop func MUST be deferred by the pump.
+func (c *ttfbController) armFirstChunkUmbra() (<-chan time.Time, func()) {
+	if c == nil || c.budget <= 0 || c.committed.Load() {
+		return nil, func() {}
+	}
+	left := c.remaining()
+	if left < 0 {
+		left = 0 // budget already spent: fire immediately
+	}
+	t := time.NewTimer(left)
+	return t.C, func() { t.Stop() }
 }

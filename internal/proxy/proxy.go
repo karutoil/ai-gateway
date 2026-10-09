@@ -609,7 +609,7 @@ func (h *Handler) writeJSONCached(w http.ResponseWriter, r *http.Request, cacheK
 	// Model-list requests carry X-Cache like every other gateway response;
 	// log them so the cache disposition shows in reporting too (free
 	// metadata call: zero tokens, zero cost).
-	h.logRequestExtendedBodies(r.Header.Get("X-Gateway-Key-Prefix"), "", "", "models", http.StatusOK, 0, 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: "miss"})
+	h.logRequestExtendedBodies(r.Context(), r.Header.Get("X-Gateway-Key-Prefix"), "", "", "models", http.StatusOK, 0, 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: "miss"})
 }
 
 // upstreamForwardHeaders is an ALLOWLIST of client headers proxied to
@@ -937,7 +937,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			// Stamp the row as a gateway cache hit so reporting can separate
 			// cached responses from fresh upstream calls (token counts stay
 			// zero: cached responses are neither re-billed nor re-metered).
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
+			h.logRequestExtendedBodies(r.Context(), keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
 			return attemptOutcome{committed: true, status: status}
 		}
 		if h.Metrics != nil {
@@ -957,7 +957,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if f, canFlush := w.(http.Flusher); canFlush {
 				f.Flush()
 			}
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
+			h.logRequestExtendedBodies(r.Context(), keyPrefix, providerID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
 			return attemptOutcome{committed: true, status: status}
 		}
 		if h.Metrics != nil {
@@ -1005,12 +1005,20 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	)
 
 	for attempt := 0; ; attempt++ {
+		// Budget already spent and this stream is still silent: commit the
+		// keepalive umbra NOW so the edge sees bytes while this attempt runs
+		// (no-op once committed). Without it a slow attempt started after
+		// expiry keeps the client connection byteless and hands the edge a
+		// free 524.
+		if isStream && ttfb.expired() {
+			ttfb.commitKeepalive(w, applyFallbackHeader)
+		}
 		// Budget already spent by earlier candidates/retries and this call is
 		// buffered (nothing in-band to keep alive): fail fast instead of
 		// piling another silent attempt onto a doomed request.
 		if !isStream && ttfb.expired() {
 			httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
-			h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: cacheStatus})
+			h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: cacheStatus})
 			return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
 		}
 		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, body, isStream, isAnthropicUpstream)
@@ -1030,9 +1038,11 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		req = req.WithContext(attemptCtx)
 		ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 		resp, err := h.Client.Do(req)
-		if ttfbTimer != nil {
-			ttfbTimer.Stop()
-		}
+		// The watchdog stays armed past Client.Do: it must also bound the
+		// response BODY reads below (error bodies, buffered bodies — a
+		// buffered response reaches the client only when COMPLETE, so its
+		// body read is part of the client's first-byte wait). It is stopped
+		// only where a long-lived stream pump takes over the connection.
 		if err != nil {
 			// First-byte budget spent while the upstream stayed silent: turn
 			// the transport timeout into a controlled outcome before the edge
@@ -1054,7 +1064,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					// Streams: commit SSE headers + keepalive so the client
 					// (and any edge proxy) see bytes, then restart a fresh
 					// upstream attempt under the keepalive umbra.
-					ttfb.commitKeepalive(w, opts.fallbackFrom)
+					ttfb.commitKeepalive(w, applyFallbackHeader)
 					if retry.ShouldRetry(attempt, retryableCode(0)) {
 						sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
 						continue
@@ -1065,7 +1075,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				// Buffered (or exhausted retries): an honest 504 that edges
 				// pass through beats a synthesized 524 the gateway never sees.
 				httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
-				h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{CacheStatus: cacheStatus})
+				h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{CacheStatus: cacheStatus})
 				return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
 			}
 		}
@@ -1139,18 +1149,24 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				ttfb.stop()
 				writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream),
 					"upstream error "+strconv.Itoa(resp.StatusCode)+": "+upstreamErrorMessage(errBody, "client error"))
-				h.logRequestExtended(keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, true)
+				h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, true)
 				return attemptOutcome{committed: true, status: resp.StatusCode}
 			}
 			copyHeader(w.Header(), resp.Header)
 			applyFallbackHeader(w.Header())
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(errBody)
-			h.logRequestExtended(keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, true)
+			h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, true)
 			return attemptOutcome{committed: true, status: resp.StatusCode}
 		}
 
 		if isStream {
+			// Long-lived pump owns the connection now: disarm the first-byte
+			// watchdog (the pump's umbra/idle timers govern from here) so a
+			// healthy long stream is never killed by the header budget.
+			if ttfbTimer != nil {
+				ttfbTimer.Stop()
+			}
 			h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader, ttfb, streamCache, cacheStatus)
 			ttfb.stop()
 			return attemptOutcome{committed: true, status: lastStatus}
@@ -1158,7 +1174,19 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if ttfbTimer != nil {
+			ttfbTimer.Stop() // body read is finished with the first-byte deadline
+		}
 		lastBody = bodyBytes
+		// A buffered response reaches the client only when COMPLETE, so the
+		// body read is part of the client's first-byte wait: when the budget
+		// expires mid-read (the watchdog cancelled the attempt), answer an
+		// honest 504 instead of sitting silent into a synthesized edge 524.
+		if readErr != nil && ttfb.expired() {
+			httperr.Proxy(w, http.StatusGatewayTimeout, "upstream is not responding (first-byte timeout)")
+			h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: cacheStatus})
+			return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
+		}
 		if readErr != nil && len(bodyBytes) == 0 {
 			lastErr, lastStatus = readErr, 0
 			if retry.ShouldRetry(attempt, 0) {
@@ -1202,7 +1230,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	if lastStatus == 0 && len(lastBody) == 0 {
 		log.Error().Err(lastErr).Str("target", targetURL).Msg("upstream error")
 		httperr.Proxy(w, http.StatusBadGateway, "upstream unavailable")
-		h.logRequestExtended(keyPrefix, providerID, model, endpoint, 502, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, 502, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return attemptOutcome{committed: true, status: http.StatusBadGateway}
 	}
 
@@ -1211,7 +1239,8 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		if pt == 0 && ct == 0 {
 			pt, ct = extractAnthropicUsageFromSSEChunk(lastBody)
 		}
-		cost := h.costForModel(model, pt, ct)
+		split := splitOrFallback(cacheSplitFromBody(lastBody), pt, ct)
+		cost := h.costForModel(model, split)
 		outBody := lastBody
 
 		needsChatShape := endpoint == "chat.completions" && isAnthropicUpstream && lastStatus == 200
@@ -1221,7 +1250,8 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				pt2, ct2 := extractUsage(translated)
 				if pt2 != 0 || ct2 != 0 {
 					pt, ct = pt2, ct2
-					cost = h.costForModel(model, pt, ct)
+					split = splitOrFallback(cacheSplitFromBody(translated), pt, ct)
+					cost = h.costForModel(model, split)
 				}
 				outBody = translated
 			}
@@ -1241,7 +1271,8 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if converted := chatToResponsesJSON(outBody, model); converted != nil {
 				if pt2, ct2 := extractUsage(converted); pt2 != 0 || ct2 != 0 {
 					pt, ct = pt2, ct2
-					cost = h.costForModel(model, pt, ct)
+					split = splitOrFallback(cacheSplitFromBody(converted), pt, ct)
+					cost = h.costForModel(model, split)
 				}
 				outBody = converted
 				// Chain support for the next turn: remember this turn's
@@ -1259,7 +1290,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				// honestly instead.
 				log.Error().Str("model", model).Str("provider", providerID).Msg("responses translation produced no usable output; returning 502")
 				httperr.Proxy(w, http.StatusBadGateway, "upstream returned an untranslatable response for the responses endpoint")
-				h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), pt, ct, cost, isStream)
+				h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), pt, ct, cost, isStream)
 				return attemptOutcome{committed: true, status: http.StatusBadGateway}
 			}
 		}
@@ -1270,20 +1301,13 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if converted := anthropicToOpenAICompletion(outBody, model); converted != nil {
 				if pt2, ct2 := extractUsage(converted); pt2 != 0 || ct2 != 0 {
 					pt, ct = pt2, ct2
-					cost = h.costForModel(model, pt, ct)
+					split = splitOrFallback(cacheSplitFromBody(converted), pt, ct)
+					cost = h.costForModel(model, split)
 				}
 				outBody = converted
 			}
 		}
 
-		h.recordUsage(keyPrefix, r, pt+ct, cost)
-
-		if cacheKey != "" && lastStatus >= 200 && lastStatus < 400 && len(outBody) <= 1<<20 {
-			hdr := http.Header{}
-			copyHeader(hdr, lastHdr)
-			hdr.Set("Content-Type", "application/json")
-			c.Set(cacheKey, outBody, lastStatus, hdr, cacheTTL)
-		}
 		copyHeader(w.Header(), lastHdr)
 		applyFallbackHeader(w.Header())
 		// Body-rewriting paths (anthropic→openai conversions, responses
@@ -1300,11 +1324,26 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		if (needsChatShape || needsResponsesShape) && lastStatus == 200 {
 			w.Header().Set("Content-Type", "application/json")
 		}
-		_, _, nd := extractUsageDetail(outBody)
-		meta := &logMeta{CacheStatus: cacheStatus, FinishReason: nd.FinishReason, CacheRead: nd.CacheRead, CacheWrite: nd.CacheWrite, Reasoning: nd.Reasoning, FallbackChain: marshalAttemptChain(opts.attempts)}
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, lastStatus, time.Since(start).Milliseconds(), pt, ct, cost, false, body, outBody, meta)
+		// Client bytes FIRST, bookkeeping after. The old order ran
+		// recordUsage + logRequestExtendedBodies (synchronous DB writes that
+		// queue on the connection pool with NO timeout) BEFORE the response
+		// went out — an 85s upstream plus a busy pool pushed the first byte
+		// past the edge's 100s window and Cloudflare 524'd a request the
+		// gateway had already fully serviced. Logging still sees the exact
+		// same data; only its ordering relative to the write changes.
 		w.WriteHeader(lastStatus)
 		w.Write(outBody)
+
+		h.recordUsage(keyPrefix, r, pt+ct, cost)
+		if cacheKey != "" && lastStatus >= 200 && lastStatus < 400 && len(outBody) <= 1<<20 {
+			hdr := http.Header{}
+			copyHeader(hdr, lastHdr)
+			hdr.Set("Content-Type", "application/json")
+			c.Set(cacheKey, outBody, lastStatus, hdr, cacheTTL)
+		}
+		_, _, nd := extractUsageDetail(outBody)
+		meta := &logMeta{CacheStatus: cacheStatus, FinishReason: nd.FinishReason, CacheRead: nd.CacheRead, CacheWrite: nd.CacheWrite, Reasoning: nd.Reasoning, FallbackChain: marshalAttemptChain(opts.attempts)}
+		h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, lastStatus, time.Since(start).Milliseconds(), pt, ct, cost, false, body, outBody, meta)
 		return attemptOutcome{committed: true, status: lastStatus}
 	}
 }
@@ -1730,9 +1769,21 @@ func (s *streamCacheCollector) commit(c cache.Cache, status int, contentType str
 
 func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx context.Context, resp *http.Response, model, keyPrefix, providerID, endpoint string, start time.Time, isAnthropicUpstream bool, applyFallbackHeader func(http.Header), ttfb *ttfbController, streamCache *streamCacheCollector, cacheStatus string) streamPumpResult {
 	res := streamPumpResult{}
+	var ttftMs int64 // ms to the upstream's first chunk (0 = none before death)
+
+	// Pre-first-chunk silence breaker: the attempt watchdog disarmed when
+	// response HEADERS arrived, but the client is still byteless until the
+	// first body chunk commits. A headers-early / body-late upstream (long
+	// thinking before the first token) burns the whole edge window in that
+	// gap and eats a synthesized 524 — the umbra timer below commits
+	// keepalive frames when the budget expires first. Both commit kinds race
+	// safely through claimCommit/commitKeepalive's shared CAS.
+	umbraC, stopUmbra := ttfb.armFirstChunkUmbra()
+	defer stopUmbra()
 
 	commit := func() {
-		if ttfb.headersCommitted() {
+		stopUmbra() // real bytes are committing; the keepalive deadline is moot
+		if !ttfb.claimCommit() {
 			// Keepalive umbra: SSE headers + first keepalive frame already
 			// flowed from the pre-commit watchdog. Only the heartbeat has to
 			// stop — real stream bytes now take over the wire.
@@ -1742,7 +1793,13 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		copyHeader(w.Header(), resp.Header)
 		applyFallbackHeader(w.Header())
 		w.Header().Set("X-Cache", "MISS")
+		// Never relay a pinned length on a stream: keepalive injection and
+		// anthropic<->openai reframing both change the byte count, and Go's
+		// server TRUNCATES writes beyond an explicitly set Content-Length —
+		// a stale one from the upstream kills the stream mid-flight.
+		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
+		ttfb.sent.Store(true) // any later WriteHeader must be swallowed
 	}
 	// First flusher probe AFTER commit: statusRecorder + chi wrappers all implement Flush.
 	flusher, _ := w.(http.Flusher)
@@ -1895,7 +1952,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		res.promptTokens, res.completionTokens = promptTok, completeTok
 		res.bodySnapshot = sample.Bytes()
 		res.capture = capture
-		cost := h.costForModel(model, promptTok, completeTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completeTok, liveDetail))
 		logStatus := http.StatusBadGateway
 		if clientGone {
 			logStatus = 499 // nginx convention: client closed request
@@ -1905,7 +1962,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		}
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Bool("client_gone", clientGone).Msg("mid-stream failure terminated")
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, endpoint, logStatus, time.Since(start).Milliseconds(), promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
+		h.logRequestStreamed(r.Context(), keyPrefix, providerID, model, endpoint, logStatus, time.Since(start).Milliseconds(), ttftMs, promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
 		return res
 	}
 
@@ -1919,7 +1976,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		res.promptTokens, res.completionTokens = promptTok, completeTok
 		res.bodySnapshot = sample.Bytes()
 		res.capture = capture
-		cost := h.costForModel(model, promptTok, completeTok)
+		cost := h.costForModel(model, streamSplit(promptTok, completeTok, liveDetail))
 		if reframe != nil {
 			if tail := reframe.finish(); len(tail) > 0 {
 				w.Write(tail)
@@ -1934,7 +1991,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		// disabled, commit is a no-op).
 		streamCache.commit(h.cacheOrNoop(), resp.StatusCode, resp.Header.Get("Content-Type"))
 		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
-		h.logRequestStreamed(keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
+		h.logRequestStreamed(r.Context(), keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), ttftMs, promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
 		return res
 	}
 
@@ -1944,6 +2001,12 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 			resp.Body.Close()
 			drainChan(chunks)
 			return fail("gateway client disconnected", true)
+
+		case <-umbraC:
+			// First-byte budget expired while the first chunk is still
+			// pending: commit keepalive so the client/edge see bytes. A
+			// no-op if a real chunk committed first.
+			ttfb.commitKeepalive(w, applyFallbackHeader)
 
 		case <-watchdogC:
 			resp.Body.Close() // unblocks the pump goroutine
@@ -1959,6 +2022,9 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 			// Process payload FIRST: Go's Read may deliver n>0 together with
 			// err==io.EOF on the same call.
 			if cm.n > 0 {
+				if ttftMs == 0 {
+					ttftMs = time.Since(start).Milliseconds()
+				}
 				buf := cm.data[:cm.n]
 				if first {
 					// Pre-commit sanity: never present an HTML error splash (or any
@@ -1975,7 +2041,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 						res.bodySnapshot = append(res.bodySnapshot[:0], buf...)
 						log.Error().Str("model", model).Str("provider", providerID).
 							Str("content_type", ct).Msg("upstream returned non-SSE payload for streaming request")
-						h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint,
+						h.logRequestExtendedBodies(r.Context(), keyPrefix, providerID, model, endpoint,
 							http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, buf)
 						res.midStreamFailure = true
 						if ttfb.headersCommitted() {
@@ -2284,15 +2350,17 @@ func (h *Handler) recordUsage(keyPrefix string, r *http.Request, tokens int, cos
 }
 
 // logRequestExtended is preserved for legacy callers/tests.
-func (h *Handler) logRequestExtended(keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, isStream bool) {
-	h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, isStream, nil, nil)
+func (h *Handler) logRequestExtended(ctx context.Context, keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, isStream bool) {
+	h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, isStream, nil, nil)
 }
 
 // logRequestStreamed persists a completed streaming exchange: the assembled
 // chat-shaped body wins over the raw SSE sample when body logging is on, and
 // the harvested usage detail (finish reason, cache/reasoning split) is stored
-// on the row.
-func (h *Handler) logRequestStreamed(keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, rawSample []byte, capture *streamCapture, cacheStatus string, liveDetail usageDetail) {
+// on the row. ttftMs is the upstream's time-to-first-chunk (0 when the stream
+// died before producing any); response_ms is derived as the post-TTFT
+// streaming window (the TPS denominator).
+func (h *Handler) logRequestStreamed(ctx context.Context, keyPrefix, providerID, model, endpoint string, status int, latencyMs, ttftMs int64, promptTokens, completionTokens int, costUSD float64, rawSample []byte, capture *streamCapture, cacheStatus string, liveDetail usageDetail) {
 	// Merge the always-on harvest with the capture's own (body-logging path)
 	// so enabling LOG_BODIES never reduces detail.
 	d := liveDetail
@@ -2316,12 +2384,13 @@ func (h *Handler) logRequestStreamed(keyPrefix, providerID, model, endpoint stri
 		CacheWrite:   d.CacheWrite,
 		Reasoning:    d.Reasoning,
 		CacheStatus:  cacheStatus,
+		TtftMs:       ttftMs,
 	}
 	if capture == nil {
-		h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, nil, rawSample, meta)
+		h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, nil, rawSample, meta)
 		return
 	}
-	h.logRequestExtendedDetail(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, rawSample, capture.body(), meta)
+	h.logRequestExtendedDetail(ctx, keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, true, rawSample, capture.body(), meta)
 }
 
 // logMeta carries the extended per-request observability fields beyond the
@@ -2334,11 +2403,17 @@ type logMeta struct {
 	Reasoning     int
 	CacheHit      bool   // served from the gateway response cache (X-Cache: HIT)
 	CacheStatus   string // hit | miss | bypass — disposition against the response cache
+	TtftMs        int64  // upstream time-to-first-chunk for streams (0 = non-stream / died before first chunk)
+	// EndUser / App are filled from the request context by the logging funnel
+	// (see attribution.go). They live here so every existing caller gets
+	// attribution without passing it explicitly.
+	EndUser string
+	App     string
 }
 
 // logRequestExtendedDetail is the full-fidelity insert used when captured
 // detail exists. Response body preference: assembled capture > raw sample.
-func (h *Handler) logRequestExtendedDetail(keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, isStream bool, rawSample, assembledBody []byte, meta *logMeta) {
+func (h *Handler) logRequestExtendedDetail(ctx context.Context, keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, isStream bool, rawSample, assembledBody []byte, meta *logMeta) {
 	if meta == nil {
 		meta = &logMeta{}
 	}
@@ -2346,7 +2421,7 @@ func (h *Handler) logRequestExtendedDetail(keyPrefix, providerID, model, endpoin
 	if len(respBody) == 0 {
 		respBody = rawSample
 	}
-	h.logRequestExtendedBodies(keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, isStream, nil, respBody, meta)
+	h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, status, latencyMs, promptTokens, completionTokens, costUSD, isStream, nil, respBody, meta)
 }
 
 // logRequestExtendedBodies persists a completed exchange. When handler body
@@ -2354,17 +2429,7 @@ func (h *Handler) logRequestExtendedDetail(keyPrefix, providerID, model, endpoin
 // credential material before insertion. meta, when present, adds the extended
 // usage-metadata columns (finish reason, cache/reasoning tokens, fallback
 // chain); legacy callers omit it and keep the original row shape.
-func (h *Handler) logRequestExtendedBodies(keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, isStream bool, requestBody, responseBody []byte, meta ...*logMeta) {
-	if h.Metrics != nil {
-		h.Metrics.IncRequests(providerID, model, endpoint, status)
-		h.Metrics.ObserveLatency(providerID, endpoint, time.Duration(latencyMs)*time.Millisecond)
-	}
-	if h.DB == nil {
-		return
-	}
-	id := uuid.NewString()
-	total := promptTokens + completionTokens
-
+func (h *Handler) logRequestExtendedBodies(ctx context.Context, keyPrefix, providerID, model, endpoint string, status int, latencyMs int64, promptTokens, completionTokens int, costUSD float64, isStream bool, requestBody, responseBody []byte, meta ...*logMeta) {
 	var m *logMeta
 	if len(meta) > 0 {
 		m = meta[0]
@@ -2372,6 +2437,48 @@ func (h *Handler) logRequestExtendedBodies(keyPrefix, providerID, model, endpoin
 	if m == nil {
 		m = &logMeta{}
 	}
+	// Attribution rides on the request context so all 47 logging call sites
+	// pick it up without threading it through every signature. An explicit
+	// field set by the caller wins over the context value.
+	if attr := AttributionFrom(ctx); attr.Any() {
+		if m.EndUser == "" {
+			m.EndUser = attr.EndUser
+		}
+		if m.App == "" {
+			m.App = attr.App
+		}
+	}
+	if h.Metrics != nil {
+		h.Metrics.IncRequests(providerID, model, endpoint, status)
+		h.Metrics.ObserveLatency(providerID, endpoint, time.Duration(latencyMs)*time.Millisecond)
+		// promptTokens is the folded total (cached input included in both
+		// dialects — see streamSplit), so the fresh bucket is what remains
+		// after the cache counts are separated back out. Emitting prompt
+		// without this subtraction would double-count cached tokens, which
+		// are also reported under their own token_type.
+		fresh := promptTokens - m.CacheRead - m.CacheWrite
+		if fresh < 0 {
+			fresh = 0
+		}
+		h.Metrics.ObserveRequest(otel.RequestMetrics{
+			Provider:    providerID,
+			Model:       model,
+			Endpoint:    endpoint,
+			CacheStatus: m.CacheStatus,
+			CostUSD:     costUSD,
+			Prompt:      fresh,
+			Completion:  completionTokens,
+			CacheRead:   m.CacheRead,
+			CacheWrite:  m.CacheWrite,
+			Reasoning:   m.Reasoning,
+			TtftMs:      m.TtftMs,
+		})
+	}
+	if h.DB == nil {
+		return
+	}
+	id := uuid.NewString()
+	total := promptTokens + completionTokens
 
 	reqBodyStr := ""
 	respBodyStr := ""
@@ -2403,9 +2510,19 @@ func (h *Handler) logRequestExtendedBodies(keyPrefix, providerID, model, endpoin
 	if m.CacheHit {
 		cacheHit = 1
 	}
-	if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
-		id, keyPrefix, providerID, model, endpoint, status, latencyMs, time.Now().UTC(), promptTokens, completionTokens, total, costUSD, isStream, nullIfEmpty(reqBodyStr), nullIfEmpty(respBodyStr),
-		nullIfEmpty(m.FinishReason), nullIfEmpty(m.FallbackChain), m.CacheRead, m.CacheWrite, m.Reasoning, cacheHit, nullIfEmpty(m.CacheStatus)); err != nil {
+	// TTFT observability: ttft_ms is the stream's first-chunk time;
+	// response_ms is the post-TTFT streaming window (latency - ttft, the TPS
+	// denominator). Both are 0 when no first chunk was seen — buffered rows
+	// have no first-token moment and must not pollute avg-TTFT/TPS math.
+	ttft := m.TtftMs
+	responseMs := int64(0)
+	if ttft > 0 && latencyMs > ttft {
+		responseMs = latencyMs - ttft
+	}
+	if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,response_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status,end_user,app) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+		id, keyPrefix, providerID, model, endpoint, status, latencyMs, ttft, responseMs, time.Now().UTC(), promptTokens, completionTokens, total, costUSD, isStream, nullIfEmpty(reqBodyStr), nullIfEmpty(respBodyStr),
+		nullIfEmpty(m.FinishReason), nullIfEmpty(m.FallbackChain), m.CacheRead, m.CacheWrite, m.Reasoning, cacheHit, nullIfEmpty(m.CacheStatus),
+		nullIfEmpty(m.EndUser), nullIfEmpty(m.App)); err != nil {
 		// The insert error was previously discarded, which let a dialect
 		// mismatch silently drop EVERY request row on Postgres. Log loudly so
 		// the next regression surfaces immediately.
@@ -2644,8 +2761,152 @@ func anthropicToOpenAICompletion(body []byte, model string) []byte {
 	return out
 }
 
-func (h *Handler) costForModel(modelID string, prompt, completion int) float64 {
-	if h.CatalogStore == nil || (prompt == 0 && completion == 0) {
+// streamSplit derives the billing split from accumulated stream totals.
+//
+// One rule covers both dialects, because in both the prompt total ALREADY
+// contains the cache-read tokens:
+//
+//	OpenAI     prompt_tokens includes prompt_tokens_details.cached_tokens
+//	           (a subset), and it has no cache-write concept at all.
+//	Anthropic  the SSE harvest folds cache_read_input_tokens and
+//	           cache_creation_input_tokens INTO promptTok, matching what
+//	           extractUsage does on the non-stream path.
+//
+// So the fresh bucket is the total minus both cache counts. CacheWrite is
+// always 0 for the OpenAI dialect, which makes subtracting it a no-op there.
+// Tracking the family separately was possible but strictly worse: it is a
+// second source of truth that can drift out of step with the fold above.
+func streamSplit(promptTok, completeTok int, d usageDetail) catalog.CacheSplit {
+	s := catalog.CacheSplit{
+		Fresh:      promptTok - d.CacheRead - d.CacheWrite,
+		CacheRead:  d.CacheRead,
+		CacheWrite: d.CacheWrite,
+		Completion: completeTok,
+	}
+	if s.Fresh < 0 {
+		s.Fresh = 0
+	}
+	return s
+}
+
+// splitOrFallback returns split when it carries usage. Otherwise it rebuilds a
+// conservative split from the raw token counts, so a body shape the split
+// parser does not recognise still bills at the standard input rate instead of
+// silently dropping to $0 (and thereby bypassing budgets).
+func splitOrFallback(split catalog.CacheSplit, prompt, completion int) catalog.CacheSplit {
+	if split.Any() || prompt+completion == 0 {
+		return split
+	}
+	return catalog.CacheSplit{Fresh: prompt, Completion: completion}
+}
+
+// readCompletionTokens mirrors readUsageTokens' completion precedence.' completion precedence.
+func readCompletionTokens(usage map[string]interface{}) int {
+	for _, k := range []string{"completion_tokens", "output_tokens", "completionTokens"} {
+		if v, ok := usage[k]; ok {
+			if n := toInt(v); n != 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// cacheSplitFromUsage normalizes one upstream usage object into a billing
+// split. The family is detected from field NAMES, because that is the only
+// reliable signal of how cached tokens relate to the prompt total:
+//
+//	Anthropic  cache_read_input_tokens / cache_creation_input_tokens are
+//	           siblings of input_tokens and ADD to the input.
+//	OpenAI     prompt_tokens_details.cached_tokens is a SUBSET of
+//	           prompt_tokens and must be subtracted out of the fresh bucket.
+//
+// Presence of the Anthropic pair is the discriminator; an upstream that
+// reports only the OpenAI shape is treated as subset semantics.
+func cacheSplitFromUsage(usage map[string]interface{}) catalog.CacheSplit {
+	var s catalog.CacheSplit
+	if usage == nil {
+		return s
+	}
+	_, hasRead := usage["cache_read_input_tokens"]
+	_, hasWrite := usage["cache_creation_input_tokens"]
+	if hasRead || hasWrite {
+		s.Fresh = toInt(usage["input_tokens"])
+		if s.Fresh == 0 {
+			s.Fresh = toInt(usage["prompt_tokens"])
+		}
+		s.CacheRead = toInt(usage["cache_read_input_tokens"])
+		s.CacheWrite = toInt(usage["cache_creation_input_tokens"])
+		s.Completion = readCompletionTokens(usage)
+		return s
+	}
+	total := toInt(usage["prompt_tokens"])
+	if total == 0 {
+		total = toInt(usage["input_tokens"])
+	}
+	cached := 0
+	for _, key := range []string{"prompt_tokens_details", "input_tokens_details"} {
+		if pd, ok := usage[key].(map[string]interface{}); ok {
+			if v, ok := pd["cached_tokens"]; ok {
+				if n := toInt(v); n != 0 {
+					cached = n
+					break
+				}
+			}
+		}
+	}
+	// Clamp: a cached count exceeding the prompt total would produce a
+	// negative fresh bucket and a negative charge.
+	if cached > total {
+		cached = total
+	}
+	s.Fresh = total - cached
+	s.CacheRead = cached
+	s.Completion = readCompletionTokens(usage)
+	return s
+}
+
+// cacheSplitFromMap is cacheSplitFromUsage over an already-parsed payload.
+func cacheSplitFromMap(m map[string]interface{}) catalog.CacheSplit {
+	if m == nil {
+		return catalog.CacheSplit{}
+	}
+	if usage, ok := m["usage"].(map[string]interface{}); ok {
+		return cacheSplitFromUsage(usage)
+	}
+	// Responses API frames wrap usage under "response".
+	if resp, ok := m["response"].(map[string]interface{}); ok {
+		if usage, ok := resp["usage"].(map[string]interface{}); ok {
+			return cacheSplitFromUsage(usage)
+		}
+	}
+	return catalog.CacheSplit{}
+}
+
+// cacheSplitFromBody parses a response body into a billing split.
+func cacheSplitFromBody(body []byte) catalog.CacheSplit {
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return catalog.CacheSplit{}
+	}
+	return cacheSplitFromMap(m)
+}
+
+// costForModel prices one completed request from its normalized token split.
+//
+// Pricing is cache-aware: cached input bills at the catalog's cache-read rate
+// rather than the standard input rate. Before this, every cached token — both
+// OpenAI's prompt_tokens_details.cached_tokens and Anthropic's
+// cache_read_input_tokens/cache_creation_input_tokens, which extractUsage
+// folds into the prompt at the input rate — was charged at full input price,
+// systematically overstating spend on cache-heavy traffic.
+func (h *Handler) costForModel(modelID string, split catalog.CacheSplit) float64 {
+	if !split.Any() {
+		h.incZeroCost(otel.ZeroCostNoUsage)
+		return 0
+	}
+	if h.CatalogStore == nil {
+		h.incZeroCost(otel.ZeroCostNoCatalog)
 		return 0
 	}
 	m, _, err := h.CatalogStore.FindBestMatch(modelID)
@@ -2655,15 +2916,37 @@ func (h *Handler) costForModel(modelID string, prompt, completion int) float64 {
 		// upstream spend invisible to cost budgets. Fall back to
 		// operator-configured default pricing when present:
 		//   price_fallback_input_usd_per_1m / price_fallback_output_usd_per_1m
-		// (settable via the dashboard Settings page).
+		// (settable via the dashboard Settings page). Cache tokens fold into
+		// the input rate here: fallback pricing carries no cache rates.
 		in := h.settingFloat("price_fallback_input_usd_per_1m")
 		out := h.settingFloat("price_fallback_output_usd_per_1m")
 		if in > 0 || out > 0 {
-			return float64(prompt)/1_000_000*in + float64(completion)/1_000_000*out
+			return float64(split.TotalInput())/1_000_000*in + float64(split.Completion)/1_000_000*out
 		}
+		// Unpriced but billable: real tokens were served for a model the
+		// catalog cannot price, and no fallback pricing is configured.
+		// Recording $0 here does NOT merely under-report spend — budget
+		// enforcement sums request_logs.cost_usd, so this traffic consumes
+		// no quota at all. Count it so the blind spot is alertable:
+		//   rate(gateway_zero_cost_requests_total{reason="catalog_miss"}[1h])
+		h.incZeroCost(otel.ZeroCostCatalogMiss)
 		return 0
 	}
-	return catalog.CostFor(m, prompt, completion)
+	cost := catalog.CostForSplit(m, split)
+	if cost == 0 {
+		// Catalog hit priced at zero (self-hosted / free tier). Distinct from
+		// catalog_miss so the actionable reason stays signal, not noise.
+		h.incZeroCost(otel.ZeroCostFreeModel)
+	}
+	return cost
+}
+
+// incZeroCost records a zero-cost disposition. Metrics is nil in tests and
+// slim builds, so this must stay nil-safe.
+func (h *Handler) incZeroCost(reason string) {
+	if h.Metrics != nil {
+		h.Metrics.IncZeroCost(reason)
+	}
 }
 
 // settingFloat reads a numeric system_config key ("" / unparseable → 0).
@@ -2831,6 +3114,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !bodyOK {
 		return
 	}
+	// Attribution is resolved once, here, while the body is in hand, and rides
+	// the request context so every downstream logging call site records it
+	// without threading it through the routing layers.
+	r = r.WithContext(WithAttribution(r.Context(), attributionFromRequest(r, body)))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -2936,6 +3223,10 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	if !bodyOK {
 		return
 	}
+	// Attribution is resolved once, here, while the body is in hand, and rides
+	// the request context so every downstream logging call site records it
+	// without threading it through the routing layers.
+	r = r.WithContext(WithAttribution(r.Context(), attributionFromRequest(r, body)))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -3115,6 +3406,10 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if !bodyOK {
 		return
 	}
+	// Attribution is resolved once, here, while the body is in hand, and rides
+	// the request context so every downstream logging call site records it
+	// without threading it through the routing layers.
+	r = r.WithContext(WithAttribution(r.Context(), attributionFromRequest(r, body)))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -3216,7 +3511,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	if cached, status, headers, ok := h.cacheOrNoop().Get(ck); ok {
 		h.serveCacheHit(w, cached, status, headers)
-		h.logRequestExtendedBodies(keyPrefix, "", "", "models", status, 0, 0, 0, 0, false, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
+		h.logRequestExtendedBodies(r.Context(), keyPrefix, "", "", "models", status, 0, 0, 0, 0, false, nil, nil, &logMeta{CacheHit: true, CacheStatus: "hit"})
 		return
 	}
 	// allowlist filter for Models — if key is restricted, only return allowed models
@@ -3495,6 +3790,10 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !bodyOK {
 		return
 	}
+	// Attribution is resolved once, here, while the body is in hand, and rides
+	// the request context so every downstream logging call site records it
+	// without threading it through the routing layers.
+	r = r.WithContext(WithAttribution(r.Context(), attributionFromRequest(r, body)))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -3624,6 +3923,10 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	if !bodyOK {
 		return
 	}
+	// Attribution is resolved once, here, while the body is in hand, and rides
+	// the request context so every downstream logging call site records it
+	// without threading it through the routing layers.
+	r = r.WithContext(WithAttribution(r.Context(), attributionFromRequest(r, body)))
 	rawModel := translate.ExtractModel(body)
 	model := h.resolveAlias(rawModel)
 	if !h.enforceModelAllowlist(w, r, rawModel, model) {
@@ -3756,11 +4059,13 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 			attemptCtx, attemptCancel := context.WithCancel(r.Context())
 			defer attemptCancel()
 			req = req.WithContext(attemptCtx)
+			// The watchdog stays armed through the probe BODY reads (they
+			// bound the client's first-byte silence exactly like the main
+			// path); it is stopped only where a long-lived stream pump takes
+			// over the connection. Its deadline is absolute (start + budget),
+			// so the retry loop needs no re-arm.
 			ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 			resp, err := h.Client.Do(req)
-			if ttfbTimer != nil {
-				ttfbTimer.Stop()
-			}
 			// Transient probe failures (upstream 429/5xx) are retried within
 			// the same budget before falling through: OpenCode Go rate-limits
 			// muse-spark bursts with 429s, and a silent probe fall-through
@@ -3777,11 +4082,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				}
 				req2.Header = req.Header.Clone()
 				req2 = req2.WithContext(attemptCtx)
-				ttfbTimer := armTTFBWatchdog(ttfb, attemptCancel)
 				resp, err = h.Client.Do(req2)
-				if ttfbTimer != nil {
-					ttfbTimer.Stop()
-				}
 			}
 			// Only an explicit 200 is a usable native reply. Location-less 3xx
 			// bodies arrive without transport error and previously passed through as
@@ -3793,6 +4094,12 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					// TRUE native pass-through streaming: relay chunk-by-chunk,
 					// flush per read. A false return means nothing was committed
 					// (dead-on-arrival upstream) — fall through to translated.
+					// The first-byte watchdog must stop here: the long-lived
+					// body reads ride attemptCtx and must outlive the budget
+					// (the pump's own umbra/idle timers govern from here on).
+					if ttfbTimer != nil {
+						ttfbTimer.Stop()
+					}
 					if out := h.streamNativeResponses(w, r, resp, model, keyPrefix, p.ID, start, ttfb); out.committed {
 						return
 					}
@@ -3811,8 +4118,8 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 						w.WriteHeader(resp.StatusCode)
 						w.Write(bodyBytes)
 						pt, ct2 := extractUsage(bodyBytes)
-						cost := h.costForModel(model, pt, ct2)
-						h.logRequestExtended(keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), pt, ct2, cost, false)
+						cost := h.costForModel(model, splitOrFallback(cacheSplitFromBody(bodyBytes), pt, ct2))
+						h.logRequestExtended(r.Context(), keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), pt, ct2, cost, false)
 						// Billing parity: the native non-stream path previously
 						// logged spend but never fed the budget ledger,
 						// silently bypassing quotas.
@@ -3841,7 +4148,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					} else {
 						w.Write([]byte(`{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"upstream rate limit exceeded; retry shortly"}}`))
 					}
-					h.logRequestExtended(keyPrefix, p.ID, model, "responses", http.StatusTooManyRequests, time.Since(start).Milliseconds(), 0, 0, 0, false)
+					h.logRequestExtended(r.Context(), keyPrefix, p.ID, model, "responses", http.StatusTooManyRequests, time.Since(start).Milliseconds(), 0, 0, 0, false)
 					return
 				}
 				// muse-spark-* models exist ONLY on the /responses endpoint;
@@ -3863,7 +4170,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					} else {
 						w.Write([]byte(fmt.Sprintf(`{"error":{"message":"upstream rejected this request with status %d","type":"proxy_error"}}`, resp.StatusCode)))
 					}
-					h.logRequestExtended(keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, false)
+					h.logRequestExtended(r.Context(), keyPrefix, p.ID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, false)
 					return
 				}
 			}

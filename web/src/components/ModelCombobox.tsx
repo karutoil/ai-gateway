@@ -141,7 +141,7 @@ export default function ModelCombobox({
     if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - width - 8)
     return (
       <div ref={dropdownRef} style={{ position: 'fixed', top, left, width, zIndex: 60 }}
-        className="bg-surface border border-stone/70 rounded-xl shadow-pop overflow-hidden backdrop-blur-xl">
+        className="bg-surface border border-stone rounded-lg shadow-pop overflow-hidden">
         <div className="max-h-[260px] overflow-auto py-1.5">
           {rows.length === 0 ? (
             <div className="px-3 py-4 text-xs text-muted text-center">
@@ -157,26 +157,26 @@ export default function ModelCombobox({
               return (
                 <div key={`${r.kind}-${r.value}-${idx}`}>
                   {showGroup && (
-                    <div className="px-3 pt-2.5 pb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-accent bg-raised/40 border-y border-stone/40 first:border-t-0">
+                    <div className="px-3 pt-2.5 pb-1 text-[11px] font-semibold uppercase tracking-wider text-muted bg-raised/60 border-y border-stone first:border-t-0">
                       {r.group}
                     </div>
                   )}
                   <button type="button" onMouseEnter={() => setHighlight(idx)}
                     onMouseDown={e => { e.preventDefault(); if (isAdd) add(r.value); else toggle(r.value) }}
-                    className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 text-sm ${isActive ? 'bg-accent/10' : ''} font-mono text-xs transition-colors`}>
+                    className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 transition-colors ${isActive ? 'bg-raised' : ''}`}>
                     <span className="flex items-center gap-2 min-w-0">
                       {isAdd ? (
                         <>
                           <span className="w-5 h-5 rounded-full border border-accent/40 bg-accent/10 flex items-center justify-center text-[11px] text-accent">+</span>
-                          <span className="truncate">Add <span className="text-accent font-semibold">"{r.value}"</span></span>
+                          <span className="truncate text-sm">Add <span className="text-accent font-medium">"{r.value}"</span></span>
                           <span className="hidden sm:inline font-mono text-[10px] text-muted ml-1">(wildcard allowed)</span>
                         </>
                       ) : (
                         <>
-                          <span className={`w-5 h-5 rounded-lg border flex items-center justify-center text-[10px] leading-none shrink-0 transition-all ${isSelected ? 'bg-accent border-transparent text-onaccent' : 'border-stone bg-app text-transparent'}`}>
+                          <span className={`w-5 h-5 rounded-md border flex items-center justify-center text-[10px] leading-none shrink-0 transition-all ${isSelected ? 'bg-accent border-transparent text-onaccent' : 'border-stone bg-app text-transparent'}`}>
                             {isSelected ? '✓' : ''}
                           </span>
-                          <span className="truncate" title={r.value}>{r.label}</span>
+                          <span className="truncate font-mono text-xs" title={r.value}>{r.label}</span>
                         </>
                       )}
                     </span>
@@ -188,7 +188,7 @@ export default function ModelCombobox({
             })
           )}
         </div>
-        <div className="border-t border-stone/60 px-3 py-2 flex items-center justify-between bg-raised/30">
+        <div className="border-t border-stone px-3 py-2 flex items-center justify-between bg-raised/60">
           <span className="font-mono text-[10px] text-muted">
             {footer ?? (value.length === 0 ? 'Empty = all models allowed' : `${value.length} model${value.length===1?'':'s'} restricted`)}
           </span>
@@ -203,9 +203,9 @@ export default function ModelCombobox({
   return (
     <div ref={rootRef} className="relative">
       <div onClick={() => inputRef.current?.focus()}
-        className={`flex flex-wrap items-center gap-1.5 min-h-[44px] bg-app/70 border rounded-xl px-2.5 py-2 cursor-text transition-all ${open ? 'border-accent/50 ring-2 ring-accent/20' : 'border-stone/70 hover:border-stone'} ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
+        className={`flex flex-wrap items-center gap-1.5 min-h-[36px] bg-app border rounded-lg px-2.5 py-1.5 cursor-text transition-colors ${open ? 'border-accent ring-2 ring-accent/20' : 'border-stone hover:border-muted/60'} ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
         {value.map(v => (
-          <span key={v} className="inline-flex items-center gap-1 bg-raised border border-accent/25 rounded-full pl-2.5 pr-1 py-1 text-xs font-mono text-paper">
+          <span key={v} className="inline-flex items-center gap-1 bg-raised border border-accent/25 rounded-full pl-2.5 pr-1 py-0.5 text-xs font-mono text-paper">
             <span className="max-w-[180px] truncate" title={chipLabel ? chipLabel(v) : v}>{chipLabel ? chipLabel(v) : v}</span>
             {!single && (
               <button type="button" onClick={e => { e.stopPropagation(); remove(v) }}
@@ -218,7 +218,7 @@ export default function ModelCombobox({
           onFocus={() => { setOpen(true); updateRect() }}
           onKeyDown={onKeyDown}
           placeholder={value.length === 0 || single ? placeholder : 'Add model...'}
-          className="flex-1 min-w-[140px] bg-transparent outline-none text-sm placeholder:text-muted/50 px-1 py-0.5"
+          className="flex-1 min-w-[140px] bg-transparent outline-none text-sm placeholder:text-muted px-1 py-0.5"
           disabled={disabled} autoComplete="off" spellCheck={false} />
         {loading && <span className="font-mono text-[10px] text-muted px-1">loading…</span>}
         {!loading && <span className="ml-auto text-muted text-xs px-1 select-none pointer-events-none">{open ? '▴' : '▾'}</span>}

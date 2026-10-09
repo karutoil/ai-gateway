@@ -13,18 +13,16 @@ export default {
         app: "rgb(var(--c-graphite) / <alpha-value>)",
         raised: "rgb(var(--c-raised) / <alpha-value>)",
         amber: "rgb(var(--c-amber) / <alpha-value>)",
+        good: "rgb(var(--c-good) / <alpha-value>)",
         accent: "rgb(var(--c-accent) / <alpha-value>)",
         onaccent: "rgb(var(--c-onaccent) / <alpha-value>)",
         ink: "rgb(var(--c-ink) / <alpha-value>)",
         cream: "rgb(var(--c-cream) / <alpha-value>)",
         danger: "rgb(var(--c-danger) / <alpha-value>)",
-        creamx: "#FDFBF7",
-        sand: "#F5F0E6",
-        clay: "#E8E0D1",
       },
       fontFamily: {
         sans: ["Inter", "system-ui", "-apple-system", "sans-serif"],
-        display: ["Fraunces", "Georgia", "serif"],
+        display: ["Inter", "system-ui", "sans-serif"],
         mono: ["JetBrains Mono", "IBM Plex Mono", "ui-monospace", "monospace"],
       },
       boxShadow: {
@@ -33,7 +31,7 @@ export default {
       },
       keyframes: {
         pageIn: {
-          '0%': { opacity: '0', transform: 'translateY(6px)' },
+          '0%': { opacity: '0', transform: 'translateY(4px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
@@ -42,8 +40,8 @@ export default {
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         modalIn: {
-          '0%': { opacity: '0', transform: 'translateY(8px)' },
-          '100%': { opacity: '1', transform: 'translateY(0)' },
+          '0%': { opacity: '0', transform: 'translateY(8px) scale(0.985)' },
+          '100%': { opacity: '1', transform: 'translateY(0) scale(1)' },
         },
         shimmer: {
           '0%, 100%': { opacity: '0.45' },
@@ -59,7 +57,7 @@ export default {
         },
       },
       animation: {
-        page: 'pageIn 0.25s ease-out',
+        page: 'pageIn 0.2s ease-out',
         fade: 'fadeIn 0.15s ease',
         toast: 'toastIn 0.2s ease-out',
         modal: 'modalIn 0.18s ease-out',

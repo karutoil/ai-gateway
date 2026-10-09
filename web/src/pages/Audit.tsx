@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import {
-  PageHeader, Card, Button, Badge, Icon, Input, TableShell, Th, Td,
+  PageHeader, Card, Button, Badge, Icon, Input, Select, TableShell, Th, Td,
   TableSkeleton, EmptyState, ErrorNote,
 } from '../components/ui'
 
@@ -19,7 +19,7 @@ const PAGE_SIZES = [25, 50, 100, 250]
 
 /** Render the audit `meta` JSON blob compactly, falling back to the raw string. */
 function MetaCell({ meta }: { meta?: string }) {
-  if (!meta) return <span className="text-muted/50">—</span>
+  if (!meta) return <span className="text-muted">—</span>
   let text = meta
   try {
     const j = JSON.parse(meta)
@@ -60,14 +60,14 @@ export default function Audit(){
   const hasNext = total != null ? offset + rows.length < total : rows.length === limit
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <PageHeader
         eyebrow="Govern · Trust"
         title="Audit trail"
         description="Who did what, to which target, and when — paginated, filterable by actor, admin-only."
         actions={
-          <Button variant="primary" onClick={()=>load()} disabled={loading}>
-            <Icon name="refresh" size={15}/>Refresh
+          <Button variant="secondary" size="sm" onClick={()=>load()} disabled={loading}>
+            <Icon name="refresh" size={14}/>Refresh
           </Button>
         }
       />
@@ -86,7 +86,7 @@ export default function Audit(){
       {!loadError && (
         <>
           {/* Filters + pagination controls */}
-          <Card className="!p-3.5 flex flex-col sm:flex-row sm:items-center gap-2 !rounded-xl">
+          <Card className="flex flex-col sm:flex-row sm:items-center gap-2">
             <form
               className="relative flex-1 min-w-[180px]"
               onSubmit={(e)=>{ e.preventDefault(); setActor(actorInput.trim()) }}
@@ -94,17 +94,16 @@ export default function Audit(){
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
               <Input value={actorInput} onChange={e=>setActorInput(e.target.value)} placeholder="Filter by actor (username)…" className="pl-9"/>
             </form>
-            <label className="flex items-center gap-2 text-xs text-muted">
+            <label className="flex items-center gap-2 text-xs font-medium text-muted">
               Rows
-              <select
+              <Select
                 value={limit}
                 onChange={e=>setLimit(Number(e.target.value))}
-                className="bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-accent/60"
               >
                 {PAGE_SIZES.map(n=> <option key={n} value={n}>{n}</option>)}
-              </select>
+              </Select>
             </label>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 sm:ml-auto">
               <Button variant="secondary" size="sm" disabled={!hasPrev || loading} onClick={()=>setOffset(Math.max(0, offset - limit))}>
                 <Icon name="chevronLeft" size={13}/> Prev
               </Button>
@@ -118,48 +117,46 @@ export default function Audit(){
           </Card>
 
           <TableShell>
-            <table className="w-full text-sm min-w-[720px]">
-              <thead>
-                <tr>
-                  <Th>When</Th>
-                  <Th>Actor</Th>
-                  <Th>Action</Th>
-                  <Th>Target</Th>
-                  <Th>Meta</Th>
-                </tr>
-              </thead>
-              {loading ? (
-                <TableSkeleton rows={10} cols={5}/>
-              ) : rows.length===0 ? (
-                <tbody>
-                  <tr><td colSpan={5}>
-                    <EmptyState
-                      icon="logs"
-                      title={offset > 0 ? 'No events on this page' : 'No audit events yet'}
-                      hint={offset > 0
-                        ? 'Go back a page or clear the actor filter.'
-                        : 'Privileged actions (provider/key/user changes, settings edits) will appear here.'}
-                    />
-                  </td></tr>
-                </tbody>
-              ) : (
-                <tbody>
-                  {rows.map(r=>(
-                    <tr key={r.id} className="hover:bg-raised/50 transition-colors">
-                      <Td className="whitespace-nowrap text-xs text-muted tabular-nums">{new Date(r.created_at).toLocaleString()}</Td>
-                      <Td className="font-mono text-xs">{r.actor || '—'}</Td>
-                      <Td><Badge tone="neutral">{r.action}</Badge></Td>
-                      <Td className="font-mono text-xs">
-                        {r.target_type
-                          ? <span title={`${r.target_type}:${r.target_id ?? ''}`} className="block truncate max-w-[220px]">{r.target_type}:{String(r.target_id ?? '').slice(0,12)}</span>
-                          : <span className="text-muted/50">—</span>}
-                      </Td>
-                      <Td><MetaCell meta={r.meta}/></Td>
-                    </tr>
-                  ))}
-                </tbody>
-              )}
-            </table>
+            <thead>
+              <tr>
+                <Th>When</Th>
+                <Th>Actor</Th>
+                <Th>Action</Th>
+                <Th>Target</Th>
+                <Th>Meta</Th>
+              </tr>
+            </thead>
+            {loading ? (
+              <TableSkeleton rows={10} cols={5}/>
+            ) : rows.length===0 ? (
+              <tbody>
+                <tr><td colSpan={5}>
+                  <EmptyState
+                    icon="logs"
+                    title={offset > 0 ? 'No events on this page' : 'No audit events yet'}
+                    hint={offset > 0
+                      ? 'Go back a page or clear the actor filter.'
+                      : 'Privileged actions (provider/key/user changes, settings edits) will appear here.'}
+                  />
+                </td></tr>
+              </tbody>
+            ) : (
+              <tbody>
+                {rows.map(r=>(
+                  <tr key={r.id} className="hover:bg-raised/60 transition-colors">
+                    <Td className="whitespace-nowrap font-mono text-xs text-muted tabular-nums">{new Date(r.created_at).toLocaleString()}</Td>
+                    <Td className="font-mono text-xs">{r.actor || '—'}</Td>
+                    <Td><Badge tone="neutral">{r.action}</Badge></Td>
+                    <Td className="font-mono text-xs">
+                      {r.target_type
+                        ? <span title={`${r.target_type}:${r.target_id ?? ''}`} className="block truncate max-w-[220px]">{r.target_type}:{String(r.target_id ?? '').slice(0,12)}</span>
+                        : <span className="text-muted">—</span>}
+                    </Td>
+                    <Td><MetaCell meta={r.meta}/></Td>
+                  </tr>
+                ))}
+              </tbody>
+            )}
           </TableShell>
 
           {!loading && rows.length > 0 && (

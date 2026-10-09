@@ -3,7 +3,7 @@ import { api } from '../lib/api'
 import type { LBRule, LBMemberInput, RoutingStrategy } from '../lib/api'
 import {
   Badge, Button, Card, Confirm, EmptyState, ErrorNote, Field, HealthDot,
-  Icon, PageHeader, SegmentedControl, TableShell, Td, Th, useToast,
+  Icon, Input, PageHeader, SegmentedControl, TableShell, Td, Th, useToast,
 } from '../components/ui'
 import ModelCombobox from '../components/ModelCombobox'
 
@@ -303,7 +303,10 @@ export default function Routing({ role = 'admin' }: { role?: string }){
 
   /** Ordered-member chip controls share one ghost icon-button style. */
   const chipBtnCls =
-    'w-6 h-6 rounded-full flex items-center justify-center text-muted hover:text-paper hover:bg-stone transition-colors disabled:opacity-30 disabled:pointer-events-none'
+    'w-6 h-6 rounded-full flex items-center justify-center text-muted hover:text-paper hover:bg-raised transition-colors disabled:opacity-30 disabled:pointer-events-none'
+  /** Destructive chip control: no hover:text-paper here so hover:text-danger wins. */
+  const chipDelBtnCls =
+    'w-6 h-6 rounded-full flex items-center justify-center text-muted hover:text-danger hover:bg-raised transition-colors disabled:opacity-30 disabled:pointer-events-none'
 
   const chainLabel = (m: BuilderMember) => (m.model_override || '').trim() || m.name || m.provider_id
 
@@ -325,12 +328,12 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           'Pick a primary model, then the other models in the list — the same model on another provider, or a different one. Failover walks the list when one fails; round robin, random, and weighted each pick one model per request. The provider comes with the model. Pin with openai/gpt-4o or X-Provider to bypass.'
         }
         actions={
-          <div className="flex items-center gap-2">
+          <>
             <Button variant="secondary" size="sm" onClick={refreshModels} disabled={discovering} title="Fetch model lists from every provider's API">
               <Icon name="zap" size={14}/> {discovering ? 'Discovering…' : 'Refresh models'}
             </Button>
-            <Badge tone="good" dot>{rules.length} rules</Badge>
-          </div>
+            <Badge tone="neutral">{rules.length} rules</Badge>
+          </>
         }
       />
 
@@ -364,68 +367,65 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           />
         </Card>
       ) : (
-        <TableShell>
-          <table className="w-full text-sm min-w-[640px]">
-            <thead>
-              <tr>
-                <Th>Primary model</Th>
-                <Th>Strategy</Th>
-                <Th>Models</Th>
-                <Th className="text-right">Actions</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {rules.map(r=> (
-                <tr key={r.model} className={`transition-colors ${editing===r.model ? 'bg-amber/5' : 'hover:bg-app/40'}`}>
-                  <Td><span className="font-mono text-sm">{r.model}</span></Td>
-                  <Td><Badge tone="neutral">{strategyLabel(r.strategy)}</Badge></Td>
-                  <Td>
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {(r.providers || []).map((m, i)=> (
-                        <span key={`${m.provider_id}-${i}`} className="contents">
-                          {i > 0 && <Icon name="chevronDown" size={11} className="-rotate-90 text-muted/60"/>}
-                          <span
-                            className="inline-flex items-center gap-1.5 bg-app/60 border border-stone rounded-full pl-1 pr-2.5 py-1 text-xs font-mono">
-                            <span className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center shrink-0 ${i===0 ? 'bg-accent text-onaccent' : 'bg-stone'}`}>
-                              {i===0 ? '1' : i+1}
-                            </span>
-                            <HealthDot health={m.health_status} />
-                            <span className="max-w-[180px] truncate" title={`${m.name} · ${m.model_override || r.model}`}>
-                              {m.model_override || r.model}
-                            </span>
-                            <span className="text-muted/70 max-w-[90px] truncate">via {m.name}</span>
-                            {!!m.weight && r.strategy === 'weighted' && <span className="text-muted">w:{m.weight}</span>}
+        <TableShell minWidth={640}>
+          <thead>
+            <tr>
+              <Th>Primary model</Th>
+              <Th>Strategy</Th>
+              <Th>Models</Th>
+              <Th className="text-right">Actions</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {rules.map(r=> (
+              <tr key={r.model} className={`transition-colors ${editing===r.model ? 'bg-accent/5' : 'hover:bg-raised/60'}`}>
+                <Td><span className="font-mono text-sm">{r.model}</span></Td>
+                <Td><Badge tone="neutral">{strategyLabel(r.strategy)}</Badge></Td>
+                <Td>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {(r.providers || []).map((m, i)=> (
+                      <span key={`${m.provider_id}-${i}`} className="contents">
+                        {i > 0 && <Icon name="chevronDown" size={11} className="-rotate-90 text-muted"/>}
+                        <span
+                          className="inline-flex items-center gap-1.5 bg-app/60 border border-stone rounded-full pl-1 pr-2.5 py-1 text-xs font-mono">
+                          <span className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center shrink-0 ${i===0 ? 'bg-accent text-onaccent' : 'bg-raised text-muted'}`}>
+                            {i===0 ? '1' : i+1}
                           </span>
+                          <HealthDot health={m.health_status} />
+                          <span className="max-w-[180px] truncate" title={`${m.name} · ${m.model_override || r.model}`}>
+                            {m.model_override || r.model}
+                          </span>
+                          <span className="text-muted max-w-[90px] truncate">via {m.name}</span>
+                          {!!m.weight && r.strategy === 'weighted' && <span className="text-muted">w:{m.weight}</span>}
                         </span>
-                      ))}
-                      {(r.providers||[]).length===0 && <span className="text-muted text-xs">no models</span>}
-                    </div>
-                  </Td>
-                  <Td className="text-right whitespace-nowrap">
-                    <div className="inline-flex gap-1.5">
-                      <Button variant="secondary" size="sm" onClick={()=>startEdit(r)}>
-                        <Icon name="pencil" size={13}/> Edit
-                      </Button>
-                      <Button variant="ghost" size="sm" onClick={()=>setPendingDelete(r)} title={`Delete rule ${r.model}`}
-                        className="hover:text-red-400">
-                        <Icon name="trash" size={14}/> Delete
-                      </Button>
-                    </div>
-                  </Td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                      </span>
+                    ))}
+                    {(r.providers||[]).length===0 && <span className="text-muted text-xs">no models</span>}
+                  </div>
+                </Td>
+                <Td className="text-right whitespace-nowrap">
+                  <div className="inline-flex gap-1.5">
+                    <Button variant="secondary" size="sm" onClick={()=>startEdit(r)}>
+                      <Icon name="pencil" size={13}/> Edit
+                    </Button>
+                    <Button variant="danger" size="sm" onClick={()=>setPendingDelete(r)} title={`Delete rule ${r.model}`}>
+                      <Icon name="trash" size={14}/> Delete
+                    </Button>
+                  </div>
+                </Td>
+              </tr>
+            ))}
+          </tbody>
         </TableShell>
       )
       )}
 
       {/* Builder / editor */}
-      <div ref={builderRef} className="scroll-mt-24">
-        <Card className={editing ? 'border-accent' : ''}>
+      <div ref={builderRef} className={`scroll-mt-24 rounded-lg ${editing ? 'ring-2 ring-accent/70' : ''}`}>
+        <Card>
           <div className="flex items-start justify-between gap-3 mb-4">
             <div>
-              <h2 className="font-semibold tracking-tight flex items-center gap-2">
+              <h2 className="font-display text-[15px] font-semibold -tracking-tight flex items-center gap-2">
                 <Icon name="route" size={16} className="text-accent"/>
                 {editing ? <>Edit <span className="font-mono">"{editing}"</span></> : 'New route'}
               </h2>
@@ -466,13 +466,13 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           </div>
 
           <div className="mt-5">
-            <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">
               {strategy === 'failover'
                 ? 'Add a fallback — tried only if the models above fail'
                 : 'Add a model — another choice in the pool'}
             </div>
             {providers.length===0 ? (
-              <div className="border border-dashed border-stone rounded-xl p-4 text-muted text-sm">No providers yet — add one on the Providers page first.</div>
+              <div className="border border-dashed border-stone rounded-lg p-4 text-muted text-sm">No providers yet — add one on the Providers page first.</div>
             ) : (
               <>
                 <ModelCombobox
@@ -499,7 +499,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
           </div>
 
           <div className="mt-5">
-            <div className="text-xs font-medium text-muted uppercase tracking-wide mb-2">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">
               {strategy === 'failover' ? 'Fallback chain' : 'Model pool'} ({members.length === 0 ? 'empty' : `${members.length} model${members.length===1?'':'s'}`})
             </div>
             {members.length===0 ? (
@@ -515,8 +515,8 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                   const isDup = duplicateUids.get(m.uid) === true
                   const noModel = !(m.model_override || '').trim()
                   return (
-                    <div key={m.uid} className={`flex flex-wrap items-center gap-2 rounded-lg bg-app/50 border px-2 py-1.5 ${isDup || noModel ? 'border-red-500/60' : 'border-stone'}`}>
-                      <span className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center shrink-0 ${i===0 ? 'bg-accent text-onaccent' : 'bg-stone'}`}>{i+1}</span>
+                    <div key={m.uid} className={`flex flex-wrap items-center gap-2 rounded-lg bg-app/50 border px-2 py-1.5 ${isDup || noModel ? 'border-danger/50 bg-danger/5' : 'border-stone'}`}>
+                      <span className={`w-5 h-5 rounded-full text-[10px] flex items-center justify-center shrink-0 ${i===0 ? 'bg-accent text-onaccent' : 'bg-raised text-muted border border-stone'}`}>{i+1}</span>
                       <HealthDot health={meta.health_status} />
                       <span className="min-w-0">
                         <span className="text-xs font-mono">{m.model_override || '—'}</span>
@@ -525,18 +525,20 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                       {strategy === 'weighted' && (
                         <label className="inline-flex items-center gap-1 text-xs text-muted">
                           w
-                          <input
-                            type="number" min={1} max={100} value={m.weight ?? 50}
-                            onChange={e=> setMemberWeight(m.uid, Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
-                            className="w-14 rounded border border-stone bg-raised px-1.5 py-0.5 text-xs font-mono"
-                          />
+                          <span className="block w-20">
+                            <Input
+                              type="number" min={1} max={100} value={m.weight ?? 50}
+                              onChange={e=> setMemberWeight(m.uid, Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
+                              className="text-xs font-mono tabular-nums"
+                            />
+                          </span>
                         </label>
                       )}
                       {isDup && (
-                        <span className="text-[11px] text-red-400">duplicate option — same provider + model</span>
+                        <span className="text-[11px] text-danger">duplicate option — same provider + model</span>
                       )}
                       {noModel && (
-                        <span className="text-[11px] text-red-400">no model — remove and pick one from the list</span>
+                        <span className="text-[11px] text-danger">no model — remove and pick one from the list</span>
                       )}
                       <span className="flex-1"/>
                       <button type="button" onClick={()=>moveMember(m.uid,-1)} disabled={i===0}
@@ -548,7 +550,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
                         <Icon name="chevronDown" size={12}/>
                       </button>
                       <button type="button" onClick={()=>removeMember(m.uid)} aria-label={`Remove ${chainLabel(m)}`} title="Remove"
-                        className={`${chipBtnCls} hover:!text-red-400`}>
+                        className={chipDelBtnCls}>
                         <Icon name="x" size={12}/>
                       </button>
                     </div>
@@ -563,7 +565,7 @@ export default function Routing({ role = 'admin' }: { role?: string }){
               <Icon name="check" size={15}/> {busy ? 'Saving' : editing ? 'Save changes' : 'Create route'}
             </Button>
             {!canSave && !busy && (
-              <span className="font-mono text-[11px] text-muted">
+              <span className="text-xs text-muted">
                 {hasDuplicates
                   ? 'Remove duplicate provider + model options first.'
                   : missingModel
@@ -576,8 +578,8 @@ export default function Routing({ role = 'admin' }: { role?: string }){
         </Card>
       </div>
 
-      <Card className="bg-app/40">
-        <div className="font-mono text-xs text-muted uppercase tracking-wide">Tip</div>
+      <Card>
+        <div className="text-[11px] font-semibold uppercase tracking-wider text-muted">Tip</div>
         <p className="text-xs text-muted mt-1 leading-relaxed">
           The primary model is what callers send. Every other row is another model — the same one on a
           different provider, or a different model — and the strategy decides how the list is used.{' '}

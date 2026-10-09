@@ -4,7 +4,7 @@ import { api } from '../lib/api'
 import { registerPasskey, authenticatePasskey } from '../lib/webauthn'
 import UserPermissionsModal from './UserPermissionsModal'
 import {
-  PageHeader, Card, Button, Input, Select, Field, Badge, Icon, CopyButton,
+  PageHeader, Card, Button, Input, Select, Field, Badge, Icon, CopyButton, Avatar,
   TableShell, Th, Td, TableSkeleton, EmptyState, ErrorNote, Modal, Confirm, useToast,
 } from '../components/ui'
 
@@ -30,8 +30,8 @@ function ago(iso?: string | null): string {
   return new Date(iso).toLocaleDateString()
 }
 
-const ROLE_TONE: Record<string, 'info' | 'good' | 'warn' | 'neutral'> = {
-  admin: 'info', member: 'good', support: 'warn', readonly: 'neutral',
+const ROLE_TONE: Record<string, 'info' | 'neutral'> = {
+  admin: 'info', member: 'neutral', support: 'neutral', readonly: 'neutral',
 }
 
 const ROLE_OPTIONS = (
@@ -42,14 +42,6 @@ const ROLE_OPTIONS = (
     <option value="readonly">readonly — view only</option>
   </>
 )
-
-function Avatar({ user }: { user: DashboardUser }) {
-  return (
-    <span className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center text-onaccent text-sm font-bold shrink-0 select-none">
-      {(user.display_name || user.username)[0]?.toUpperCase()}
-    </span>
-  )
-}
 
 export default function Users(){
 	const navigate = useNavigate();
@@ -213,7 +205,7 @@ export default function Users(){
       {Object.entries(recoveryCodes).map(([uid, code]) => {
         const u = list.find(x=>x.id===uid)
         return (
-          <div key={uid} className="rounded-xl border border-accent/30 bg-accent/10 p-4">
+          <div key={uid} className="rounded-lg border border-accent/30 bg-accent/10 p-4">
             <div className="flex items-start gap-3">
               <div className="w-9 h-9 rounded-lg bg-accent/15 text-accent flex items-center justify-center shrink-0">
                 <Icon name="lock" size={17} />
@@ -221,7 +213,7 @@ export default function Users(){
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-semibold text-accent">Recovery code for {u?.username || 'user'}</div>
                 <div className="text-xs text-muted mt-0.5">Store it now — shown only once. Required if the passkey is lost.</div>
-                <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-accent/30 bg-graphite/60 px-3 py-2">
+                <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-stone bg-raised px-3 py-2">
                   <code className="font-mono text-sm text-paper break-all min-w-0 flex-1">{code}</code>
                   <CopyButton value={code} label="Copy recovery code" />
                 </div>
@@ -237,8 +229,8 @@ export default function Users(){
       {canManage && (
         <Card>
           <div className="flex items-center gap-2 mb-4">
-            <Icon name="plus" size={15} className="text-accent" />
-            <h3 className="font-semibold text-sm">Create user</h3>
+            <Icon name="plus" size={15} className="text-muted" />
+            <h3 className="font-semibold text-[15px] -tracking-tight">Create user</h3>
           </div>
           {createError && <div className="mb-3"><ErrorNote message={createError} /></div>}
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
@@ -264,8 +256,13 @@ export default function Users(){
         </Card>
       )}
 
-      <TableShell>
-        <table className="w-full text-sm min-w-[860px]">
+      <TableShell minWidth={860} footer={
+        <div className="px-4 py-3 border-t border-stone bg-app/60 text-[11px] text-muted leading-relaxed">
+          RBAC: <span className="text-paper font-medium">admin</span> = full access · <span className="text-paper font-medium">support / member</span> = providers &amp; keys · <span className="text-paper font-medium">readonly</span> = view only.
+          Use <span className="text-paper">Perms</span> for fine-grained overrides (e.g. let a user see only their own keys) — changes apply immediately.
+          Passkeys use WebAuthn — the private key stays on device; a recovery code is required if the passkey is lost.
+        </div>
+      }>
           <thead>
             <tr>
               <Th>User</Th>
@@ -282,15 +279,15 @@ export default function Users(){
           ) : (
             <tbody>
               {list.map(u=>(
-                <tr key={u.id} className={`${u.disabled?'opacity-50':''} hover:bg-stone/20 transition-colors`}>
+                <tr key={u.id} className={`${u.disabled?'opacity-50':''} hover:bg-raised/60 transition-colors`}>
                   <Td>
                     <div className="flex items-center gap-3 min-w-0">
-                      <Avatar user={u} />
+                      <Avatar name={u.display_name || u.username} />
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="font-semibold truncate">{u.username}</span>
                           {u.id===me?.id && (
-                            <span className="text-[10px] font-semibold uppercase tracking-wide bg-accent/15 text-accent px-1.5 py-0.5 rounded-full shrink-0">you</span>
+                            <span className="text-[10px] font-semibold uppercase tracking-wide bg-accent/10 text-accent border border-accent/25 px-1.5 py-0.5 rounded-full shrink-0">you</span>
                           )}
                           {u.disabled && <Badge tone="bad">disabled</Badge>}
                         </div>
@@ -299,7 +296,7 @@ export default function Users(){
                     </div>
                   </Td>
                   <Td>
-                    <Badge tone={ROLE_TONE[u.role] ?? 'neutral'} dot>{u.role}</Badge>
+                    <Badge tone={ROLE_TONE[u.role] ?? 'neutral'}>{u.role}</Badge>
                   </Td>
                   <Td>
                     {/* Assigned keys: keys this user created / owns (non-revoked). */}
@@ -319,23 +316,23 @@ export default function Users(){
                   <Td>
                     <div className="flex flex-col items-start gap-1.5">
                       <span className="inline-flex items-center gap-1.5" title={u.passkey_enabled ? `${u.passkey_count} passkey(s) enrolled` : 'no passkey'}>
-                        <Icon name="shield" size={15} className={u.passkey_enabled ? 'text-accent' : 'text-muted/40'} />
+                        <Icon name="shield" size={15} className={u.passkey_enabled ? 'text-good' : 'text-muted/40'} />
                         {u.passkey_enabled
                           ? <span className="text-xs text-muted tabular-nums">{u.passkey_count} enrolled</span>
-                          : <span className="text-xs text-muted/60">none</span>}
+                          : <span className="text-xs text-muted">none</span>}
                       </span>
                       {u.id === me?.id ? (
                         showPasskeyFor===u.id ? (
                           <div className="flex items-center gap-1">
                             <Button size="sm" variant="primary" onClick={()=>handleRegisterPasskey(u.id)} disabled={passkeyBusy}>Enroll</Button>
                             {u.passkey_enabled && (
-                              <Button size="sm" variant="ghost" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                              <Button size="sm" variant="danger"
                                 onClick={()=>setPasskeyDisableTarget(u.id)}>
                                 Disable
                               </Button>
                             )}
                             <button onClick={()=>setShowPasskeyFor(null)} aria-label="Close"
-                              className="w-6 h-6 rounded-md flex items-center justify-center text-muted hover:text-paper hover:bg-stone/50">
+                              className="w-6 h-6 rounded-md flex items-center justify-center text-muted hover:text-paper hover:bg-raised">
                               <Icon name="x" size={12} />
                             </button>
                           </div>
@@ -353,9 +350,9 @@ export default function Users(){
                   </Td>
                   <Td>
                     {u.has_recovery_code ? (
-                      <Badge tone="warn">set</Badge>
+                      <Badge tone="good">set</Badge>
                     ) : (
-                      <span className="text-xs text-muted/60">—</span>
+                      <span className="text-xs text-muted">—</span>
                     )}
                     {u.passkey_enabled && (
                       <Button size="sm" variant="ghost" className="mt-1 -ml-2" onClick={()=>genRecovery(u.id)}
@@ -365,11 +362,11 @@ export default function Users(){
                     )}
                   </Td>
                   <Td>
-                    <div className="text-xs text-muted whitespace-nowrap" title={u.last_login_at ? new Date(u.last_login_at).toLocaleString() : undefined}>
+                    <div className="text-xs text-muted font-mono whitespace-nowrap" title={u.last_login_at ? new Date(u.last_login_at).toLocaleString() : undefined}>
                       {ago(u.last_login_at)}
                     </div>
                     {typeof u.login_count === 'number' && (
-                      <div className="text-[11px] text-muted/70 tabular-nums mt-0.5">{u.login_count} logins</div>
+                      <div className="text-[11px] text-muted font-mono tabular-nums mt-0.5">{u.login_count} logins</div>
                     )}
                   </Td>
                   <Td>
@@ -394,7 +391,7 @@ export default function Users(){
                           <Button size="sm" variant="ghost" onClick={()=>setAccountDisableTarget(u)} title="Disable account">Disable</Button>
                         )
                       )}
-                      <Button size="sm" variant="ghost" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                      <Button size="sm" variant="danger"
                         onClick={()=>setDeleteTarget(u)} disabled={soleAdminBlocked(u)}
                         title={soleAdminBlocked(u) ? 'Cannot delete the last remaining admin' : 'Delete user'}>
                         <Icon name="trash" size={14} />
@@ -410,18 +407,12 @@ export default function Users(){
               )}
             </tbody>
           )}
-        </table>
-        <div className="px-4 py-3 border-t border-stone bg-app/60 text-[11px] text-muted leading-relaxed">
-          RBAC: <span className="text-amber font-medium">admin</span> = full access · <span className="text-accent font-medium">support / member</span> = providers &amp; keys · readonly = view only.
-          Use <span className="text-paper">Perms</span> for fine-grained overrides (e.g. let a user see only their own keys) — changes apply immediately.
-          Passkeys use WebAuthn — the private key stays on device; a recovery code is required if the passkey is lost.
-        </div>
       </TableShell>
 
       <Card>
         <div className="flex items-center gap-2">
-          <Icon name="zap" size={15} className="text-accent" />
-          <h3 className="font-semibold text-sm">Passkey quick test</h3>
+          <Icon name="zap" size={15} className="text-muted" />
+          <h3 className="font-semibold text-[15px] -tracking-tight">Passkey quick test</h3>
         </div>
         <p className="text-xs text-muted mt-1.5 max-w-2xl">Try passkey login for your own account — requires enrollment above and browser support. The public key stays on device; the recovery code bypasses it if lost.</p>
         <div className="mt-3">
@@ -455,7 +446,7 @@ export default function Users(){
             onKeyDown={e=>{ if(e.key==='Enter' && resetPwValue.length >= 8) resetPwSubmit() }} />
         </Field>
         {resetPwValue.length > 0 && (
-          <p className={`text-xs mt-2 ${resetPwValue.length >= 8 ? 'text-accent' : 'text-amber'}`}>
+          <p className={`text-xs mt-2 ${resetPwValue.length >= 8 ? 'text-good' : 'text-amber'}`}>
             {resetPwValue.length >= 8 ? 'Strong enough — 8+ characters.' : 'Too short — 8 characters minimum.'}
           </p>
         )}

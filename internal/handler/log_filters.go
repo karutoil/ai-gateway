@@ -32,7 +32,8 @@ import (
 //
 //	model, key (prefix), endpoint, status ("failed" or code), since (RFC3339 or Go duration),
 //	key_id, provider_id, stream (true/false), min_latency_ms, max_latency_ms,
-//	has_error (true), q (search: model, endpoint, error; bodies only with search_bodies=true)
+//	has_error (true), finish_reason (or "(none)"), end_user, app,
+//	q (search: model, endpoint, error; bodies only with search_bodies=true)
 func logFilterWhere(orgID string, q url.Values) (whereSQL string, args []any) {
 	var where []string
 	if orgID != "" {
@@ -63,6 +64,11 @@ func logFilterWhere(orgID string, q url.Values) (whereSQL string, args []any) {
 		if t, err := time.Parse(time.RFC3339, sv); err == nil {
 			where = append(where, "rl.created_at >= ?")
 			args = append(args, t.UTC())
+		} else if d, ok := analyticsWindows[sv]; ok {
+			// Report-page shorthand includes days and years, which Go's
+			// time.ParseDuration cannot parse. Keep log drilldowns aligned.
+			where = append(where, "rl.created_at >= ?")
+			args = append(args, time.Now().UTC().Add(-d))
 		} else if d, err := time.ParseDuration(sv); err == nil && d > 0 {
 			where = append(where, "rl.created_at >= ?")
 			args = append(args, time.Now().UTC().Add(-d))
@@ -81,6 +87,17 @@ func logFilterWhere(orgID string, q url.Values) (whereSQL string, args []any) {
 		where = append(where, "rl.provider_id = ?")
 		args = append(args, pid)
 	}
+	// Attribution. Both are exact-match so a report can be narrowed to one
+	// identity; app additionally supports prefix match via app_prefix because
+	// an operator commonly wants "everything from this site".
+	if eu := strings.TrimSpace(q.Get("end_user")); eu != "" {
+		where = append(where, "rl.end_user = ?")
+		args = append(args, eu)
+	}
+	if ap := strings.TrimSpace(q.Get("app")); ap != "" {
+		where = append(where, "rl.app = ?")
+		args = append(args, ap)
+	}
 	// Stream / non-stream. db.BoolLit renders 1/0 vs TRUE/FALSE per dialect.
 	if s := strings.TrimSpace(q.Get("stream")); s == "true" || s == "false" {
 		where = append(where, "rl.is_stream = "+db.BoolLit(s == "true"))
@@ -95,6 +112,18 @@ func logFilterWhere(orgID string, q url.Values) (whereSQL string, args []any) {
 	}
 	if strings.EqualFold(strings.TrimSpace(q.Get("has_error")), "true") {
 		where = append(where, "rl.error IS NOT NULL")
+	}
+	// Terminal finish reason. Mirrors the "finish_reason" grouping dimension
+	// (log_group.go): the logGroupNoneLabel sentinel matches the rows that
+	// dimension buckets as "(none)", so clicking that group filters to exactly
+	// the set it counted instead of silently returning nothing.
+	if fr := strings.TrimSpace(q.Get("finish_reason")); fr != "" {
+		if fr == logGroupNoneLabel {
+			where = append(where, "(rl.finish_reason IS NULL OR rl.finish_reason = '')")
+		} else {
+			where = append(where, "rl.finish_reason = ?")
+			args = append(args, fr)
+		}
 	}
 	// Server-side search. Default covers model/endpoint/error (cheap,
 	// error has its own index); request/response bodies are opt-in because
@@ -183,4 +212,42 @@ func logScopeOwnOnly(r *http.Request, h *AdminHandler, alias string) (hasAll boo
 		return false, "1=0", nil
 	}
 	return false, col("key_id") + " IN (SELECT id FROM gateway_keys WHERE created_by = ?)", []any{uid}
+}
+
+// logSortColumns whitelists the sortable columns of the logs read surface.
+// The value reaches the SQL string directly, so anything not in this map is
+// rejected rather than interpolated — an ORDER BY cannot be parameterised.
+var logSortColumns = map[string]string{
+	"created_at":   "rl.created_at",
+	"latency_ms":   "rl.latency_ms",
+	"ttft_ms":      "rl.ttft_ms",
+	"total_tokens": "rl.total_tokens",
+	"cost_usd":     "rl.cost_usd",
+	"status":       "rl.status",
+	"model":        "rl.model",
+	"endpoint":     "rl.endpoint",
+}
+
+// logOrderClause builds a safe ORDER BY from the order/dir query params.
+//
+// Defaults to newest-first, which is what the request list has always done.
+// A NULLable sort column gets NULLS LAST semantics via the COALESCE so rows
+// with no recorded value sink to the bottom instead of floating to the top of
+// an ascending sort. created_at is appended as a tiebreaker so pagination is
+// stable: without it, equal sort keys let rows repeat or vanish across pages.
+func logOrderClause(q url.Values) string {
+	col, ok := logSortColumns[strings.TrimSpace(q.Get("order"))]
+	if !ok {
+		col = "rl.created_at"
+	}
+	dir := "DESC"
+	if strings.EqualFold(strings.TrimSpace(q.Get("dir")), "asc") {
+		dir = "ASC"
+	}
+	clause := " ORDER BY " + col + " " + dir
+	if col != "rl.created_at" {
+		// Stable tiebreak; also gives NULL timestamps a defined position.
+		clause += ", rl.created_at DESC"
+	}
+	return clause
 }

@@ -28,6 +28,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 type AdminHandler struct {
@@ -110,6 +111,12 @@ func (h *AdminHandler) Routes(r chi.Router) {
 		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/logs/export", h.LogsExport)
 		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/logs/{id}", h.GetLog)
 		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/billing/export", h.BillingExport)
+		// Reporting pages. Same read gate as the logs surface they aggregate,
+		// because every one of them rolls up request_logs and would otherwise
+		// expose another tenant's spend through a total.
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/analytics/attribution", h.Attribution)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/analytics/cost", h.Cost)
+		r.With(middleware.RequireAnyPerm(rbac.PermLogsRead, rbac.PermKeysReadOwn)).Get("/analytics/performance", h.Performance)
 	})
 }
 
@@ -1014,7 +1021,7 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		Requests  int64   `json:"requests"`
 	}
 	var topKeys []topK
-	rows3, err := h.DB.Query(db.Q(`SELECT key_prefix, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? AND key_prefix != ''`+orgFilter+` GROUP BY key_prefix ORDER BY COUNT(*) DESC LIMIT 5`), append([]any{start}, orgArgs...)...)
+	rows3, err := h.DB.Query(db.Q(`SELECT key_prefix, COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM request_logs WHERE created_at >= ? AND key_prefix != ''`+orgFilter+` GROUP BY key_prefix ORDER BY SUM(total_tokens) DESC LIMIT 5`), append([]any{start}, orgArgs...)...)
 	if err == nil {
 		defer rows3.Close()
 		for rows3.Next() {
@@ -1087,7 +1094,20 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 		Sample string `json:"sample,omitempty"`
 	}
 	var errorRows []errRow
-	rows5, err5 := h.DB.Query(db.Q(`SELECT status, COUNT(*), (SELECT rl2.error FROM request_logs rl2 WHERE rl2.status=rl.status AND rl2.error IS NOT NULL AND rl2.created_at>=?`+orgFilter+` ORDER BY rl2.created_at DESC LIMIT 1) FROM request_logs rl WHERE rl.created_at >= ? AND rl.status >= 400`+orgFilter+` GROUP BY rl.status ORDER BY COUNT(*) DESC LIMIT 10`), append([]any{start, start}, orgArgs...)...)
+	// Qualify each scope independently: the correlated sample must never draw
+	// text from another tenant, and each scope contributes its own SQL args.
+	qualifiedScope := func(alias string) string {
+		// Only qualify the outer column references. The subquery's own id
+		// columns belong to providers/gateway_keys and must stay untouched.
+		return strings.ReplaceAll(strings.ReplaceAll(orgFilter,
+			"provider_id IN", alias+".provider_id IN"),
+			"key_id IN", alias+".key_id IN")
+	}
+	outerScope, innerScope := qualifiedScope("rl"), qualifiedScope("rl2")
+	errorArgs := append([]any{start}, orgArgs...)
+	errorArgs = append(errorArgs, start)
+	errorArgs = append(errorArgs, orgArgs...)
+	rows5, err5 := h.DB.Query(db.Q(`SELECT rl.status, COUNT(*), (SELECT rl2.error FROM request_logs rl2 WHERE rl2.status=rl.status AND rl2.error IS NOT NULL AND rl2.created_at>=?`+innerScope+` ORDER BY rl2.created_at DESC LIMIT 1) FROM request_logs rl WHERE rl.created_at >= ? AND rl.status >= 400`+outerScope+` GROUP BY rl.status ORDER BY COUNT(*) DESC LIMIT 10`), errorArgs...)
 	if err5 == nil {
 		defer rows5.Close()
 		for rows5.Next() {
@@ -1258,10 +1278,11 @@ func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	limArgs := append(append([]any{}, args...), limit, offset)
-	rows, err := h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.cache_hit,rl.cache_status`+from+` ORDER BY rl.created_at DESC LIMIT ? OFFSET ?`), limArgs...)
+	orderBy := logOrderClause(q)
+	rows, err := h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.cache_hit,rl.cache_status`+from+orderBy+` LIMIT ? OFFSET ?`), limArgs...)
 	if err != nil {
 		// Fallback for DBs without ttft_ms/error columns.
-		rows, err = h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream`+from+` ORDER BY rl.created_at DESC LIMIT ? OFFSET ?`), limArgs...)
+		rows, err = h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream`+from+orderBy+` LIMIT ? OFFSET ?`), limArgs...)
 		if err != nil {
 			http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 			return
@@ -1269,10 +1290,12 @@ func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 		logs := []models.RequestLog{}
 		for rows.Next() {
-			var l models.RequestLog
-			if rows.Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream) == nil {
-				logs = append(logs, l)
+			l, err := scanRequestLogLegacyRow(rows)
+			if err != nil {
+				log.Error().Err(err).Msg("request_logs row skipped: scan failed (legacy column set)")
+				continue
 			}
+			logs = append(logs, l)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(logs)
@@ -1280,31 +1303,94 @@ func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	logs := []models.RequestLog{}
+	skipped := 0
 	for rows.Next() {
-		var l models.RequestLog
-		var ttft sql.NullInt64
-		var errStr sql.NullString
-		var cacheHit sql.NullBool
-		var cacheStatus sql.NullString
-		if err := rows.Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &ttft, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream, &errStr, &cacheHit, &cacheStatus); err != nil {
+		l, err := scanRequestLogRow(rows)
+		if err != nil {
+			// A row that fails to scan used to vanish with no signal at all,
+			// so a schema/NULL regression looked like "no traffic" rather
+			// than like a bug. Log it and surface the count to the caller.
+			skipped++
+			log.Error().Err(err).Msg("request_logs row skipped: scan failed")
 			continue
-		}
-		if ttft.Valid {
-			l.TTFTMs = ttft.Int64
-		}
-		if errStr.Valid {
-			l.Error = errStr.String
-		}
-		if cacheHit.Valid {
-			l.CacheHit = cacheHit.Bool
-		}
-		if cacheStatus.Valid {
-			l.CacheStatus = cacheStatus.String
 		}
 		logs = append(logs, l)
 	}
+	// Surface unreadable rows instead of silently returning a short page: a
+	// client comparing this against X-Total-Count can then see the gap.
+	if skipped > 0 {
+		w.Header().Set("X-Rows-Skipped", strconv.Itoa(skipped))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(logs)
+}
+
+// scanRequestLogRow reads one request_logs row from the list projection,
+// tolerating NULLs.
+//
+// Only id and created_at are NOT NULL in the schema; every other column is
+// nullable. Scanning them straight into string/int/float64/bool meant a row
+// with any NULL failed the scan, and the list endpoint dropped it — so real
+// traffic became invisible with no error anywhere. Legacy and
+// partially-written rows hit this most, but so does anything inserted without
+// a gateway key prefix.
+func scanRequestLogRow(rows *sql.Rows) (models.RequestLog, error) {
+	var (
+		l                                      models.RequestLog
+		keyPrefix, providerID, model, endpoint sql.NullString
+		status, latencyMs, ttft, promptTok     sql.NullInt64
+		completionTok, totalTok                sql.NullInt64
+		costUSD                                sql.NullFloat64
+		isStream, cacheHit                     sql.NullBool
+		errStr, cacheStatus                    sql.NullString
+	)
+	if err := rows.Scan(&l.ID, &keyPrefix, &providerID, &model, &endpoint, &status, &latencyMs, &ttft, &l.CreatedAt, &promptTok, &completionTok, &totalTok, &costUSD, &isStream, &errStr, &cacheHit, &cacheStatus); err != nil {
+		return l, err
+	}
+	l.KeyPrefix = keyPrefix.String
+	l.ProviderID = providerID.String
+	l.Model = model.String
+	l.Endpoint = endpoint.String
+	l.Status = int(status.Int64)
+	l.LatencyMs = latencyMs.Int64
+	l.TTFTMs = ttft.Int64
+	l.PromptTokens = int(promptTok.Int64)
+	l.CompletionTokens = int(completionTok.Int64)
+	l.TotalTokens = int(totalTok.Int64)
+	l.CostUSD = costUSD.Float64
+	l.IsStream = isStream.Bool
+	l.Error = errStr.String
+	l.CacheHit = cacheHit.Bool
+	l.CacheStatus = cacheStatus.String
+	return l, nil
+}
+
+// scanRequestLogLegacyRow is scanRequestLogRow over the pre-ttft_ms/error
+// column set used as a fallback on databases that predate those migrations.
+func scanRequestLogLegacyRow(rows *sql.Rows) (models.RequestLog, error) {
+	var (
+		l                                      models.RequestLog
+		keyPrefix, providerID, model, endpoint sql.NullString
+		status, latencyMs, promptTok           sql.NullInt64
+		completionTok, totalTok                sql.NullInt64
+		costUSD                                sql.NullFloat64
+		isStream                               sql.NullBool
+	)
+	if err := rows.Scan(&l.ID, &keyPrefix, &providerID, &model, &endpoint, &status, &latencyMs, &l.CreatedAt, &promptTok, &completionTok, &totalTok, &costUSD, &isStream); err != nil {
+		return l, err
+	}
+	l.KeyPrefix = keyPrefix.String
+	l.ProviderID = providerID.String
+	l.Model = model.String
+	l.Endpoint = endpoint.String
+	l.Status = int(status.Int64)
+	l.LatencyMs = latencyMs.Int64
+	l.PromptTokens = int(promptTok.Int64)
+	l.CompletionTokens = int(completionTok.Int64)
+	l.TotalTokens = int(totalTok.Int64)
+	l.CostUSD = costUSD.Float64
+	l.IsStream = isStream.Bool
+	return l, nil
 }
 
 func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {

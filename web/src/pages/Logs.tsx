@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, logsParamsToSearch } from '../lib/api'
-import { useFiltersState } from '../lib/useQueryState'
+import { useFiltersState, useQueryState } from '../lib/useQueryState'
 import { loadSavedViews, saveView, removeSavedView, describeViewParams, type SavedView } from '../lib/savedViews'
 import {
   Card, Button, Badge, Icon, Input, PageHeader, SegmentedControl,
   TableShell, Th, Td, TableSkeleton, EmptyState, Modal, CopyButton, Field,
 } from '../components/ui'
+import { SortTh } from '../components/report'
 
 function tpsFor(l:any){
   if(!l.completion_tokens || !l.latency_ms) return 0
@@ -24,8 +25,8 @@ function statusTone(s:number): 'good'|'warn'|'bad' {
 /** Cache disposition of one request — hit / miss / bypass / unknown (legacy rows). */
 function CacheState({ status }: { status?: string }) {
   if (!status) return <span className="text-[10px] font-mono text-muted/40" title="Cache status not recorded (row predates cache reporting)">cache ·—</span>
-  if (status === 'hit') return <span className="text-[10px] font-mono text-accent" title="Answered from the gateway response cache (X-Cache: HIT) — no upstream call">cache·hit</span>
-  if (status === 'miss') return <span className="text-[10px] font-mono text-muted/70" title="Cache-eligible but not cached (X-Cache: MISS) — identical requests within the TTL replay from cache">cache·miss</span>
+  if (status === 'hit') return <span className="text-[10px] font-mono text-good" title="Answered from the gateway response cache (X-Cache: HIT) — no upstream call">cache·hit</span>
+  if (status === 'miss') return <span className="text-[10px] font-mono text-muted" title="Cache-eligible but not cached (X-Cache: MISS) — identical requests within the TTL replay from cache">cache·miss</span>
   if (status === 'bypass') return <span className="text-[10px] font-mono text-muted/40" title="Not cache-eligible (X-Cache: BYPASS): streaming with the stream cache off, oversize body, or a non-cached endpoint">cache·bypass</span>
   return <span className="text-[10px] font-mono text-muted/40">cache ·—</span>
 }
@@ -139,8 +140,8 @@ function parseResponseMessages(raw:string|undefined|null): ChatMessage[] {
   return out
 }
 
-const ROLE_TONES: Record<string, 'good'|'warn'|'bad'|'neutral'> = {
-  system: 'neutral', user: 'warn', assistant: 'good', tool: 'bad',
+const ROLE_TONES: Record<string, 'good'|'warn'|'bad'|'neutral'|'info'> = {
+  system: 'neutral', user: 'info', assistant: 'good', tool: 'neutral',
 }
 
 /** One structured chat message: role badge, text, tool-call cards, image chips. */
@@ -184,7 +185,7 @@ function MessagePanes({ requestBody, responseBody }: { requestBody?: string; res
   return (
     <div className="grid md:grid-cols-2 gap-3">
       {reqMsgs.length > 0 && (
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="flex items-center justify-between mb-2">
             <div className="text-xs text-muted">Request messages</div>
             <CopyButton value={requestBody || ''} label="Copy raw"/>
@@ -195,7 +196,7 @@ function MessagePanes({ requestBody, responseBody }: { requestBody?: string; res
         </div>
       )}
       {respMsgs.length > 0 && (
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="flex items-center justify-between mb-2">
             <div className="text-xs text-muted">Response messages</div>
             <CopyButton value={responseBody || ''} label="Copy raw"/>
@@ -219,35 +220,35 @@ function DetailBody({ detail, selected, keyMap }: {
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Status</div>
           <div className="mt-1"><Badge tone={stat} dot>{detail.log?.status ?? selected.status}</Badge></div>
           {(detail.log?.error || detail.error || selected.error) && (
-            <div className="mt-2 text-xs text-red-400 break-all line-clamp-3">{errMsg.slice(0,200)}</div>
+            <div className="mt-2 text-xs text-danger break-all line-clamp-3">{errMsg.slice(0,200)}</div>
           )}
         </div>
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Latency</div>
           <div className="font-mono text-sm mt-1 tabular-nums">{(detail.log?.latency_ms ?? selected.latency_ms)}ms</div>
           <div className="text-xs text-muted tabular-nums">TTFT {((detail.log?.ttft_ms ?? selected.ttft_ms) || '—')}ms</div>
         </div>
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">TPS</div>
           <div className="font-mono text-sm mt-1 tabular-nums">{detail.tps ? Number(detail.tps).toFixed(1) : tpsFor(detail.log||selected).toFixed(1)} tok/s</div>
           <div className="text-xs text-muted tabular-nums">{detail.log?.total_tokens ?? selected.total_tokens} tokens</div>
         </div>
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Provider</div>
           <div className="text-sm mt-1 truncate" title={String(detail.provider_name || detail.log?.provider_id || selected.provider_id || '')}>
             {detail.provider_name || detail.log?.provider_id || selected.provider_id || '—'}
           </div>
         </div>
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Key</div>
           <div className="font-mono text-xs mt-1">{detail.key_name ? `${detail.log?.key_prefix} · ${detail.key_name}` : detail.log?.key_prefix || selected.key_prefix}</div>
           {keyMap[selected.key_prefix] && <div className="text-xs text-muted">{keyMap[selected.key_prefix]}</div>}
         </div>
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Endpoint</div>
           <div className="text-xs mt-1 break-all">{detail.log?.endpoint || selected.endpoint}</div>
           <div className="text-xs text-muted font-mono truncate">{detail.log?.model || selected.model}</div>
@@ -255,7 +256,7 @@ function DetailBody({ detail, selected, keyMap }: {
       </div>
 
       <div className="grid md:grid-cols-2 gap-3">
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Tokens</div>
           <div className="mt-2 font-mono text-xs space-y-1 tabular-nums">
             <div>prompt: {detail.log?.prompt_tokens ?? selected.prompt_tokens}</div>
@@ -264,7 +265,7 @@ function DetailBody({ detail, selected, keyMap }: {
             <div>cost: ${Number((detail.log?.cost_usd ?? selected.cost_usd) ?? 0).toFixed(6)}</div>
           </div>
         </div>
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted">Timing</div>
           <div className="mt-2 font-mono text-xs space-y-1 tabular-nums">
             <div>latency: {detail.log?.latency_ms ?? selected.latency_ms}ms</div>
@@ -279,7 +280,7 @@ function DetailBody({ detail, selected, keyMap }: {
 
       {/* Usage metadata: finish reason + cache/reasoning token split */}
       {((detail.log?.finish_reason ?? (detail as any).finish_reason) || (detail.log?.cache_read_tokens ?? (detail as any).cache_read_tokens) || (detail.log?.cache_write_tokens ?? (detail as any).cache_write_tokens) || (detail.log?.reasoning_tokens ?? (detail as any).reasoning_tokens) || (detail.log?.cache_hit ?? selected.cache_hit)) && (
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted mb-2">Usage metadata</div>
           <div className="flex flex-wrap gap-2">
             {(detail.log?.finish_reason ?? (detail as any).finish_reason) && (
@@ -320,12 +321,12 @@ function DetailBody({ detail, selected, keyMap }: {
       <MessagePanes requestBody={detail.log?.request_body || (detail as any).request_body} responseBody={detail.log?.response_body || (detail as any).response_body}/>
 
       {(detail.log?.error || detail.error || selected.error) && (
-        <div className="border border-red-500/30 bg-red-500/10 rounded-xl p-3">
-          <div className="flex items-center gap-2 text-xs text-red-400">
+        <div className="border border-danger/30 bg-danger/10 rounded-lg p-3">
+          <div className="flex items-center gap-2 text-xs text-danger">
             <Icon name="alert" size={14}/>
-            <span className="uppercase tracking-wider font-medium">Error — {detail.log?.status || selected.status}</span>
+            <span className="font-semibold">Error — {detail.log?.status || selected.status}</span>
           </div>
-          <pre className="mt-2 bg-app border border-red-500/20 rounded-lg p-3 font-mono text-xs whitespace-pre-wrap break-all text-red-400 overflow-x-auto">{errMsg.slice(0,4000)}</pre>
+          <pre className="mt-2 bg-app border border-danger/25 rounded-lg p-3 font-mono text-xs whitespace-pre-wrap break-all text-danger overflow-x-auto">{errMsg.slice(0,4000)}</pre>
           {(detail.log?.request_body || (detail as any).request_body) && (
             <details className="mt-2">
               <summary className="font-mono text-xs text-muted cursor-pointer select-none">Request body</summary>
@@ -341,12 +342,12 @@ function DetailBody({ detail, selected, keyMap }: {
         </div>
       )}
 
-      <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+      <div className="rounded-lg border border-stone bg-raised/60 p-3">
         <div className="text-xs text-muted mb-2">Raw log</div>
         <pre className="bg-app border border-stone rounded-lg p-3 font-mono text-xs overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(detail.log || selected, null, 2)}</pre>
       </div>
       {detail.log && detail.log !== selected && (
-        <div className="rounded-xl border border-stone/60 bg-raised/50 p-3">
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
           <div className="text-xs text-muted mb-2">Enriched detail</div>
           <pre className="bg-app border border-stone rounded-lg p-3 font-mono text-xs overflow-x-auto whitespace-pre-wrap break-all">{JSON.stringify(detail, null, 2)}</pre>
         </div>
@@ -376,15 +377,22 @@ type LogFilters = {
   max_latency_ms: string
   has_error: '' | 'true'
   search_bodies: '' | 'true'
+  /** terminal finish reason, or '(none)' to match rows with none recorded */
+  finish_reason: string
+  /** exact end-user identity (OpenAI `user` field / X-End-User) */
+  end_user: string
+  /** exact application identity (X-App-Id / X-Title / HTTP-Referer origin) */
+  app: string
 }
 
 const FILTER_DEFAULTS: LogFilters = {
   q: '', status: '', since: '24h', key_id: '', provider_id: '', model: '',
   stream: '', min_latency_ms: '', max_latency_ms: '', has_error: '', search_bodies: '',
+  finish_reason: '', end_user: '', app: '',
 }
 
 /** Which filter fields are "advanced" (hidden behind More filters). */
-const ADVANCED_FIELDS: (keyof LogFilters)[] = ['min_latency_ms', 'max_latency_ms', 'search_bodies', 'model']
+const ADVANCED_FIELDS: (keyof LogFilters)[] = ['min_latency_ms', 'max_latency_ms', 'search_bodies', 'model', 'end_user', 'app']
 
 /** True when a field differs from its default (drives chips + active count). */
 function filterActive(f: LogFilters, k: keyof LogFilters): boolean {
@@ -408,6 +416,11 @@ const GROUP_DIMS = [
   { value: 'key', label: 'Key' },
   { value: 'provider', label: 'Provider' },
   { value: 'endpoint', label: 'Endpoint' },
+  { value: 'finish_reason', label: 'Finish reason' },
+  // `app` is groupable (an operator bounds how many apps attribute to them).
+  // end_user is intentionally NOT here: it is unbounded by construction, so it
+  // stays a filter/rank dimension rather than a rollup key.
+  { value: 'app', label: 'App' },
   { value: 'status', label: 'Status' },
   { value: 'error', label: 'Errors' },
 ] as const
@@ -428,11 +441,21 @@ export default function Logs(){
   const [detail, setDetail] = useState<any|null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
+  // Sort is URL state but deliberately not a LogFilters field: it must not
+  // appear as an active-filter chip or count toward "clear all filters".
+  const [sortKey, setSortKey] = useQueryState('order', 'created_at')
+  const [sortDir, setSortDir] = useQueryState('dir', 'desc')
+  const toggleSort = (k: string) => {
+    if (sortKey === k) setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
+    else { setSortKey(k); setSortDir('desc') }
+  }
   const [showReports, setShowReports] = useState(false)
   const [showSaveView, setShowSaveView] = useState(false)
   const [savedViews, setSavedViews] = useState<SavedView[]>(() => loadSavedViews())
   const [viewName, setViewName] = useState('')
   const [exportNote, setExportNote] = useState('')
+  // Tone for the export/link note: success messages vs the catch-path error.
+  const [exportNoteKind, setExportNoteKind] = useState<'ok' | 'error'>('ok')
 
   // Reports panel state
   const [groupBy, setGroupBy] = useState<string>('model')
@@ -478,6 +501,11 @@ export default function Logs(){
     if (filters.stream) p.stream = filters.stream
     if (filters.has_error) p.has_error = filters.has_error
     if (filters.search_bodies) p.search_bodies = filters.search_bodies
+    if (filters.finish_reason) p.finish_reason = filters.finish_reason
+    if (filters.end_user) p.end_user = filters.end_user
+    if (filters.app) p.app = filters.app
+    if (sortKey !== 'created_at') p.order = sortKey
+    if (sortKey !== 'created_at' && sortDir === 'asc') p.dir = 'asc'
     if (filters.min_latency_ms) p.min_latency_ms = Number(filters.min_latency_ms)
     if (filters.max_latency_ms) p.max_latency_ms = Number(filters.max_latency_ms)
     return p
@@ -526,9 +554,10 @@ export default function Logs(){
     setExportNote('')
     try {
       const { filename, truncated } = await api.logsExport(apiParams() as any)
+      setExportNoteKind('ok')
       setExportNote(truncated ? `Exported ${filename} (truncated at server cap)` : `Exported ${filename}`)
       setTimeout(() => setExportNote(''), 5000)
-    } catch (e:any) { setExportNote(e?.message || 'export failed') }
+    } catch (e:any) { setExportNoteKind('error'); setExportNote(e?.message || 'export failed') }
   }
 
   const fetchDetail = async (id:string)=>{
@@ -574,7 +603,7 @@ export default function Logs(){
   const rawJson = detail ? JSON.stringify(detail || selected, null, 2) : ''
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <PageHeader
         eyebrow="Operate · Traffic"
         title="Requests"
@@ -591,19 +620,23 @@ export default function Logs(){
         }
       />
 
-      {exportNote && <div className="text-xs text-accent">{exportNote}</div>}
+      {exportNote && (
+        <div className={`flex items-center gap-1.5 text-xs ${exportNoteKind === 'error' ? 'text-danger' : 'text-good'}`}>
+          <Icon name={exportNoteKind === 'error' ? 'alert' : 'check'} size={13} />{exportNote}
+        </div>
+      )}
 
       {/* Saved views chips */}
       {savedViews.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 -mt-1">
-          <span className="text-xs text-muted uppercase tracking-wide mr-1">Saved views</span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs text-muted font-medium mr-1">Saved views</span>
           {savedViews.map(v => (
             <span key={v.id} className="inline-flex items-center gap-1 rounded-full border border-stone bg-raised px-2.5 py-1 text-xs group hover:border-accent/50 transition-colors">
               <button onClick={()=>applySavedView(v)} title={describeViewParams(v.params)} className="focus:outline-none">
                 <span className="font-medium">{v.name}</span>
                 <span className="text-muted ml-1.5">{describeViewParams(v.params)}</span>
               </button>
-              <button onClick={()=>setSavedViews(removeSavedView(v.id))} className="text-muted hover:text-red-400 focus:outline-none" title="Delete view">
+              <button onClick={()=>setSavedViews(removeSavedView(v.id))} className="text-muted hover:text-danger focus:outline-none" title="Delete view">
                 <Icon name="x" size={11}/>
               </button>
             </span>
@@ -612,7 +645,7 @@ export default function Logs(){
       )}
 
       {/* Totals strip — aggregates cover the currently loaded rows only */}
-      <div className="flex flex-wrap items-center gap-2 -mt-1">
+      <div className="flex flex-wrap items-center gap-2">
         {[
           `${logs.length} loaded${total != null ? ` of ${total.toLocaleString()} matching` : ''}`,
           `${logs.reduce((a,l)=>a+(l.total_tokens||0),0).toLocaleString()} tokens`,
@@ -624,29 +657,29 @@ export default function Logs(){
       </div>
 
       {/* Filter bar — every control is server-side and URL-synced */}
-      <Card className="!p-4 space-y-3 !rounded-xl">
+      <Card className="space-y-3">
         <div className="flex flex-col sm:flex-row sm:items-center gap-2">
           <div className="relative flex-1 min-w-[180px]">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
             <Input value={qInput} onChange={e=>setQInput(e.target.value)} placeholder="Search model, endpoint, error text…" className="pl-9"/>
           </div>
           <select value={filters.status} onChange={e=>applyFilter({ status: e.target.value })}
-            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm focus:outline-none focus:border-accent/60">
+            className="w-auto bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
             <option value="">Any status</option>
             <option value="failed">Failed only</option>
           </select>
           <select value={filters.key_id} onChange={e=>applyFilter({ key_id: e.target.value })}
-            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm max-w-[150px] focus:outline-none focus:border-accent/60">
+            className="w-auto max-w-[150px] bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
             <option value="">Any key</option>
             {Object.entries(keyIdMap).map(([id,name]) => <option key={id} value={id}>{name}</option>)}
           </select>
           <select value={filters.provider_id} onChange={e=>applyFilter({ provider_id: e.target.value })}
-            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm max-w-[150px] focus:outline-none focus:border-accent/60">
+            className="w-auto max-w-[150px] bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
             <option value="">Any provider</option>
             {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
           <select value={filters.since} onChange={e=>applyFilter({ since: e.target.value })}
-            className="bg-app/70 border border-stone/70 rounded-xl px-2.5 h-10 text-sm focus:outline-none focus:border-accent/60">
+            className="w-auto bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
             {SINCE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
@@ -669,10 +702,9 @@ export default function Logs(){
             <Icon name="chevronDown" size={13} className={`transition-transform ${showAdvanced?'rotate-180':''}`}/>
             More filters {activeFilters.some(k=>ADVANCED_FIELDS.includes(k)) ? '•' : ''}
           </button>
-          <div className="flex-1"/>
-          <Button variant="secondary" size="sm" onClick={()=>setShowSaveView(true)}><Icon name="plus" size={13}/>Save view</Button>
+          <Button variant="secondary" size="sm" className="ml-auto" onClick={()=>setShowSaveView(true)}><Icon name="plus" size={13}/>Save view</Button>
           <Button variant="secondary" size="sm" onClick={()=>{
-            navigator.clipboard?.writeText(window.location.href).then(()=>setExportNote('View link copied'), ()=>{})
+            navigator.clipboard?.writeText(window.location.href).then(()=>{ setExportNoteKind('ok'); setExportNote('View link copied') }, ()=>{})
           }}><Icon name="key" size={13}/>Share</Button>
         </div>
         {showAdvanced && (
@@ -680,13 +712,15 @@ export default function Logs(){
             <Input value={filters.model} onChange={e=>applyFilter({ model: e.target.value })} placeholder="Model (substring)" className="max-w-[180px] h-8 text-xs"/>
             <Input value={filters.min_latency_ms} onChange={e=>applyFilter({ min_latency_ms: e.target.value.replace(/\D/g,'') })} placeholder="Min latency ms" className="max-w-[120px] h-8 text-xs" inputMode="numeric"/>
             <Input value={filters.max_latency_ms} onChange={e=>applyFilter({ max_latency_ms: e.target.value.replace(/\D/g,'') })} placeholder="Max latency ms" className="max-w-[120px] h-8 text-xs" inputMode="numeric"/>
+            <Input value={filters.end_user} onChange={e=>applyFilter({ end_user: e.target.value })} placeholder="End user (exact)" className="max-w-[160px] h-8 text-xs"/>
+            <Input value={filters.app} onChange={e=>applyFilter({ app: e.target.value })} placeholder="App (exact)" className="max-w-[160px] h-8 text-xs"/>
           </div>
         )}
       </Card>
 
       {/* Active filter chips */}
       {activeFilters.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 -mt-1">
+        <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-xs text-muted">Filtered by</span>
           {activeFilters.map(k => (
             <Badge key={k} tone="info">
@@ -694,7 +728,7 @@ export default function Logs(){
                k === 'provider_id' ? (providers.find(p=>p.id===filters.provider_id)?.name || 'provider') :
                k === 'q' ? `search: ${filters.q}` :
                `${k.replace(/_/g,' ')}: ${filters[k]}`}
-              <button onClick={()=>applyFilter({ [k]: FILTER_DEFAULTS[k] } as any)} className="ml-1 hover:text-red-300 focus:outline-none"><Icon name="x" size={10}/></button>
+              <button onClick={()=>applyFilter({ [k]: FILTER_DEFAULTS[k] } as any)} className="ml-1 hover:text-danger focus:outline-none"><Icon name="x" size={10}/></button>
             </Badge>
           ))}
           <button onClick={()=>setFilters({...FILTER_DEFAULTS})} className="text-xs text-muted hover:text-paper focus:outline-none">Clear all</button>
@@ -702,7 +736,7 @@ export default function Logs(){
       )}
 
       {/* Reports (group-by) panel */}
-      <Card className="!p-4 !rounded-xl">
+      <Card>
         <button onClick={()=>setShowReports(s=>!s)} className="w-full flex items-center justify-between text-sm font-medium focus:outline-none">
           <span className="flex items-center gap-2"><Icon name="chart" size={15} className="text-accent"/>Reports</span>
           <Icon name="chevronDown" size={15} className={`text-muted transition-transform ${showReports?'rotate-180':''}`}/>
@@ -715,7 +749,7 @@ export default function Logs(){
                 options={GROUP_DIMS.map(d=>({ value: d.value, label: d.label }))}
                 value={groupBy} onChange={setGroupBy}
               />
-              <span className="text-xs text-muted ml-auto">window {filters.since} · respects filters above</span>
+              <span className="text-xs text-muted ml-auto font-mono tabular-nums">window {filters.since} · respects filters above</span>
             </div>
             {groupLoading ? (
               <div className="py-6 text-center text-sm text-muted">Aggregating…</div>
@@ -723,7 +757,7 @@ export default function Logs(){
               <div className="py-6 text-center text-sm text-muted">No rows match the current filters.</div>
             ) : (
               <div className="overflow-x-auto rounded-lg border border-stone">
-                <table className="w-full text-xs">
+                <table className="w-full text-sm">
                   <thead>
                     <tr>
                       <Th className="text-left">{GROUP_DIMS.find(d=>d.value===groupBy)?.label || groupBy}</Th>
@@ -745,18 +779,24 @@ export default function Logs(){
                           else if (groupBy === 'key') { const k = Object.entries(keyMap).find(([,n])=>n===g.name||true); applyFilter({ key_id: g.name ? (Object.entries(keyIdMap).find(([,n])=>n===g.name)?.[0] ?? '') : '' }) }
                           else if (groupBy === 'provider') applyFilter({ provider_id: g.group === '(none)' ? '' : g.group })
                           else if (groupBy === 'status') applyFilter({ status: g.group === '(none)' ? '' : g.group })
+                          // finish_reason passes '(none)' through rather than
+                          // clearing: the API filter understands the sentinel
+                          // and matches rows with no reason recorded, so the
+                          // click lands on exactly the set this group counted.
+                          else if (groupBy === 'finish_reason') applyFilter({ finish_reason: g.group })
+                          else if (groupBy === 'app') applyFilter({ app: g.group === '(none)' ? '' : g.group })
                           else if (groupBy === 'error') applyFilter({ has_error: g.group === 'error' ? 'true' : '' })
                           else applyFilter({ model: g.group })
                         }}
-                        className="hover:bg-raised/50 cursor-pointer transition-colors">
-                        <Td className="font-mono">{g.name || g.group}</Td>
-                        <Td className="text-right tabular-nums">{g.requests.toLocaleString()}</Td>
-                        <Td className={`text-right tabular-nums ${g.failed>0?'text-red-400':'text-muted'}`}>{g.failed||'—'}</Td>
-                        <Td className="text-right tabular-nums">{g.tokens ? g.tokens.toLocaleString() : '—'}</Td>
-                        <Td className="text-right tabular-nums">{g.cost ? `$${g.cost.toFixed(4)}` : '—'}</Td>
-                        <Td className="text-right tabular-nums">{g.avg_latency_ms ? `${Math.round(g.avg_latency_ms)}ms` : '—'}</Td>
-                        <Td className="text-right tabular-nums">{g.p50_latency_ms ? `${g.p50_latency_ms}ms` : '—'}</Td>
-                        <Td className="text-right tabular-nums">{g.p95_latency_ms ? `${g.p95_latency_ms}ms` : '—'}</Td>
+                        className="hover:bg-raised/60 cursor-pointer transition-colors">
+                        <Td className="font-mono text-xs">{g.name || g.group}</Td>
+                        <Td className="text-right font-mono tabular-nums">{g.requests.toLocaleString()}</Td>
+                        <Td className={`text-right font-mono tabular-nums ${g.failed>0?'text-danger':'text-muted'}`}>{g.failed||'—'}</Td>
+                        <Td className="text-right font-mono tabular-nums">{g.tokens ? g.tokens.toLocaleString() : '—'}</Td>
+                        <Td className="text-right font-mono tabular-nums">{g.cost ? `$${g.cost.toFixed(4)}` : '—'}</Td>
+                        <Td className="text-right font-mono tabular-nums">{g.avg_latency_ms ? `${Math.round(g.avg_latency_ms)}ms` : '—'}</Td>
+                        <Td className="text-right font-mono tabular-nums">{g.p50_latency_ms ? `${g.p50_latency_ms}ms` : '—'}</Td>
+                        <Td className="text-right font-mono tabular-nums">{g.p95_latency_ms ? `${g.p95_latency_ms}ms` : '—'}</Td>
                       </tr>
                     ))}
                   </tbody>
@@ -781,14 +821,26 @@ export default function Logs(){
       {!loadError && (
         <TableShell>
           <thead>
-            <tr>
-              <Th>Time</Th>
-              <Th>Model</Th>
-              <Th>Provider</Th>
-              <Th className="text-center">Status</Th>
-              <Th className="!text-right">Latency</Th>
-              <Th className="!text-right">Tokens</Th>
-              <Th className="!text-right">Cost</Th>
+            <tr className="bg-raised/60 border-b border-stone">
+              {([
+                { key: 'created_at', label: 'Time', align: 'left' },
+                { key: 'model', label: 'Model', align: 'left' },
+                { key: null, label: 'Provider', align: 'left' },
+                { key: 'status', label: 'Status', align: 'center' },
+                { key: 'latency_ms', label: 'Latency', align: 'right' },
+                { key: 'total_tokens', label: 'Tokens', align: 'right' },
+                { key: 'cost_usd', label: 'Cost', align: 'right' },
+              ] as const).map(col => (
+                <SortTh
+                  key={col.label}
+                  label={col.label}
+                  sortKey={col.key ?? ''}
+                  sort={{ key: sortKey, dir: sortDir as 'asc' | 'desc' }}
+                  onSort={() => col.key && toggleSort(col.key)}
+                  align={col.align === 'right' ? 'right' : 'left'}
+                  className={col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : ''}
+                />
+              ))}
             </tr>
           </thead>
           {loading ? (
@@ -819,8 +871,8 @@ export default function Logs(){
             <tbody>
               {logs.map(l=>(
                 <tr key={l.id} onClick={()=>handleRowClick(l)}
-                    className="hover:bg-raised/50 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/50">
-                  <Td className="whitespace-nowrap text-xs text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
+                    className="hover:bg-raised/60 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/60">
+                  <Td className="whitespace-nowrap text-xs font-mono text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
                   <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}`}>{l.model}</span></Td>
                   <Td><span className="block font-mono text-xs truncate max-w-[110px] text-muted" title={String(l.provider_id||'')}>{l.provider_id || '—'}</span></Td>
                   <Td className="text-center">
@@ -829,13 +881,13 @@ export default function Logs(){
                       <CacheState status={(l as any).cache_status ?? ((l as any).cache_hit ? 'hit' : undefined)} />
                     </span>
                   </Td>
-                  <Td className="text-right tabular-nums text-xs">{l.latency_ms}ms</Td>
-                  <Td className="text-right tabular-nums text-xs">
+                  <Td className="text-right font-mono tabular-nums text-xs">{l.latency_ms}ms</Td>
+                  <Td className="text-right font-mono tabular-nums text-xs">
                     <span className="block" title={`${l.prompt_tokens ?? 0} prompt · ${l.completion_tokens ?? 0} completion`}>
                       {l.total_tokens ? l.total_tokens.toLocaleString() : '—'}
                     </span>
                   </Td>
-                  <Td className="text-right tabular-nums text-xs">{l.cost_usd ? `$${Number(l.cost_usd).toFixed(4)}` : '—'}</Td>
+                  <Td className="text-right font-mono tabular-nums text-xs">{l.cost_usd ? `$${Number(l.cost_usd).toFixed(4)}` : '—'}</Td>
                 </tr>
               ))}
             </tbody>
@@ -845,7 +897,7 @@ export default function Logs(){
 
       {/* Server-side pagination controls */}
       {!loadError && (
-        <div className="flex items-center justify-between gap-2 -mt-2">
+        <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-muted tabular-nums">
             {total != null ? `${total.toLocaleString()} request(s) matching` : ''}
             {' '}· rows {offset + 1}–{offset + logs.length}

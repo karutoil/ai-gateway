@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
-import { PageHeader, Card, Button, Input, Field, Badge, Icon, CopyButton, Modal, Confirm, EmptyState, useToast } from '../components/ui'
+import {
+  Card, Button, Input, Field, Badge, Icon, CopyButton, Modal, Confirm, EmptyState,
+  Eyebrow, TableShell, Th, Td, TableSkeleton, useToast,
+} from '../components/ui'
 
 type Pat = {
   id: string
@@ -65,21 +68,21 @@ export default function ProfileTokens() {
   }
 
   return (
-    <Card className="space-y-4 !rounded-xl">
+    <Card className="space-y-4">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-[11px] font-bold uppercase tracking-[0.16em] text-accent">Automation</div>
-          <h3 className="font-display text-lg font-bold tracking-tight mt-1 flex items-center gap-2">
-            <Icon name="key" size={16} className="text-accent" /> API tokens
+          <Eyebrow>Automation</Eyebrow>
+          <h3 className="font-display text-[15px] font-semibold -tracking-tight mt-2 flex items-center gap-2">
+            <Icon name="key" size={15} className="text-muted" /> API tokens
           </h3>
-          <p className="text-xs text-muted mt-0.5">
+          <p className="text-xs text-muted mt-1">
             Bearer tokens for the dashboard API (<code className="font-mono">Authorization: Bearer gwp_...</code>).
             Scopes narrow what a token may do — a token never exceeds your own permissions.
           </p>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px_1fr_auto] gap-2 items-end">
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px_1fr_auto] gap-3 items-end">
         <Field label="Name"><Input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-reporting" /></Field>
         <Field label="Expires (days)"><Input value={days} inputMode="numeric" onChange={e => setDays(e.target.value.replace(/\D/g, ''))} placeholder="never" /></Field>
         <Field label="Scopes (optional)"><Input value={scopes} onChange={e => setScopes(e.target.value)} placeholder="logs:read,analytics:read" spellCheck={false} /></Field>
@@ -89,48 +92,67 @@ export default function ProfileTokens() {
       </div>
 
       {loading ? (
-        <div className="text-sm text-muted py-3">Loading…</div>
+        <TableShell>
+          <TableSkeleton rows={3} cols={6} />
+        </TableShell>
       ) : tokens.length === 0 ? (
         <EmptyState icon="key" title="No API tokens yet" hint="Create one to let scripts or CI query the dashboard API as you." />
       ) : (
-        <div className="space-y-1.5">
-          {tokens.map(t => {
-            const revoked = !!t.revoked_at
-            const expired = t.expires_at && new Date(t.expires_at) < new Date()
-            return (
-              <div key={t.id} className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${revoked || expired ? 'border-stone/50 opacity-50' : 'border-stone'}`}>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="font-medium text-sm truncate">{t.name}</span>
-                    {revoked ? <Badge tone="bad">revoked</Badge> : expired ? <Badge tone="bad">expired</Badge> : <Badge tone="good">active</Badge>}
-                    {t.scopes ? <Badge tone="info">{t.scopes}</Badge> : <span className="text-[10px] text-muted">full user access</span>}
-                  </div>
-                  <div className="text-xs text-muted font-mono mt-0.5">
-                    {t.prefix}… · created {new Date(t.created_at).toLocaleDateString()}
-                    {t.last_used_at ? ` · used ${new Date(t.last_used_at).toLocaleDateString()}` : ' · never used'}
-                    {t.expires_at ? ` · expires ${new Date(t.expires_at).toLocaleDateString()}` : ''}
-                  </div>
-                </div>
-                {!revoked && !expired && (
-                  <Button variant="ghost" size="sm" className="text-red-400 hover:bg-red-500/10 shrink-0" onClick={() => setRevokeTarget(t)}>
-                    <Icon name="trash" size={13} /> Revoke
-                  </Button>
-                )}
-              </div>
-            )
-          })}
-        </div>
+        <TableShell minWidth={720}>
+            <thead>
+              <tr>
+                <Th>Token</Th>
+                <Th>Prefix</Th>
+                <Th>Created</Th>
+                <Th>Last used</Th>
+                <Th>Expires</Th>
+                <Th className="text-right">Actions</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {tokens.map(t => {
+                const revoked = !!t.revoked_at
+                const expired = t.expires_at && new Date(t.expires_at) < new Date()
+                return (
+                  <tr key={t.id} className={`${revoked || expired ? 'opacity-50 ' : ''}hover:bg-raised/60 transition-colors`}>
+                    <Td>
+                      <div className="flex items-center gap-2 flex-wrap max-w-[320px]">
+                        <span className="font-medium truncate" title={t.name}>{t.name}</span>
+                        {revoked ? <Badge tone="bad">revoked</Badge> : expired ? <Badge tone="bad">expired</Badge> : <Badge tone="good">active</Badge>}
+                        {t.scopes ? <Badge tone="info">{t.scopes}</Badge> : <span className="text-xs text-muted">full user access</span>}
+                      </div>
+                    </Td>
+                    <Td className="font-mono text-xs text-muted whitespace-nowrap">{t.prefix}…</Td>
+                    <Td className="font-mono text-xs text-muted whitespace-nowrap">{new Date(t.created_at).toLocaleDateString()}</Td>
+                    <Td className="font-mono text-xs text-muted whitespace-nowrap">
+                      {t.last_used_at ? new Date(t.last_used_at).toLocaleDateString() : 'never'}
+                    </Td>
+                    <Td className="font-mono text-xs text-muted whitespace-nowrap">
+                      {t.expires_at ? new Date(t.expires_at).toLocaleDateString() : 'never'}
+                    </Td>
+                    <Td className="text-right">
+                      {!revoked && !expired && (
+                        <Button variant="danger" size="sm" className="shrink-0" onClick={() => setRevokeTarget(t)}>
+                          <Icon name="trash" size={13} /> Revoke
+                        </Button>
+                      )}
+                    </Td>
+                  </tr>
+                )
+              })}
+            </tbody>
+        </TableShell>
       )}
 
       {/* One-time secret display */}
       <Modal open={!!created} onClose={() => setCreated(null)} title="Token created" width="max-w-md">
         {created && (
           <>
-            <div className="rounded-lg border border-accent/40 bg-accent/5 p-3">
-              <div className="text-xs text-muted mb-1.5 uppercase tracking-wide">Token — shown only once</div>
-              <code className="block font-mono text-sm break-all select-all text-accent">{created.secret}</code>
+            <div className="rounded-lg border border-cream/10 bg-ink px-3 py-2.5">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-cream/60 mb-1.5">Token — shown only once</div>
+              <code className="block font-mono text-sm break-all select-all text-cream">{created.secret}</code>
             </div>
-            <p className="text-xs text-muted mt-2">
+            <p className="text-xs text-muted mt-3 leading-relaxed">
               Use it with <code className="font-mono">Authorization: Bearer …</code> on dashboard API calls
               ({created.name} will act with your permissions{created.name ? '' : ''}).
             </p>

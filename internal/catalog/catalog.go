@@ -66,6 +66,66 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db, client: &http.Client{Timeout: 30 * time.Second}}
 }
 
+// catalogColumns is the canonical projection for one catalog row. All four
+// read paths share it so a new column cannot be added to some scans and not
+// others.
+const catalogColumns = `id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits`
+
+// catalogRowScanner is the subset of *sql.Row / *sql.Rows that Scan needs.
+type catalogRowScanner interface{ Scan(dest ...any) error }
+
+// scanCatalogModel reads one catalog row tolerating NULLs. The schema makes
+// only id/provider/name NOT NULL — everything else is nullable — so each
+// column is scanned into a sql.Null* and folded to its zero value.
+//
+// This is not defensive style for its own sake: scanning straight into
+// string/int/float64/time.Time made ANY row with a NULL in those columns fail
+// the scan, and callers treat that failure as "no such model". The model then
+// became silently unpriceable, recording $0 cost and bypassing every per-key
+// budget. The models.dev sync always writes explicit values so it did not bite
+// in the normal path, but a row inserted by any other means is one NULL away
+// from disappearing from pricing.
+func scanCatalogModel(sc catalogRowScanner) (*models.CatalogModel, error) {
+	var (
+		m                                                    models.CatalogModel
+		description, family, modalities, knowledgeCutoff     sql.NullString
+		contextWindow, maxOutput                             sql.NullInt64
+		inputCost, outputCost, cacheReadCost, cacheWriteCost sql.NullFloat64
+		reasoning, toolCall, structuredOutput                sql.NullBool
+		attachment, openWeights                              sql.NullBool
+		updatedAt                                            sql.NullTime
+		rt, rl, rol                                          sql.NullString
+	)
+	if err := sc.Scan(&m.ID, &m.Provider, &m.Name, &description, &family, &contextWindow, &maxOutput,
+		&inputCost, &outputCost, &cacheReadCost, &cacheWriteCost,
+		&reasoning, &toolCall, &structuredOutput, &attachment, &modalities,
+		&openWeights, &knowledgeCutoff, &updatedAt, &rt, &rl, &rol); err != nil {
+		return nil, err
+	}
+	m.Description = description.String
+	m.Family = family.String
+	m.Modalities = modalities.String
+	m.KnowledgeCutoff = knowledgeCutoff.String
+	m.ContextWindow = int(contextWindow.Int64)
+	m.MaxOutput = int(maxOutput.Int64)
+	m.InputCost = inputCost.Float64
+	m.OutputCost = outputCost.Float64
+	m.CacheReadCost = cacheReadCost.Float64
+	m.CacheWriteCost = cacheWriteCost.Float64
+	m.Reasoning = reasoning.Bool
+	m.ToolCall = toolCall.Bool
+	m.StructuredOutput = structuredOutput.Bool
+	m.Attachment = attachment.Bool
+	m.OpenWeights = openWeights.Bool
+	if updatedAt.Valid {
+		m.UpdatedAt = updatedAt.Time
+	}
+	m.ReasoningType = rt.String
+	m.ReasoningLevels = rl.String
+	m.ReasoningOutputLimits = rol.String
+	return &m, nil
+}
+
 func (s *Store) Count() (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM models_catalog`).Scan(&n)
@@ -87,7 +147,7 @@ func (s *Store) List(filter string, providerFilter string, reasoningOnly bool, l
 	if reasoningOnly {
 		where += " AND reasoning = " + db.BoolLit(true)
 	}
-	query := fmt.Sprintf(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE %s ORDER BY provider, id LIMIT ? OFFSET ?`, where)
+	query := fmt.Sprintf(`SELECT `+catalogColumns+` FROM models_catalog WHERE %s ORDER BY provider, id LIMIT ? OFFSET ?`, where)
 	args = append(args, limit, offset)
 	rows, err := s.db.Query(db.Rebind(query), args...)
 	if err != nil {
@@ -96,42 +156,17 @@ func (s *Store) List(filter string, providerFilter string, reasoningOnly bool, l
 	defer rows.Close()
 	var out []models.CatalogModel
 	for rows.Next() {
-		var m models.CatalogModel
-		var rt, rl, rol sql.NullString
-		if err := rows.Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol); err != nil {
+		m, err := scanCatalogModel(rows)
+		if err != nil {
 			return nil, err
 		}
-		if rt.Valid {
-			m.ReasoningType = rt.String
-		}
-		if rl.Valid {
-			m.ReasoningLevels = rl.String
-		}
-		if rol.Valid {
-			m.ReasoningOutputLimits = rol.String
-		}
-		out = append(out, m)
+		out = append(out, *m)
 	}
 	return out, nil
 }
 
 func (s *Store) Get(id string) (*models.CatalogModel, error) {
-	var m models.CatalogModel
-	var rt, rl, rol sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE id=?`), id).Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol)
-	if err != nil {
-		return nil, err
-	}
-	if rt.Valid {
-		m.ReasoningType = rt.String
-	}
-	if rl.Valid {
-		m.ReasoningLevels = rl.String
-	}
-	if rol.Valid {
-		m.ReasoningOutputLimits = rol.String
-	}
-	return &m, nil
+	return scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE id=?`), id))
 }
 
 func (s *Store) GetByShortID(shortID string) (*models.CatalogModel, error) {
@@ -152,25 +187,7 @@ func (s *Store) GetByShortID(shortID string) (*models.CatalogModel, error) {
 	if trimmed == "" {
 		return nil, sql.ErrNoRows
 	}
-	var m models.CatalogModel
-	var rt, rl, rol sql.NullString
-	// Prefer a priced row: the suffix match can hit many providers and an
-	// arbitrary LIMIT 1 may return a zero-price mirror (e.g. ollama-cloud),
-	// which again bills $0 despite priced rows existing.
-	err := s.db.QueryRow(db.Q(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE id LIKE ? ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), id LIMIT 1`), "%/"+trimmed).Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol)
-	if err != nil {
-		return nil, err
-	}
-	if rt.Valid {
-		m.ReasoningType = rt.String
-	}
-	if rl.Valid {
-		m.ReasoningLevels = rl.String
-	}
-	if rol.Valid {
-		m.ReasoningOutputLimits = rol.String
-	}
-	return &m, nil
+	return scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), id LIMIT 1`), "%/"+escapeLike(trimmed)))
 }
 
 // NormalizeModelID strips reseller channel tags and routing prefixes,
@@ -315,9 +332,14 @@ func escapeLike(s string) string {
 //	"wildcard"   — approximate: think/think spelling, "-vN" variant,
 //	               thinking base, dated-version containment
 //	               ("claude-opus-4-1" -> "…/claude-opus-4-1-20250805"),
-//	               AIHubMix coding-plan prefix ("coding-glm-5.3" -> "…/glm-5.3")
+//	               AIHubMix coding-plan prefix ("coding-glm-5.3" -> "…/glm-5.3"),
+//	               coding-plan vendor infix ("coding-xiaomi-mimo-v2.6-pro" ->
+//	               "…/mimo-v2.6-pro")
 //	               or free-tier base ("coding-glm-5.3-free" -> "…/glm-5.3-free"
-//	               or zeroed "…/glm-5.3")
+//	               or zeroed "…/glm-5.3"),
+//	               umans channel prefix ("umans-glm-5.2" -> "…/glm-5.2")
+//	               or umans lab-mode base ("umans-glm-5.3-flash-lab" ->
+//	               "…/glm-5.3-flash")
 //
 // Callers should record "wildcard" distinctly (provider_models.source =
 // "enriched-wildcard") so estimated pricing is distinguishable from exact
@@ -365,8 +387,17 @@ func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, err
 		}
 		// Coding-plan slugs never contain-match (the catalog holds the base,
 		// not the prefixed id), so retry containment on the stripped base:
-		// ("coding-foo-9" -> "…/foo-9-20250101").
-		for _, alt := range codingFreeAlternates(norm) {
+		// ("coding-foo-9" -> "…/foo-9-20250101"). umans channel bases join the
+		// retry only when versioned (a base with a digit): bare-word bases
+		// ("umans-flash-lab" -> "flash") are channel product names and must
+		// not contain-match unrelated rows ("…/gemini-3.5-flash").
+		alts := codingFreeAlternates(norm)
+		for _, alt := range umansAlternates(norm) {
+			if strings.ContainsAny(alt, "0123456789") {
+				alts = append(alts, alt)
+			}
+		}
+		for _, alt := range alts {
 			if len(alt) >= 4 {
 				if m, err := s.getByContains(alt); err == nil {
 					if thinking {
@@ -398,7 +429,8 @@ func (s *Store) FindBestMatch(modelID string) (*models.CatalogModel, string, err
 
 // trySlug runs the per-slug match tiers: verbatim/suffix hits return
 // subkind "", approximate (think spelling, "-vN" variant, thinking base,
-// coding-plan prefix, free-tier base) hits return "wild".
+// coding-plan prefix, free-tier base, umans channel/lab-mode base) hits
+// return "wild".
 func (s *Store) trySlug(slug string, thinking bool) (*models.CatalogModel, string) {
 	if m, err := s.Get(slug); err == nil {
 		return m, ""
@@ -419,12 +451,13 @@ func (s *Store) trySlug(slug string, thinking bool) (*models.CatalogModel, strin
 			return m, "wild"
 		}
 	}
-	// AIHubMix coding-plan channel ("coding-glm-5.3" -> "glm-5.3") and
-	// free-tier base ("x-free" -> "x"). Each alternate also tries the "-vN"
-	// spellings, since the strip can expose a version-variant base
-	// ("coding-deepseek-3.2" -> "deepseek-v3.2").
+	// AIHubMix coding-plan channel ("coding-glm-5.3" -> "glm-5.3"), umans
+	// channel ("umans-glm-5.2" -> "glm-5.2", "umans-glm-5.3-flash-lab" ->
+	// "glm-5.3-flash") and free-tier base ("x-free" -> "x"). Each alternate
+	// also tries the "-vN" spellings, since the strip can expose a
+	// version-variant base ("coding-deepseek-3.2" -> "deepseek-v3.2").
 	free := isFreeSlug(slug)
-	for _, alt := range codingFreeAlternates(slug) {
+	for _, alt := range append(codingFreeAlternates(slug), umansAlternates(slug)...) {
 		if m, err := s.GetByShortID(alt); err == nil {
 			if thinking {
 				m = ensureReasoning(m)
@@ -473,11 +506,53 @@ func stripCodingPrefix(slug string) (string, bool) {
 	return slug, false
 }
 
+// stripCodingVendor removes a vendor infix from an AIHubMix coding-plan slug
+// ("xiaomi-mimo-v2.6-pro" -> "mimo-v2.6-pro"). The coding channel embeds the
+// model vendor name, but models.dev keys the base rows without it
+// ("xiaomi/mimo-v2.6-pro"), so without this the lookup misses and the model
+// stays unenriched. Only known vendor infixes are stripped; matching stays
+// case-insensitive like the rest of the lookup chain. Reports whether a
+// prefix was stripped.
+func stripCodingVendor(slug string) (string, bool) {
+	lower := strings.ToLower(slug)
+	for _, v := range []string{"xiaomi-"} {
+		if len(slug) > len(v) && strings.HasPrefix(lower, v) {
+			return slug[len(v):], true
+		}
+	}
+	return slug, false
+}
+
 // stripFreeSuffix removes the free-tier suffix ("glm-5.3-free" -> "glm-5.3").
 // Reports whether a suffix was stripped.
 func stripFreeSuffix(slug string) (string, bool) {
 	if len(slug) > len("-free") && strings.HasSuffix(strings.ToLower(slug), "-free") {
 		return slug[:len(slug)-len("-free")], true
+	}
+	return slug, false
+}
+
+// stripUmansPrefix removes the umans channel model prefix
+// ("umans-glm-5.2" -> "glm-5.2"). The umans provider namespaces every model
+// id with "umans-", but models.dev keys the underlying base rows without it
+// ("zai/glm-5.2"), so without stripping, lookup misses and the model stays
+// unenriched. Matching stays case-insensitive like the rest of the lookup
+// chain. Reports whether a prefix was stripped.
+func stripUmansPrefix(slug string) (string, bool) {
+	if len(slug) > len("umans-") && strings.HasPrefix(strings.ToLower(slug), "umans-") {
+		return slug[len("umans-"):], true
+	}
+	return slug, false
+}
+
+// stripLabSuffix removes the umans lab-mode suffix
+// ("umans-glm-5.3-flash-lab" -> "umans-glm-5.3-flash"). Lab-mode ids wrap the
+// base with the "umans-" prefix and this "-lab" suffix; models.dev keys the
+// base row alone ("zai/glm-5.3-flash"). Matching stays case-insensitive like
+// the rest of the lookup chain. Reports whether a suffix was stripped.
+func stripLabSuffix(slug string) (string, bool) {
+	if len(slug) > len("-lab") && strings.HasSuffix(strings.ToLower(slug), "-lab") {
+		return slug[:len(slug)-len("-lab")], true
 	}
 	return slug, false
 }
@@ -504,27 +579,79 @@ func zeroFreeCosts(m *models.CatalogModel) *models.CatalogModel {
 // codingFreeAlternates proposes stripped candidates for AIHubMix coding-plan
 // slugs, in priority order. Chained variants come last:
 // ("coding-glm-5.3-free" -> ["coding-glm-5.3", "glm-5.3-free", "glm-5.3"]).
+// Vendor-infixed slugs additionally propose the bare base, since models.dev
+// keys base rows without the vendor name:
+// ("coding-xiaomi-mimo-v2.6-pro" -> [..., "xiaomi-mimo-v2.6-pro",
+// "mimo-v2.6-pro"]).
 func codingFreeAlternates(slug string) []string {
 	var out []string
 	seen := map[string]bool{slug: true}
-	if noFree, ok := stripFreeSuffix(slug); ok && !seen[noFree] {
-		seen[noFree] = true
-		out = append(out, noFree)
-	}
-	if noCoding, ok := stripCodingPrefix(slug); ok && !seen[noCoding] {
-		seen[noCoding] = true
-		out = append(out, noCoding)
+	add := func(cand string) {
+		if cand != "" && !seen[cand] {
+			seen[cand] = true
+			out = append(out, cand)
+		}
 	}
 	if noFree, ok := stripFreeSuffix(slug); ok {
-		if both, ok2 := stripCodingPrefix(noFree); ok2 && !seen[both] {
-			seen[both] = true
-			out = append(out, both)
+		add(noFree)
+	}
+	if noCoding, ok := stripCodingPrefix(slug); ok {
+		add(noCoding)
+	}
+	if noFree, ok := stripFreeSuffix(slug); ok {
+		if both, ok2 := stripCodingPrefix(noFree); ok2 {
+			add(both)
 		}
 	}
 	if noCoding, ok := stripCodingPrefix(slug); ok {
-		if both, ok2 := stripFreeSuffix(noCoding); ok2 && !seen[both] {
-			seen[both] = true
-			out = append(out, both)
+		if both, ok2 := stripFreeSuffix(noCoding); ok2 {
+			add(both)
+		}
+	}
+	// Bare-base fallbacks for vendor-infixed coding slugs. Each candidate
+	// whose coding- prefix is stripped may still carry the vendor infix, so
+	// propose the base too. These come last so exact coding rows and plain
+	// coding-stripped rows keep priority.
+	for _, cand := range append([]string{slug}, out...) {
+		stripped := cand
+		if noCoding, ok := stripCodingPrefix(stripped); ok {
+			stripped = noCoding
+		}
+		if base, ok := stripCodingVendor(stripped); ok {
+			add(base)
+			if noFree, ok := stripFreeSuffix(base); ok {
+				add(noFree)
+			}
+		}
+	}
+	return out
+}
+
+// umansAlternates proposes base slugs for umans channel ids in priority
+// order — minimal stripping first, so the channel's own rows stay preferred
+// ("umans-glm-5.3-flash-lab" -> "umans-glm-5.3-flash", the non-lab sibling,
+// then "glm-5.3-flash-lab", then the bare base "glm-5.3-flash"). Plain
+// channel ids propose the bare base ("umans-glm-5.2" -> "glm-5.2").
+func umansAlternates(slug string) []string {
+	var out []string
+	seen := map[string]bool{slug: true}
+	add := func(cand string) {
+		if cand != "" && !seen[cand] {
+			seen[cand] = true
+			out = append(out, cand)
+		}
+	}
+	noUmans, isUmans := stripUmansPrefix(slug)
+	noLab, isLab := stripLabSuffix(slug)
+	if isLab {
+		add(noLab)
+	}
+	if isUmans {
+		add(noUmans)
+	}
+	if isUmans && isLab {
+		if base, ok := stripLabSuffix(noUmans); ok {
+			add(base)
 		}
 	}
 	return out
@@ -544,22 +671,7 @@ func backoffSegment(slug string) string {
 // Case-insensitive: reseller slugs do not always match snapshot casing.
 func (s *Store) getByContains(slug string) (*models.CatalogModel, error) {
 	pat := "%" + escapeLike(slug) + "%"
-	var m models.CatalogModel
-	var rt, rl, rol sql.NullString
-	err := s.db.QueryRow(db.Q(`SELECT id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), LENGTH(id), id LIMIT 1`), pat).Scan(&m.ID, &m.Provider, &m.Name, &m.Description, &m.Family, &m.ContextWindow, &m.MaxOutput, &m.InputCost, &m.OutputCost, &m.CacheReadCost, &m.CacheWriteCost, &m.Reasoning, &m.ToolCall, &m.StructuredOutput, &m.Attachment, &m.Modalities, &m.OpenWeights, &m.KnowledgeCutoff, &m.UpdatedAt, &rt, &rl, &rol)
-	if err != nil {
-		return nil, err
-	}
-	if rt.Valid {
-		m.ReasoningType = rt.String
-	}
-	if rl.Valid {
-		m.ReasoningLevels = rl.String
-	}
-	if rol.Valid {
-		m.ReasoningOutputLimits = rol.String
-	}
-	return &m, nil
+	return scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), LENGTH(id), id LIMIT 1`), pat))
 }
 
 func (s *Store) FetchAndSync() (int, error) {
@@ -672,4 +784,59 @@ func CostFor(m *models.CatalogModel, promptTokens, completionTokens int) float64
 		return 0
 	}
 	return float64(promptTokens)*m.InputCost/1_000_000 + float64(completionTokens)*m.OutputCost/1_000_000
+}
+
+// CacheSplit is the normalized billing split of a request's input tokens:
+// every input token lands in exactly one bucket, and the three add up to the
+// true total input. Normalizing at extraction time is what lets the pricing
+// below stay provider-agnostic, because the two upstream families disagree on
+// how cached tokens are reported:
+//
+//	OpenAI      prompt_tokens INCLUDES prompt_tokens_details.cached_tokens
+//	            (a subset), so Fresh = prompt_tokens - cached.
+//	Anthropic   input_tokens EXCLUDES cache_read_input_tokens and
+//	            cache_creation_input_tokens (siblings), so Fresh = input_tokens
+//	            and the cache counts are additional.
+//
+// Getting this wrong double-charges one family and under-charges the other,
+// so the split is decided where the field names are still visible.
+type CacheSplit struct {
+	Fresh      int
+	CacheRead  int
+	CacheWrite int
+	Completion int
+}
+
+// TotalInput is the true input token count across all three input buckets.
+func (c CacheSplit) TotalInput() int { return c.Fresh + c.CacheRead + c.CacheWrite }
+
+// Any reports whether the request carried any usage at all.
+func (c CacheSplit) Any() bool { return c.TotalInput()+c.Completion > 0 }
+
+// CostForSplit prices a request using cache-aware rates.
+//
+// Cached input is billed at the model's cache-read rate and cache writes at
+// its cache-write rate; the remainder at the standard input rate. When a rate
+// is absent from the catalog (0) the corresponding tokens fall back to the
+// standard input rate — the conservative choice, since assuming a discount
+// that does not exist understates spend and silently under-counts budget
+// consumption. That fallback also preserves pre-existing behaviour for models
+// the catalog carries no cache pricing for.
+func CostForSplit(m *models.CatalogModel, s CacheSplit) float64 {
+	if m == nil {
+		return 0
+	}
+	const perM = 1_000_000.0
+	cacheReadRate := m.CacheReadCost
+	if cacheReadRate <= 0 {
+		cacheReadRate = m.InputCost
+	}
+	cacheWriteRate := m.CacheWriteCost
+	if cacheWriteRate <= 0 {
+		cacheWriteRate = m.InputCost
+	}
+	return float64(s.Fresh)*m.InputCost/perM +
+		float64(s.CacheRead)*cacheReadRate/perM +
+		float64(s.CacheWrite)*cacheWriteRate/perM +
+		float64(s.Completion)*m.OutputCost/perM
 }

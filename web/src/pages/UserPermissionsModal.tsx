@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
 import { PERM_CATALOG, PERM_GROUPS, type Perm } from '../lib/permissions'
-import { Modal, Button, Badge, Icon, useToast } from '../components/ui'
+import { Modal, Button, Badge, Icon, ErrorNote, useToast } from '../components/ui'
 
 type PermState = 'inherit' | 'allow' | 'deny'
 
@@ -93,28 +93,28 @@ export default function UserPermissionsModal({ userId, onClose, onSaved }: {
 
   return (
     <Modal open={userId !== null} onClose={onClose} title="Fine-grained permissions" width="max-w-2xl">
-      {error && <div className="text-sm text-red-400">{error}</div>}
+      {error && <ErrorNote message={error} />}
       {loading && !data && <div className="py-8 text-center text-sm text-muted">Loading…</div>}
       {data && (
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2 text-sm">
               <span className="font-medium">{data.username}</span>
-              <Badge tone="neutral">{data.role}</Badge>
+              <Badge tone={data.role === 'admin' ? 'info' : 'neutral'}>{data.role}</Badge>
               {adminFixed && (
                 <span className="text-xs text-muted">admin — always full access</span>
               )}
             </div>
             <div className="text-xs text-muted">
-              {allowCount > 0 && <span className="text-accent">{allowCount} granted </span>}
-              {denyCount > 0 && <span className="text-amber">{denyCount} denied </span>}
+              {allowCount > 0 && <span className="text-good">{allowCount} granted </span>}
+              {denyCount > 0 && <span className="text-danger">{denyCount} denied </span>}
               {(allowCount === 0 && denyCount === 0) && 'following role defaults'}
             </div>
           </div>
 
           {adminFixed ? (
             <div className="space-y-3">
-              <div className="rounded-lg border border-stone bg-app p-4 text-sm text-muted">
+              <div className="rounded-lg border border-stone bg-raised p-4 text-sm text-muted leading-relaxed">
                 Admins hold every permission by design — overrides don't apply to the admin
                 role, so this account can never be locked out. Switch the user's role first
                 if they should have limited access. Full set:
@@ -133,19 +133,19 @@ export default function UserPermissionsModal({ userId, onClose, onSaved }: {
                 Changes apply immediately, no re-login needed.
               </p>
               {PERM_GROUPS.map(g => (
-                <div key={g.resource} className="rounded-xl border border-stone/60 overflow-hidden bg-app/40">
-                  <div className="px-3 py-2 bg-raised text-xs font-medium uppercase tracking-wide text-muted">{g.label}</div>
+                <div key={g.resource} className="rounded-lg border border-stone overflow-hidden bg-app/40">
+                  <div className="px-3 py-2 bg-raised text-xs font-semibold uppercase tracking-wider text-muted">{g.label}</div>
                   <div className="divide-y divide-stone">
                     {g.perms.map(p => {
                       const st = states[p.perm] ?? 'inherit'
                       const eff = effectiveSet.has(p.perm)
                       return (
                         <button key={p.perm} onClick={() => cycle(p.perm)}
-                          className="w-full text-left px-3 py-2 flex items-center justify-between gap-3 hover:bg-raised/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50">
+                          className="w-full text-left px-3 py-2.5 flex items-center justify-between gap-4 hover:bg-raised/60 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/50">
                           <span className="min-w-0">
                             <span className="text-sm block">{p.label}</span>
-                            {p.hint && <span className="text-xs text-muted block">{p.hint}</span>}
-                            <span className="font-mono text-[10px] text-muted/70">{p.perm}</span>
+                            {p.hint && <span className="text-xs text-muted block leading-relaxed">{p.hint}</span>}
+                            <span className="font-mono text-[10px] text-muted">{p.perm}</span>
                           </span>
                           <span className="flex items-center gap-2 shrink-0">
                             <span className="text-[10px] text-muted">{eff ? 'effective' : '—'}</span>

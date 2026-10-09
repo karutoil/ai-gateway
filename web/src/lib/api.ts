@@ -83,6 +83,117 @@ export function extractApiError(text: string, fallback = 'request failed'): stri
   return t.length > 400 ? t.slice(0, 400) + '…' : t
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Reporting window + report shapes                                    */
+/* ------------------------------------------------------------------ */
+
+/** Quick-pick windows the reporting pages offer. */
+export type RangeKey = '1h' | '6h' | '24h' | '7d' | '30d' | '90d' | '365d'
+
+/** A reporting window: either a shorthand range or an explicit from/to pair. */
+export type AnalyticsWindow = {
+  range?: RangeKey
+  /** RFC3339; wins over `range` when present. */
+  from?: string
+  to?: string
+  limit?: number
+}
+
+export function analyticsParams(w: AnalyticsWindow): string {
+  const p = new URLSearchParams()
+  if (w.from && w.to) {
+    p.set('from', w.from); p.set('to', w.to)
+  } else if (w.range) {
+    p.set('range', w.range)
+  }
+  if (w.limit != null) p.set('limit', String(w.limit))
+  const s = p.toString()
+  return s ? `?${s}` : ''
+}
+
+/** One ranked breakdown row (also used for cost groupings). */
+export type RankRow = {
+  name: string
+  requests: number
+  tokens: number
+  cost: number
+  failed: number
+  identities?: number
+  last_seen?: string
+}
+
+export type AttributionReport = {
+  range: string
+  from: string
+  to: string
+  generated: string
+  apps: RankRow[]
+  end_users: RankRow[]
+  coverage: {
+    total_requests: number
+    with_end_user: number
+    unattributed: number
+    unpriced_requests: number
+    unpriced_token_share: number
+  }
+}
+
+export type CostPoint = { day: string; cost: number; cache_savings: number; requests: number }
+
+export type CostReport = {
+  range: string
+  from: string
+  to: string
+  generated: string
+  totals: {
+    cost_usd: number
+    cache_savings_usd: number
+    cache_read_tokens: number
+    cache_write_tokens: number
+    prompt_tokens: number
+    completion_tokens: number
+    reasoning_tokens: number
+    unpriced_requests: number
+    unpriced_tokens: number
+  }
+  daily: CostPoint[]
+  by_cache_status: RankRow[]
+  by_model: RankRow[]
+  by_provider: RankRow[]
+  by_app: RankRow[]
+  by_key: RankRow[]
+}
+
+export type PerfRow = {
+  name: string
+  requests: number
+  failed: number
+  error_rate: number
+  uptime_pct: number
+  p50_ms: number
+  p95_ms: number
+  p99_ms: number
+  avg_ms: number
+  ttft_p50_ms: number
+  ttft_p95_ms: number
+  avg_tps: number
+  stream_share: number
+  health?: string
+}
+
+export type PerfPoint = { day: string; requests: number; failed: number; avg_ms: number; avg_ttft_ms: number }
+
+export type PerformanceReport = {
+  range: string
+  from: string
+  to: string
+  generated: string
+  providers: PerfRow[]
+  models: PerfRow[]
+  daily: PerfPoint[]
+}
+
 /** Query params accepted by GET /api/logs (and /api/logs/group + /api/logs/export). */
 export type LogsQuery = {
   limit?: number
@@ -104,6 +215,19 @@ export type LogsQuery = {
   min_latency_ms?: number
   max_latency_ms?: number
   has_error?: 'true'
+  /** terminal finish reason (stop|length|tool_calls|content_filter), or "(none)" */
+  finish_reason?: string
+  /** exact end-user identity; high-cardinality, so filter-only (never group_by) */
+  end_user?: string
+  /** exact application identity */
+  app?: string
+  /**
+   * Server-side sort. The column is whitelisted by the API, so an unknown
+   * value falls back to newest-first rather than erroring.
+   */
+  order?: 'created_at' | 'latency_ms' | 'ttft_ms' | 'total_tokens' | 'cost_usd' | 'status' | 'model' | 'endpoint'
+  /** Sort direction; defaults to desc. */
+  dir?: 'asc' | 'desc'
   /** server-side search across model, endpoint, error (and bodies with search_bodies) */
   q?: string
   /** opt-in: include request/response bodies in q search */
@@ -112,7 +236,7 @@ export type LogsQuery = {
 
 /** Params for GET /api/logs/group (group-by reporting). */
 export type LogsGroupQuery = Omit<LogsQuery, 'limit' | 'offset'> & {
-  group_by: 'key' | 'model' | 'provider' | 'endpoint' | 'finish_reason' | 'status' | 'error'
+  group_by: 'key' | 'model' | 'provider' | 'endpoint' | 'finish_reason' | 'status' | 'error' | 'app'
   /** window: 24h / 7d / 30d (default 7d) */
   range?: string
   limit?: number
@@ -216,6 +340,19 @@ export const api = {
     analytics: (id: string, range: '24h'|'7d'|'30d' = '7d') => req(`/api/keys/${encodeURIComponent(id)}/analytics?range=${range}`),
   },
   stats: () => req('/api/stats'),
+  /**
+   * Reporting endpoints behind the attribution / cost / performance pages.
+   * All three accept either a `range` shorthand or an explicit from/to pair
+   * (RFC3339), so the UI can offer absolute windows as well as quick picks.
+   */
+  analytics: {
+    attribution: (params: AnalyticsWindow = {}) =>
+      req(`/api/analytics/attribution${analyticsParams(params)}`) as Promise<AttributionReport>,
+    cost: (params: AnalyticsWindow = {}) =>
+      req(`/api/analytics/cost${analyticsParams(params)}`) as Promise<CostReport>,
+    performance: (params: AnalyticsWindow = {}) =>
+      req(`/api/analytics/performance${analyticsParams(params)}`) as Promise<PerformanceReport>,
+  },
   logs: () => req('/api/logs'),
   /**
    * Paginated/filtered request logs. Response stays a JSON array; the total

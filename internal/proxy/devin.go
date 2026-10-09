@@ -65,14 +65,14 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 	sessionToken, _, _, err := h.ProviderStore.EnsureFreshAccess(ctx, p, h.clientOrDefault())
 	if err != nil {
 		httperr.Write(w, http.StatusBadGateway, "devin oauth not connected or refresh failed — reconnect in Providers", httperr.TypeProxy)
-		h.logRequestExtended(keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logRequestExtended(ctx, keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
 
 	userJWT, chatBase, err := devin.GetUserJWT(sessionToken, devinEndpoints(p)[0], h.clientOrDefault())
 	if err != nil {
 		httperr.Write(w, http.StatusBadGateway, "devin authentication failed — reconnect in Providers", httperr.TypeProxy)
-		h.logRequestExtended(keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logRequestExtended(ctx, keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
 
@@ -130,14 +130,14 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 			status = http.StatusBadGateway
 		}
 		httperr.Proxy(w, status, friendlyDevinMessage(status, lastErrText))
-		h.logRequestExtended(keyPrefix, p.ID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		h.logRequestExtended(ctx, keyPrefix, p.ID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
 	}
 	defer resp.Body.Close()
 
 	switch endpoint {
 	case "messages", "responses":
-		h.serveDevinBuffered(w, resp, model, wire, chatIn, endpoint, keyPrefix, start, p.ID, isStream)
+		h.serveDevinBuffered(r.Context(), w, resp, model, wire, chatIn, endpoint, keyPrefix, start, p.ID, isStream)
 	default:
 		h.serveDevinChat(w, r, resp, model, wire, chatIn, keyPrefix, start, p.ID, isStream)
 	}
@@ -169,8 +169,8 @@ func (h *Handler) devinModelRouting(providerID, base string) map[string]string {
 // wire-level context for Devin support tickets. Streaming exchanges must call
 // this explicitly: headers have already flowed, so without it the failure is
 // invisible in request history.
-func (h *Handler) logDevinTrailer(model, wire string, chatIn devin.ChatInput, endpoint, keyPrefix, providerID string, start time.Time, stream bool, trailer string) {
-	h.logRequestExtended(keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, stream)
+func (h *Handler) logDevinTrailer(ctx context.Context, model, wire string, chatIn devin.ChatInput, endpoint, keyPrefix, providerID string, start time.Time, stream bool, trailer string) {
+	h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, stream)
 	toolCalls := 0
 	for _, m := range chatIn.Messages {
 		toolCalls += len(m.ToolCalls)
@@ -370,7 +370,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		deltas, trailerErr := collectDevinDeltas(resp.Body)
 		if trailerErr != "" {
 			httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+friendlyDevinTrailerError(trailerErr))
-			h.logDevinTrailer(model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, false, trailerErr)
+			h.logDevinTrailer(r.Context(), model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, false, trailerErr)
 			return
 		}
 		chunks := devinDeltasToChunks(deltas)
@@ -378,7 +378,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
-		h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, 0, false)
+		h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, 0, false)
 		if h.Metrics != nil {
 			h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 		}
@@ -406,7 +406,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		frames, rest, err := devin.ParseFrames(staging)
 		if err != nil {
 			writeSSEUpstreamError(w, false, "Devin stream error: malformed frame")
-			h.logDevinTrailer(model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, "malformed frame")
+			h.logDevinTrailer(r.Context(), model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, "malformed frame")
 			return
 		}
 		staging = rest
@@ -416,7 +416,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 				// and still land in request history via logDevinTrailer.
 				if msg := devin.TrailerError(fr.Payload); msg != "" {
 					writeSSEUpstreamError(w, false, "Devin stream error: "+friendlyDevinTrailerError(msg))
-					h.logDevinTrailer(model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, msg)
+					h.logDevinTrailer(r.Context(), model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, msg)
 					return
 				}
 				continue
@@ -465,7 +465,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		st.SetFinish("length")
 	}
 	st.Close()
-	h.logRequestExtended(keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, 0, true)
+	h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, 0, true)
 	if h.Metrics != nil {
 		h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 	}
@@ -473,22 +473,22 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 
 // serveDevinBuffered collects a full Devin stream then renders the messages
 // or responses dialect.
-func (h *Handler) serveDevinBuffered(w http.ResponseWriter, resp *http.Response, model, wire string, chatIn devin.ChatInput, endpoint, keyPrefix string, start time.Time, providerID string, isStream bool) {
+func (h *Handler) serveDevinBuffered(ctx context.Context, w http.ResponseWriter, resp *http.Response, model, wire string, chatIn devin.ChatInput, endpoint, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	deltas, trailerErr := collectDevinDeltas(resp.Body)
 	if trailerErr != "" {
 		// Nothing written yet, so a plain 502 (not an SSE frame) is correct
 		// even when the client asked to stream.
 		httperr.Proxy(w, http.StatusBadGateway, "Devin stream error: "+friendlyDevinTrailerError(trailerErr))
-		h.logDevinTrailer(model, wire, chatIn, endpoint, keyPrefix, providerID, start, isStream, trailerErr)
+		h.logDevinTrailer(ctx, model, wire, chatIn, endpoint, keyPrefix, providerID, start, isStream, trailerErr)
 		return
 	}
 	chunks := devinDeltasToChunks(deltas)
 	costFn := devinCostFor()
 	if endpoint == "messages" {
-		h.serveChunksAsAnthropic(w, chunks, model, "messages", costFn, keyPrefix, providerID, start, isStream)
+		h.serveChunksAsAnthropic(ctx, w, chunks, model, "messages", costFn, keyPrefix, providerID, start, isStream)
 		return
 	}
-	h.serveChunksAsResponses(w, chunks, model, "responses", costFn, keyPrefix, providerID, start, isStream)
+	h.serveChunksAsResponses(ctx, w, chunks, model, "responses", costFn, keyPrefix, providerID, start, isStream)
 }
 
 // collectDevinDeltas drains framed deltas; the first trailer error wins.

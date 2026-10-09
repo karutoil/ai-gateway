@@ -9,8 +9,8 @@ import {
 
 type Me = { id:string; username:string; role:string; display_name?:string; created_at:string; last_login_at?:string; login_count:number; passkey_enabled:boolean; has_recovery_code:boolean; passkey_count:number }
 
-const ROLE_TONE: Record<string, 'info' | 'good' | 'warn' | 'neutral'> = {
-  admin: 'info', member: 'good', support: 'warn', readonly: 'neutral',
+const ROLE_TONE: Record<string, 'info' | 'neutral'> = {
+  admin: 'info', member: 'neutral', support: 'neutral', readonly: 'neutral',
 }
 
 function ago(iso?: string | null): string {
@@ -150,7 +150,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
 
       {/* show-once recovery code — explicit acknowledgment, no bare dismiss */}
       {recovery && (
-        <div className="rounded-xl border border-accent/30 bg-accent/10 p-4">
+        <div className="rounded-lg border border-accent/30 bg-accent/10 p-4">
           <div className="flex items-start gap-3">
             <div className="w-9 h-9 rounded-lg bg-accent/15 text-accent flex items-center justify-center shrink-0">
               <Icon name="lock" size={17} />
@@ -158,7 +158,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
             <div className="min-w-0 flex-1">
               <div className="text-sm font-semibold text-accent">Recovery code</div>
               <div className="text-xs text-muted mt-0.5">Store it now — shown only once. Required if your passkey is lost.</div>
-              <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-accent/30 bg-graphite/60 px-3 py-2">
+              <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-stone bg-raised px-3 py-2">
                 <code className="font-mono text-sm text-paper break-all min-w-0 flex-1">{recovery}</code>
                 <CopyButton value={recovery} label="Copy recovery code" />
               </div>
@@ -176,13 +176,13 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         {/* identity card */}
         <Card>
           <div className="flex flex-col items-center text-center pb-4 border-b border-stone">
-            <span className="w-16 h-16 rounded-xl bg-accent flex items-center justify-center text-onaccent font-display font-semibold text-2xl select-none">
+            <span className="w-16 h-16 rounded-lg bg-accent flex items-center justify-center text-onaccent font-display font-semibold text-2xl select-none">
               {me.username[0]?.toUpperCase()}
             </span>
             <div className="font-semibold mt-3">{me.username}</div>
             {me.display_name && <div className="text-sm text-muted mt-0.5">{me.display_name}</div>}
-            <div className="mt-2"><Badge tone={ROLE_TONE[me.role] ?? 'neutral'} dot>{me.role}</Badge></div>
-            <div className="text-xs text-muted mt-2">member since {new Date(me.created_at).toLocaleDateString()}</div>
+            <div className="mt-2"><Badge tone={ROLE_TONE[me.role] ?? 'neutral'}>{me.role}</Badge></div>
+            <div className="text-xs text-muted mt-2 font-mono">member since {new Date(me.created_at).toLocaleDateString()}</div>
           </div>
           <div className="pt-4">
             <Field label="Display name">
@@ -199,8 +199,8 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         {/* change password card */}
         <Card>
           <div className="flex items-center gap-2 mb-4">
-            <Icon name="lock" size={15} className="text-accent" />
-            <h3 className="font-semibold text-sm">Change password</h3>
+            <Icon name="lock" size={15} className="text-muted" />
+            <h3 className="font-semibold text-[15px] -tracking-tight">Change password</h3>
           </div>
           {pwError && <div className="mb-3"><ErrorNote message={pwError} /></div>}
           <div className="grid sm:grid-cols-3 gap-3">
@@ -223,11 +223,11 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
 
       <div className="grid md:grid-cols-2 gap-4">
         {/* passkeys card */}
-        <Card className="hover:border-accent/25 transition-colors">
+        <Card className="hover:border-muted/40 transition-colors">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
-              <Icon name="shield" size={15} className={me.passkey_enabled ? 'text-accent' : 'text-muted'} />
-              <h3 className="font-semibold text-sm">Passkeys</h3>
+              <Icon name="shield" size={15} className={me.passkey_enabled ? 'text-good' : 'text-muted'} />
+              <h3 className="font-semibold text-[15px] -tracking-tight">Passkeys</h3>
             </div>
             <Badge tone={me.passkey_enabled ? 'good' : 'neutral'} dot={me.passkey_enabled}>
               {me.passkey_enabled ? `${me.passkey_count} enabled` : 'disabled'}
@@ -246,7 +246,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
               {busy ? 'Waiting…' : <> <Icon name="shield" size={14} /> Enable passkey </>}
             </Button>
             {me.passkey_enabled && (
-              <Button variant="ghost" size="sm" className="text-red-400 hover:text-red-300 hover:bg-red-500/10" onClick={()=>setConfirmDisable(true)}>
+              <Button variant="danger" size="sm" onClick={()=>setConfirmDisable(true)}>
                 Disable
               </Button>
             )}
@@ -274,8 +274,8 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
         <Card>
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              <Icon name="pulse" size={15} className="text-accent" />
-              <h3 className="font-semibold text-sm">Recent activity</h3>
+              <Icon name="pulse" size={15} className="text-muted" />
+              <h3 className="font-semibold text-[15px] -tracking-tight">Recent activity</h3>
             </div>
             <Badge tone="neutral"><span className="tabular-nums">{activity.length}</span> events</Badge>
           </div>
@@ -291,7 +291,7 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
                   <span className="absolute left-0 top-1 w-[11px] h-[11px] rounded-full bg-accent ring-4 ring-surface" aria-hidden />
                   <div className="flex flex-wrap items-baseline justify-between gap-x-3">
                     <span className="text-sm font-medium">{a.action}</span>
-                    <span className="text-xs text-muted whitespace-nowrap">{ago(a.created_at)}</span>
+                    <span className="text-xs text-muted font-mono whitespace-nowrap">{ago(a.created_at)}</span>
                   </div>
                   <div className="font-mono text-xs text-muted truncate mt-0.5" title={`${a.target_type}:${a.target_id}`}>
                     {a.target_type}:{a.target_id}
@@ -307,25 +307,25 @@ export default function Profile({ onSessionRevoked }: { onSessionRevoked?: () =>
       {logins && (
         <Card>
           <div className="flex items-center gap-2 mb-4">
-            <Icon name="logout" size={15} className="text-accent" />
-            <h3 className="font-semibold text-sm">Logins</h3>
+            <Icon name="logout" size={15} className="text-muted" />
+            <h3 className="font-semibold text-[15px] -tracking-tight">Logins</h3>
           </div>
-          <div className="grid grid-cols-3 gap-3">
-            <div className="rounded-lg bg-app border border-stone p-3">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted">Total logins</div>
-              <div className="text-xl font-semibold tabular-nums mt-1">{logins.login_count ?? me.login_count}</div>
-            </div>
-            <div className="rounded-lg bg-app border border-stone p-3">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted">Last login</div>
-              <div className="text-sm font-medium mt-1.5 whitespace-nowrap" title={logins.last_login_at ? new Date(logins.last_login_at).toLocaleString() : undefined}>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <Card pad={false} className="p-3">
+              <div className="text-xs font-medium text-muted">Total logins</div>
+              <div className="text-2xl leading-none font-semibold tabular-nums -tracking-tight mt-1.5">{logins.login_count ?? me.login_count}</div>
+            </Card>
+            <Card pad={false} className="p-3">
+              <div className="text-xs font-medium text-muted">Last login</div>
+              <div className="text-sm font-medium mt-1.5 whitespace-nowrap font-mono" title={logins.last_login_at ? new Date(logins.last_login_at).toLocaleString() : undefined}>
                 {ago(logins.last_login_at)}
               </div>
-              {logins.last_login_at && <div className="text-[11px] text-muted mt-0.5">{new Date(logins.last_login_at).toLocaleString()}</div>}
-            </div>
-            <div className="rounded-lg bg-app border border-stone p-3">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-muted">Joined</div>
-              <div className="text-sm font-medium mt-1.5">{new Date(logins.created_at ?? me.created_at).toLocaleDateString()}</div>
-            </div>
+              {logins.last_login_at && <div className="text-[11px] text-muted mt-0.5 font-mono">{new Date(logins.last_login_at).toLocaleString()}</div>}
+            </Card>
+            <Card pad={false} className="p-3">
+              <div className="text-xs font-medium text-muted">Joined</div>
+              <div className="text-sm font-medium mt-1.5 font-mono">{new Date(logins.created_at ?? me.created_at).toLocaleDateString()}</div>
+            </Card>
           </div>
         </Card>
       )}

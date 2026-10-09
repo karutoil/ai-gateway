@@ -1,9 +1,10 @@
 /**
- * Ledger Design System — shared UI primitives for the AI Gateway console.
+ * Precision Design System — shared UI primitives for the AI Gateway console.
  *
- * Flat surfaces, hairline borders, one persimmon accent. Serif headlines,
- * grotesque body, mono data. Pages compose primitives; they never hand-roll
- * raw control styling.
+ * Cool slate surfaces, hairline borders, one indigo accent; green/amber/red
+ * reserved for status. Sans-only type (Inter + JetBrains Mono for data).
+ * Pages compose primitives; they never hand-roll raw control styling.
+ * See ../DESIGN.md for the full spec.
  */
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { create } from 'zustand'
@@ -96,13 +97,13 @@ export function Button({
   type?: 'button' | 'submit'; title?: string
 }) {
   const base =
-    'inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-40 disabled:pointer-events-none select-none active:translate-y-px whitespace-nowrap'
-  const sizes = size === 'sm' ? 'text-xs px-3 h-8' : size === 'lg' ? 'text-sm px-5 h-11' : 'text-sm px-4 h-10'
+    'inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-40 disabled:pointer-events-none select-none active:translate-y-px whitespace-nowrap'
+  const sizes = size === 'sm' ? 'text-xs px-2.5 h-8' : size === 'lg' ? 'text-sm px-4 h-10' : 'text-sm px-3 h-9'
   const variants: Record<ButtonVariant, string> = {
-    primary: 'bg-accent text-onaccent hover:bg-accent/90 shadow-sm',
-    secondary: 'border border-stone bg-surface text-paper hover:border-muted/70 hover:bg-raised/50',
+    primary: 'bg-accent text-onaccent hover:opacity-90 shadow-sm',
+    secondary: 'border border-stone bg-surface text-paper hover:bg-raised',
     ghost: 'text-muted hover:text-paper hover:bg-raised',
-    danger: 'bg-danger text-white hover:brightness-95 shadow-sm',
+    danger: 'bg-danger/10 text-danger border border-danger/30 hover:bg-danger/15',
     subtle: 'bg-accent/10 text-accent border border-accent/25 hover:bg-accent/15',
   }
   return (
@@ -119,7 +120,7 @@ export function Button({
 
 export function Card({ children, className = '', pad = true }: { children: ReactNode; className?: string; pad?: boolean }) {
   return (
-    <div className={`rounded-xl border border-stone bg-surface shadow-card ${pad ? 'p-5' : ''} ${className}`}>
+    <div className={`rounded-lg border border-stone bg-surface shadow-card ${pad ? 'p-4' : ''} ${className}`}>
       {children}
     </div>
   )
@@ -127,8 +128,8 @@ export function Card({ children, className = '', pad = true }: { children: React
 
 export function Eyebrow({ children }: { children: ReactNode }) {
   return (
-    <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-accent flex items-center gap-2">
-      <span className="w-4 h-px bg-accent" />{children}
+    <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-accent flex items-center gap-2">
+      <span className="w-3.5 h-px bg-accent/60" />{children}
     </div>
   )
 }
@@ -138,7 +139,7 @@ export function PageHeader({ title, description, actions, eyebrow }: { title: st
     <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4 mb-6">
       <div className="min-w-0">
         {eyebrow && <Eyebrow>{eyebrow}</Eyebrow>}
-        <h1 className={`font-display text-[30px] md:text-4xl font-semibold leading-tight ${eyebrow ? 'mt-2' : ''}`}>{title}</h1>
+        <h1 className={`font-display text-2xl font-semibold leading-tight -tracking-tight ${eyebrow ? 'mt-2' : ''}`}>{title}</h1>
         {description && <p className="text-muted text-sm mt-1.5 max-w-2xl leading-relaxed">{description}</p>}
       </div>
       {actions && <div className="flex items-center gap-2 shrink-0 flex-wrap">{actions}</div>}
@@ -151,15 +152,15 @@ export function Badge({ children, tone = 'neutral', dot = false }: {
 }) {
   const tones = {
     neutral: 'bg-raised text-muted border-stone',
-    good: 'bg-accent/10 text-accent border-accent/30',
+    good: 'bg-good/10 text-good border-good/30',
     warn: 'bg-amber/10 text-amber border-amber/30',
     bad: 'bg-danger/10 text-danger border-danger/30',
-    info: 'bg-raised text-paper border-stone',
+    info: 'bg-accent/10 text-accent border-accent/25',
     brand: 'bg-accent text-onaccent border-transparent',
   }
-  const dotColor = { neutral: '', good: 'bg-accent', warn: 'bg-amber', bad: 'bg-danger', info: 'bg-muted', brand: '' }
+  const dotColor = { neutral: '', good: 'bg-good', warn: 'bg-amber', bad: 'bg-danger', info: 'bg-accent', brand: '' }
   return (
-    <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full border ${tones[tone]}`}>
+    <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full border ${tones[tone]}`}>
       {dot && <span className={`w-1.5 h-1.5 rounded-full ${dotColor[tone]} ${tone === 'good' ? 'animate-pulse-soft' : ''}`} />}
       {children}
     </span>
@@ -169,7 +170,7 @@ export function Badge({ children, tone = 'neutral', dot = false }: {
 export function HealthDot({ health }: { health?: string | null }) {
   const up = health === 'up'
   const down = health === 'down'
-  const color = up ? 'bg-accent' : down ? 'bg-danger' : 'bg-muted/50'
+  const color = up ? 'bg-good' : down ? 'bg-danger' : 'bg-muted/60'
   const label = up ? 'healthy' : down ? 'down' : 'unknown'
   return <span title={`health: ${label}`} className={`inline-block w-2 h-2 rounded-full ${color}`} />
 }
@@ -177,7 +178,7 @@ export function HealthDot({ health }: { health?: string | null }) {
 export function Progress({ value, tone = 'accent' }: { value: number; tone?: 'accent' | 'amber' | 'red' }) {
   const bar = tone === 'accent' ? 'bg-accent' : tone === 'amber' ? 'bg-amber' : 'bg-danger'
   return (
-    <div className="h-1.5 rounded-full bg-raised overflow-hidden">
+    <div className="h-1 rounded-full bg-raised overflow-hidden">
       <div className={`h-full rounded-full ${bar} transition-all duration-500`} style={{ width: `${Math.max(2, Math.min(100, value))}%` }} />
     </div>
   )
@@ -189,21 +190,21 @@ export function Stat({ icon, title, value, sub, tone = 'neutral', delta }: {
 }) {
   const tones: Record<string, string> = {
     neutral: 'bg-raised text-muted border-stone',
-    good: 'bg-accent/10 text-accent border-accent/30',
+    good: 'bg-good/10 text-good border-good/30',
     warn: 'bg-amber/10 text-amber border-amber/30',
     bad: 'bg-danger/10 text-danger border-danger/30',
   }
   return (
-    <Card className="group hover:border-muted/50 transition-colors duration-150">
+    <Card className="group hover:border-muted/40 transition-colors duration-150">
       <div className="flex items-start justify-between gap-3">
-        <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 border ${tones[tone]}`}>
-          <Icon name={icon} size={18} />
+        <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${tones[tone]}`}>
+          <Icon name={icon} size={16} />
         </div>
         {delta && <span className="text-[11px] font-mono text-accent bg-accent/10 border border-accent/25 rounded-full px-2 py-0.5">{delta}</span>}
       </div>
       <div className="mt-3">
         <div className="text-xs text-muted font-medium">{title}</div>
-        <div className="font-display text-[28px] leading-none font-semibold tabular-nums mt-1 truncate">{value}</div>
+        <div className="text-2xl leading-none font-semibold tabular-nums -tracking-tight mt-1.5 truncate">{value}</div>
         {sub && <div className="text-xs text-muted mt-1.5">{sub}</div>}
       </div>
     </Card>
@@ -215,14 +216,14 @@ export function Stat({ icon, title, value, sub, tone = 'neutral', delta }: {
 /* ------------------------------------------------------------------ */
 
 const fieldCls =
-  'w-full bg-app border border-stone rounded-lg px-3.5 h-10 text-sm placeholder:text-muted/50 transition-colors focus:outline-none focus:border-accent/70 focus:ring-2 focus:ring-accent/20 disabled:opacity-50 hover:border-muted/60'
+  'w-full bg-app border border-stone rounded-lg px-3 h-9 text-sm placeholder:text-muted transition-colors focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 disabled:opacity-50 hover:border-muted/60'
 
 export function Field({ label, hint, children, className = '' }: { label: string; hint?: string; children: ReactNode; className?: string }) {
   return (
     <label className={`block ${className}`}>
-      <span className="block text-[11px] font-semibold text-muted mb-1.5 uppercase tracking-[0.1em]">{label}</span>
+      <span className="block text-xs font-medium text-muted mb-1.5">{label}</span>
       {children}
-      {hint && <span className="block text-xs text-muted/80 mt-1.5 leading-relaxed">{hint}</span>}
+      {hint && <span className="block text-xs text-muted mt-1.5 leading-relaxed">{hint}</span>}
     </label>
   )
 }
@@ -287,26 +288,27 @@ export function CopyButton({ value, label, size = 'sm' }: { value: string; label
 /* Tables                                                              */
 /* ------------------------------------------------------------------ */
 
-export function TableShell({ children, className = '' }: { children: ReactNode; className?: string }) {
+export function TableShell({ children, className = '', minWidth, footer }: { children: ReactNode; className?: string; minWidth?: number; footer?: ReactNode }) {
   return (
     <Card pad={false} className={`overflow-hidden ${className}`}>
       <div className="overflow-x-auto">
-        <table className="w-full text-sm">{children}</table>
+        <table className="w-full text-sm" style={minWidth ? { minWidth: `${minWidth}px` } : undefined}>{children}</table>
       </div>
+      {footer}
     </Card>
   )
 }
 
 export function Th({ children, className = '' }: { children: ReactNode; className?: string }) {
   return (
-    <th className={`text-left text-[11px] font-semibold uppercase tracking-[0.1em] text-muted px-4 py-3 border-b border-stone bg-raised/50 whitespace-nowrap ${className}`}>
+    <th className={`text-left text-[11px] font-semibold uppercase tracking-wider text-muted px-4 py-2.5 border-b border-stone bg-raised/60 whitespace-nowrap ${className}`}>
       {children}
     </th>
   )
 }
 
 export function Td({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <td className={`px-4 py-3 border-b border-stone/60 align-middle ${className}`}>{children}</td>
+  return <td className={`px-4 py-2.5 border-b border-stone/60 align-middle ${className}`}>{children}</td>
 }
 
 /* ------------------------------------------------------------------ */
@@ -331,15 +333,15 @@ export function TableSkeleton({ rows = 4, cols = 4 }: { rows?: number; cols?: nu
   )
 }
 
-export function EmptyState({ icon = 'box', title, hint, action }: { icon?: IconName; title: string; hint?: string; action?: ReactNode }) {
+export function EmptyState({ icon = 'box', title, hint, action }: { icon?: IconName; title: string; hint?: ReactNode; action?: ReactNode }) {
   return (
-    <div className="py-14 flex flex-col items-center text-center px-6">
-      <div className="w-12 h-12 rounded-xl bg-raised border border-stone text-muted flex items-center justify-center mb-4">
-        <Icon name={icon} size={22} />
+    <div className="py-12 flex flex-col items-center text-center px-6">
+      <div className="w-10 h-10 rounded-lg bg-raised border border-stone text-muted flex items-center justify-center mb-3">
+        <Icon name={icon} size={18} />
       </div>
-      <div className="font-display font-semibold text-xl">{title}</div>
+      <div className="font-semibold text-[15px] -tracking-tight">{title}</div>
       {hint && <div className="text-muted text-sm mt-1.5 max-w-sm leading-relaxed">{hint}</div>}
-      {action && <div className="mt-5">{action}</div>}
+      {action && <div className="mt-4">{action}</div>}
     </div>
   )
 }
@@ -373,8 +375,8 @@ export function Modal({ open, onClose, title, children, width = 'max-w-lg' }: {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 animate-fade" onClick={onClose} />
       <div role="dialog" aria-modal="true" aria-label={title} className={`relative w-full ${width} rounded-xl border border-stone bg-surface shadow-pop animate-modal max-h-[88vh] flex flex-col overflow-hidden`}>
-        <div className="flex items-center justify-between px-5 py-4 border-b border-stone shrink-0">
-          <h2 className="font-display font-semibold text-xl">{title}</h2>
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-stone shrink-0">
+          <h2 className="font-semibold text-[15px] -tracking-tight">{title}</h2>
           <button onClick={onClose} aria-label="Close"
             className="w-8 h-8 -mr-1 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-raised transition-colors">
             <Icon name="x" size={16} />
@@ -435,12 +437,12 @@ export function useToast() {
 export function Toaster() {
   const { toasts, dismiss } = useToastStore()
   const tone: Record<ToastKind, string> = {
-    success: 'border-accent/40',
+    success: 'border-good/40',
     error: 'border-danger/40',
     info: 'border-stone',
   }
   const iconName: Record<ToastKind, IconName> = { success: 'check', error: 'alert', info: 'sparkles' }
-  const iconCls: Record<ToastKind, string> = { success: 'text-accent', error: 'text-danger', info: 'text-muted' }
+  const iconCls: Record<ToastKind, string> = { success: 'text-good', error: 'text-danger', info: 'text-muted' }
   return (
     <div className="fixed bottom-4 right-4 z-[60] space-y-2 w-[340px] max-w-[calc(100vw-2rem)]">
       {toasts.map((t) => (
@@ -466,10 +468,10 @@ export function SegmentedControl<T extends string>({ options, value, onChange }:
   options: { value: T; label: string }[]; value: T; onChange: (v: T) => void
 }) {
   return (
-    <div className="inline-flex rounded-lg border border-stone bg-raised p-1 gap-0.5" role="tablist">
+    <div className="inline-flex rounded-lg border border-stone bg-raised p-0.5 gap-0.5" role="tablist">
       {options.map((o) => (
         <button key={o.value} role="tab" aria-selected={value === o.value} onClick={() => onChange(o.value)}
-          className={`px-3.5 h-8 rounded-md text-xs font-semibold transition-colors duration-150 ${
+          className={`px-3 h-7 rounded-md text-xs font-medium transition-colors duration-150 ${
             value === o.value ? 'bg-ink text-cream shadow-sm' : 'text-muted hover:text-paper'
           }`}>
           {o.label}
@@ -497,8 +499,8 @@ export function Section({ title, description, children }: { title: string; descr
   return (
     <SectionCtx.Provider value={{ title }}>
       <section className="mb-8">
-        <div className="mb-4">
-          <h2 className="font-display text-lg font-semibold text-paper">{title}</h2>
+        <div className="mb-3">
+          <h2 className="font-semibold text-[15px] -tracking-tight text-paper">{title}</h2>
           {description && <p className="text-muted text-sm mt-1 leading-relaxed">{description}</p>}
         </div>
         {children}
@@ -512,7 +514,7 @@ export function Avatar({ name, size = 8 }: { name: string; size?: number }) {
   return (
     <span
       style={{ width: `${size * 4}px`, height: `${size * 4}px` }}
-      className="rounded-lg bg-accent flex items-center justify-center text-onaccent text-xs font-bold select-none shrink-0">
+      className="rounded-md bg-accent flex items-center justify-center text-onaccent text-xs font-semibold select-none shrink-0">
       {letter}
     </span>
   )

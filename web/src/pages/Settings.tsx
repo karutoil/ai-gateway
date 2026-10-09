@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import {
   PageHeader, Card, Button, Input, Textarea, Badge, Icon,
-  TableShell, Th, Td, Skeleton, EmptyState, ErrorNote, Section, SegmentedControl, useToast,
+  TableShell, Th, Td, Skeleton, TableSkeleton, EmptyState, ErrorNote, Section, SegmentedControl, useToast,
 } from '../components/ui'
 
 /** Known setting keys with inline docs — surfaced next to matching rows. */
@@ -89,7 +89,7 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Optimize · Tuning"
+        eyebrow="Connect · Configuration"
         title="Settings"
         description="Catalog pricing fallbacks and routing configuration. Removals apply instantly; edits apply on save."
         actions={
@@ -124,47 +124,52 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
           {status && !loading && !loadError && <ErrorNote message={status} />}
 
           {!isAdmin && !loading && !loadError && (
-            <div className="border border-amber/30 bg-amber/10 rounded-xl p-3 text-sm flex items-center gap-2">
-              <Icon name="alert" size={14} className="text-amber shrink-0"/> Settings are read-only for your role — changes require an admin.
+            <div className="border border-amber/30 bg-amber/10 text-amber rounded-lg p-3 text-sm flex items-center gap-2">
+              <Icon name="alert" size={14} className="shrink-0"/> Settings are read-only for your role — changes require an admin.
             </div>
           )}
 
           {loading ? (
-            <Card className="space-y-3">
-              {[0,1,2,3].map(i => <Skeleton key={i} className="h-10 w-full" />)}
-            </Card>
+            mode==='table' ? (
+              <TableShell>
+                <TableSkeleton rows={4} cols={3} />
+              </TableShell>
+            ) : (
+              <Card className="space-y-3">
+                {[0,1,2,3].map(i => <Skeleton key={i} className="h-10 w-full" />)}
+              </Card>
+            )
           ) : !loadError && mode==='table' ? (
-            <Card pad={false}>
+            <>
               {isAdmin && (
-              <div className="p-5 pb-4">
-                <div className="flex items-center gap-2 mb-3">
-                  <Icon name="plus" size={15} className="text-accent" />
-                  <h3 className="font-semibold text-sm">Add entry</h3>
-                  <Badge tone="neutral"><span className="tabular-nums">{Object.keys(draft).length}</span> / 50</Badge>
-                </div>
-                <div className="flex flex-col sm:flex-row gap-2">
-                  <Input value={newK} onChange={e=>setNewK(e.target.value)} placeholder="key — e.g. price_fallback_input_usd_per_1m" className="font-mono text-xs flex-1" spellCheck={false} autoComplete="off"
-                    onKeyDown={e=>{ if(e.key==='Enter') addEntry() }} />
-                  <Input value={newV} onChange={e=>setNewV(e.target.value)} placeholder="value" className="font-mono text-xs flex-1" spellCheck={false} autoComplete="off"
-                    onKeyDown={e=>{ if(e.key==='Enter') addEntry() }} />
-                  <Button variant="subtle" onClick={addEntry}><Icon name="plus" size={14} /> Add</Button>
-                </div>
-                <p className="text-[11px] text-muted mt-2 leading-relaxed">
-                  Known keys: <code className="font-mono">price_fallback_input_usd_per_1m</code> /{' '}
-                  <code className="font-mono">price_fallback_output_usd_per_1m</code> — default input/output pricing in $ per 1M
-                  tokens, applied to models missing from the price catalog.
-                </p>
-              </div>
+                <Card>
+                  <div className="flex items-center gap-2 mb-3">
+                    <Icon name="plus" size={15} className="text-muted" />
+                    <h3 className="font-semibold text-[15px] -tracking-tight">Add entry</h3>
+                    <Badge tone="neutral"><span className="tabular-nums">{Object.keys(draft).length}</span> / 50</Badge>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <Input value={newK} onChange={e=>setNewK(e.target.value)} placeholder="key — e.g. price_fallback_input_usd_per_1m" className="font-mono text-xs flex-1" spellCheck={false} autoComplete="off"
+                      onKeyDown={e=>{ if(e.key==='Enter') addEntry() }} />
+                    <Input value={newV} onChange={e=>setNewV(e.target.value)} placeholder="value" className="font-mono text-xs flex-1" spellCheck={false} autoComplete="off"
+                      onKeyDown={e=>{ if(e.key==='Enter') addEntry() }} />
+                    <Button variant="subtle" onClick={addEntry}><Icon name="plus" size={14} /> Add</Button>
+                  </div>
+                  <p className="text-[11px] text-muted mt-2 leading-relaxed">
+                    Known keys: <code className="font-mono">price_fallback_input_usd_per_1m</code> /{' '}
+                    <code className="font-mono">price_fallback_output_usd_per_1m</code> — default input/output pricing in $ per 1M
+                    tokens, applied to models missing from the price catalog.
+                  </p>
+                </Card>
               )}
 
-              <TableShell className="!shadow-none !rounded-none border-x-0 border-b-0">
-                <table className="w-full text-sm min-w-[480px]">
+              <TableShell minWidth={480}>
                   <thead>
                     <tr><Th>Key</Th><Th>Value</Th><Th className="w-12"><span className="sr-only">Remove</span></Th></tr>
                   </thead>
                   <tbody>
                     {Object.entries(draft).map(([k,v])=>(
-                      <tr key={k} className="hover:bg-stone/20 transition-colors">
+                      <tr key={k} className="hover:bg-raised/60 transition-colors">
                         <Td className="font-mono text-xs align-top pt-3.5">
                           {k}
                           {KNOWN_KEYS[k] && (
@@ -176,7 +181,7 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
                         </Td>
                         <Td className="text-center">
                           {isAdmin && (
-                            <Button variant="ghost" size="sm" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                            <Button variant="danger" size="sm"
                               onClick={()=>removeKey(k)} disabled={removingKey === k} title={`Remove ${k} immediately`}>
                               <Icon name={removingKey === k ? 'refresh' : 'trash'} size={13} className={removingKey === k ? 'animate-spin' : ''} />
                             </Button>
@@ -188,28 +193,27 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
                       <tr><td colSpan={3}><EmptyState icon="cog" title="No config." hint={isAdmin ? 'Add an entry above to create one.' : 'No catalog settings are configured.'} /></td></tr>
                     )}
                   </tbody>
-                </table>
               </TableShell>
 
-              {/* per-card pinned footer */}
+              {/* save row — actions stay in one toolbar line under the table */}
               {isAdmin && (
-                <div className="px-5 py-3 border-t border-stone bg-app/60 flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs text-muted">Edits and adds apply after saving; removals above apply immediately.</span>
                   <Button variant="primary" onClick={saveTable} disabled={saving}>{saving ? 'Saving…' : <> <Icon name="check" size={15} /> Save </>}</Button>
                 </div>
               )}
-            </Card>
+            </>
           ) : !loadError ? (
             <Card pad={false}>
-              <div className="p-5">
+              <div className="p-4">
                 <div className="flex items-center gap-2 mb-3">
-                  <Icon name="logs" size={15} className="text-accent" />
-                  <h3 className="font-semibold text-sm">Raw JSON</h3>
+                  <Icon name="logs" size={15} className="text-muted" />
+                  <h3 className="font-semibold text-[15px] -tracking-tight">Raw JSON</h3>
                 </div>
                 <Textarea value={jsonText} onChange={e=>setJsonText(e.target.value)} rows={16} className="min-h-[320px]" spellCheck={false} disabled={!isAdmin} />
               </div>
               {isAdmin && (
-                <div className="px-5 py-3 border-t border-stone bg-app/60 flex items-center justify-between gap-2">
+                <div className="px-4 py-3 border-t border-stone bg-app/60 flex items-center justify-between gap-2">
                   <span className="text-xs text-muted">Raw JSON object — same endpoint as Table mode.</span>
                   <Button variant="primary" onClick={saveJson} disabled={saving}>{saving ? 'Saving…' : <> <Icon name="check" size={15} /> Save JSON </>}</Button>
                 </div>

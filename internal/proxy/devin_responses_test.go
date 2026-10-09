@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +23,7 @@ func TestServeChunksAsResponsesKeepsToolCalls(t *testing.T) {
 	}}
 
 	w := httptest.NewRecorder()
-	h.serveChunksAsResponses(w, chunks, "devin/swe-2", "responses", devinCostFor(), "test", "pid", time.Now(), false)
+	h.serveChunksAsResponses(context.Background(), w, chunks, "devin/swe-2", "responses", devinCostFor(), "test", "pid", time.Now(), false)
 	if w.Code != 200 {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -55,7 +56,7 @@ func TestServeChunksAsResponsesKeepsToolCalls(t *testing.T) {
 	}
 
 	ws := httptest.NewRecorder()
-	h.serveChunksAsResponses(ws, chunks, "devin/swe-2", "responses", devinCostFor(), "test", "pid", time.Now(), true)
+	h.serveChunksAsResponses(context.Background(), ws, chunks, "devin/swe-2", "responses", devinCostFor(), "test", "pid", time.Now(), true)
 	sse := ws.Body.String()
 	for _, want := range []string{
 		`"type":"function_call"`,

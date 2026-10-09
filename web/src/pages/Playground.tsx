@@ -212,8 +212,8 @@ export default function Playground(){
     setRunning(false)
   }
 
-  /** Caption row shared by settings controls. */
-  const captionCls = 'block text-xs font-medium text-muted mb-1.5 uppercase tracking-wide'
+  /** Caption row shared by settings controls — same treatment as Field labels. */
+  const captionCls = 'block text-xs font-medium text-muted mb-1.5'
 
   return (
     <div className="space-y-6">
@@ -262,7 +262,7 @@ export default function Playground(){
                 <div className="flex gap-1.5 flex-wrap pt-0.5">
                   {catalogInfo.context_window > 0 && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">ctx {(catalogInfo.context_window/1000).toFixed(0)}k</span>}
                   {catalogInfo.max_output > 0 && <span className="font-mono tabular-nums border border-stone rounded-full px-2 py-0.5">out {(catalogInfo.max_output/1000).toFixed(0)}k</span>}
-                  {catalogInfo.reasoning && <Badge tone="warn">reasoning: {catalogInfo.reasoning_type||'effort'} {reasoningLevels.join('/')}</Badge>}
+                  {catalogInfo.reasoning && <Badge tone="neutral">reasoning: {catalogInfo.reasoning_type||'effort'} {reasoningLevels.join('/')}</Badge>}
                   {catalogInfo.tool_call && <Badge tone="good">tools</Badge>}
                   {(catalogInfo.input_cost>0||catalogInfo.output_cost>0) && <span className="font-mono tabular-nums border border-accent/30 text-accent rounded-full px-2 py-0.5">${catalogInfo.input_cost}/${catalogInfo.output_cost}/1M</span>}
                 </div>
@@ -290,7 +290,7 @@ export default function Playground(){
 
             {/* Telemetry strip — status dot + real response headers only. */}
             <div className="mt-3 rounded-lg border border-stone bg-app/50 px-2.5 py-2 flex items-center gap-2 font-mono text-xs">
-              <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-accent animate-pulse-soft' : 'bg-stone'}`} />
+              <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-accent animate-pulse-soft' : 'bg-muted/60'}`} />
               <span className="text-muted shrink-0">{running ? 'streaming' : 'idle'}</span>
               {cacheStatus && (cacheStatus==='HIT'
                 ? <Badge tone="good">cached</Badge>
@@ -356,9 +356,9 @@ export default function Playground(){
         </div>
 
         {/* Right pane: conversation */}
-        <Card pad={false} className="lg:sticky lg:top-20 flex flex-col lg:h-[720px] overflow-hidden !rounded-xl">
-          <div className="px-5 py-3.5 border-b border-stone/60 bg-raised/30 flex items-center justify-between gap-2">
-            <span className="text-xs font-semibold uppercase tracking-wider text-muted">Conversation</span>
+        <Card pad={false} className="lg:sticky lg:top-20 flex flex-col lg:h-[720px] overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-stone bg-raised/30 flex items-center justify-between gap-2">
+            <span className="text-[15px] font-semibold -tracking-tight text-paper">Conversation</span>
             <div className="flex items-center gap-1.5">
               <Badge tone="neutral">{mode}</Badge>
               <Badge tone={stream ? 'good' : 'neutral'} dot={stream}>{stream ? 'stream on' : 'stream off'}</Badge>
@@ -368,11 +368,11 @@ export default function Playground(){
           <div ref={convoRef} className="flex-1 min-h-[380px] overflow-y-auto p-4 space-y-4">
             {prompt.trim() !== '' && (
               <div className="flex justify-end">
-                <div className="ml-auto max-w-[85%] bg-raised rounded-xl px-3 py-2 text-sm whitespace-pre-wrap break-words">{prompt}</div>
+                <div className="ml-auto max-w-[85%] bg-raised rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words border border-stone">{prompt}</div>
               </div>
             )}
             <div className="max-w-full">
-              <div className="mr-auto border-l-2 border-accent/70 bg-app/50 rounded-r-xl px-3 py-2 font-mono text-sm whitespace-pre-wrap break-words min-h-[42px]">
+              <div className="mr-auto border-l-2 border-accent/70 bg-app/50 rounded-r-lg px-3 py-2 font-mono text-sm whitespace-pre-wrap break-words min-h-[42px]">
                 {out || <span className="text-muted">Output will appear here.</span>}
               </div>
             </div>

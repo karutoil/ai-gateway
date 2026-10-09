@@ -499,13 +499,20 @@ func main() {
 
 	addr := ":" + cfg.Port
 	srv := &http.Server{
-		Addr:        addr,
-		Handler:     r,
-		ReadTimeout: 30 * time.Second,
-		// WriteTimeout is intentionally 0: streaming LLM responses are managed
-		// per-request via ResponseController deadlines in the proxy handlers.
+		Addr:         addr,
+		Handler:      r,
 		WriteTimeout: 0,
 		IdleTimeout:  60 * time.Second,
+		// WriteTimeout is intentionally 0: streaming LLM responses are managed
+		// per-request by the proxy's TTFB/idle watchdogs, not a server deadline.
+		// ReadHeaderTimeout (not ReadTimeout) bounds only the header-read phase:
+		// ReadTimeout covers the ENTIRE request body too, and agent sessions
+		// legitimately upload multi-MB contexts (MAX_PROXY_BODY_MB up to 256)
+		// that can trickle past 30s — the server then killed the connection
+		// without a response byte, which an edge proxy surfaces as a
+		// 524-class failure. Body size stays bounded by readProxyBody's
+		// MaxBytesReader; idle connections by IdleTimeout.
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	// Socket activation (systemd): when launched with LISTEN_FDS, serve on the

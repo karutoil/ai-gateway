@@ -48,6 +48,10 @@ export default function Dashboard() {
   ]
   const onboardDone = stats && Number(stats.providers) > 0
 
+  // Plate-safe secondary button: the shared `secondary` variant assumes a light
+  // surface, so on the ink hero it must be expressed as a cream ghost outline.
+  const plateBtn = '!bg-transparent !text-cream !border-cream/25 hover:!border-cream/60'
+
   return (
     <div className="space-y-6">
       <PageHeader eyebrow="Operate · Overview" title={`${greeting} — here's your gateway`} description="One domain for every model. Health, spend and the fastest path to first traffic." />
@@ -56,17 +60,17 @@ export default function Dashboard() {
       <div className="rounded-xl bg-ink text-cream shadow-card overflow-hidden">
         <div className="p-6 md:p-8 flex flex-col lg:flex-row lg:items-center gap-6">
           <div className="flex-1 min-w-0">
-            <div className="font-mono text-[11px] uppercase tracking-[0.2em] text-accent">
+            <div className="font-mono text-[11px] uppercase tracking-[0.2em] text-indigo-300">
               {healthOk ? `● ${health?.status || 'ok'}` : `● ${health?.status || 'unknown'}`}
-              {catalogStatus?.count != null && <span className="opacity-70"> · {catalogStatus.count} models</span>}
-              {stats && <span className="opacity-70"> · {stats.requests ?? 0} requests</span>}
+              {catalogStatus?.count != null && <span className="text-cream/70"> · {catalogStatus.count} models</span>}
+              {stats && <span className="text-cream/70"> · {stats.requests ?? 0} requests</span>}
             </div>
-            <h2 className="font-display text-4xl md:text-5xl font-semibold mt-3">Route. Observe. Govern.</h2>
-            <p className="opacity-70 text-sm mt-2 max-w-xl leading-relaxed">Bare model names fan out across your provider groups with failover — keys enforce budgets, every call lands in logs with tokens, latency and cost.</p>
+            <h2 className="font-display text-3xl md:text-4xl font-semibold leading-tight -tracking-tight mt-3">Route. Observe. Govern.</h2>
+            <p className="text-cream/70 text-sm mt-2 max-w-xl leading-relaxed">Bare model names fan out across your provider groups with failover — keys enforce budgets, every call lands in logs with tokens, latency and cost.</p>
             <div className="mt-5 flex flex-wrap gap-2 items-center">
               <Button variant="primary" onClick={()=>navigate('/playground')}><Icon name="play" size={15}/> Test a call</Button>
-              <Button variant="secondary" onClick={()=>navigate('/providers')} className="!bg-transparent !text-cream !border-cream/25 hover:!border-cream/60"><Icon name="server" size={15}/> Add provider</Button>
-              <button onClick={()=>navigate('/logs')} className="inline-flex items-center gap-1.5 text-sm font-semibold opacity-80 hover:opacity-100 transition-opacity px-2">View requests <Icon name="arrowRight" size={14}/></button>
+              <Button variant="secondary" onClick={()=>navigate('/providers')} className={plateBtn}><Icon name="server" size={15}/> Add provider</Button>
+              <button onClick={()=>navigate('/logs')} className="inline-flex items-center gap-1.5 text-sm font-semibold text-cream/70 hover:text-cream transition-colors px-2">View requests <Icon name="arrowRight" size={14}/></button>
             </div>
           </div>
           <div className="lg:w-[300px] shrink-0 grid grid-cols-2 lg:grid-cols-1 gap-px bg-cream/15 rounded-xl overflow-hidden border border-cream/15">
@@ -75,12 +79,12 @@ export default function Dashboard() {
               { k: 'Est. spend', v: stats?.total_cost ? `$${Number(stats.total_cost).toFixed(2)}` : '$0.00' },
             ].map(r => (
               <div key={r.k} className="bg-ink px-4 py-3">
-                <div className="text-[11px] uppercase tracking-[0.14em] opacity-60">{r.k}</div>
+                <div className="text-[11px] uppercase tracking-[0.14em] text-cream/70">{r.k}</div>
                 <div className="font-display text-2xl font-semibold tabular-nums mt-0.5 truncate">{r.v}</div>
               </div>
             ))}
             <button onClick={()=>navigate('/analytics')} className="bg-ink px-4 py-3 text-left hover:bg-cream/5 transition-colors col-span-2 lg:col-span-1">
-              <div className="text-[11px] uppercase tracking-[0.14em] text-accent">This week</div>
+              <div className="text-[11px] uppercase tracking-[0.14em] text-indigo-300">This week</div>
               <div className="text-sm font-semibold mt-0.5 flex items-center gap-1.5">Open analytics <Icon name="arrowRight" size={13}/></div>
             </button>
           </div>
@@ -93,7 +97,7 @@ export default function Dashboard() {
           <div className="flex items-start justify-between gap-3">
             <div>
               <Eyebrow>Getting started</Eyebrow>
-              <h2 className="font-display font-semibold text-2xl mt-1.5">First traffic in four steps</h2>
+              <h2 className="font-display font-semibold text-[15px] -tracking-tight mt-1.5">First traffic in four steps</h2>
             </div>
             <button onClick={dismiss} aria-label="Dismiss getting started" className="w-8 h-8 rounded-lg flex items-center justify-center text-muted hover:text-paper hover:bg-raised">
               <Icon name="x" size={15} />
@@ -102,7 +106,7 @@ export default function Dashboard() {
           <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             {steps.map(s => (
               <button key={s.n} onClick={()=>navigate(s.to)}
-                className="group text-left rounded-xl border border-stone bg-app p-4 hover:border-accent/50 transition-colors">
+                className="group text-left rounded-lg border border-stone bg-app p-4 hover:border-accent/50 transition-colors">
                 <div className="flex items-center justify-between">
                   <span className="font-display text-2xl text-accent font-semibold">{String(s.n).padStart(2, '0')}</span>
                   <Icon name={s.icon} size={16} className="text-muted group-hover:text-accent transition-colors" />
@@ -136,10 +140,10 @@ export default function Dashboard() {
             { to:'/keys', icon:'key' as IconName, title:'Keys & budgets', desc:'Virtual credentials with rate limits, allowlists and monthly spend caps.', cta:'Open keys' },
           ].map(l => (
             <Card key={l.to} className="flex flex-col group hover:border-muted/60 transition-colors">
-              <div className="w-10 h-10 rounded-xl bg-accent/10 border border-accent/25 text-accent flex items-center justify-center mb-3">
+              <div className="w-10 h-10 rounded-lg bg-accent/10 border border-accent/25 text-accent flex items-center justify-center mb-3">
                 <Icon name={l.icon} size={18} />
               </div>
-              <h3 className="font-display font-semibold tracking-tight">{l.title}</h3>
+              <h3 className="font-display font-semibold text-[15px] -tracking-tight">{l.title}</h3>
               <p className="text-muted text-[13px] mt-1 leading-relaxed flex-1">{l.desc}</p>
               <div className="mt-4"><Button variant="secondary" size="sm" onClick={()=>navigate(l.to)}>{l.cta} <Icon name="arrowRight" size={13}/></Button></div>
             </Card>
@@ -149,12 +153,12 @@ export default function Dashboard() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className="w-8 h-8 rounded-lg bg-raised border border-stone/60 text-accent flex items-center justify-center"><Icon name="terminal" size={15}/></span>
-              <h3 className="font-display font-semibold tracking-tight">Quick start</h3>
+              <h3 className="font-display font-semibold text-[15px] -tracking-tight">Quick start</h3>
             </div>
             <CopyButton value={quickStart} label="Copy curl" />
           </div>
           <p className="text-xs text-muted mt-1.5">Drop-in OpenAI-compatible call through your gateway domain.</p>
-          <pre className="mt-3 flex-1 rounded-xl border border-stone bg-ink p-4 font-mono text-[11.5px] leading-relaxed overflow-x-auto whitespace-pre text-cream/90">{quickStart}</pre>
+          <pre className="mt-3 flex-1 rounded-xl border border-cream/10 bg-ink p-4 font-mono text-[11.5px] leading-relaxed overflow-x-auto whitespace-pre text-cream/90">{quickStart}</pre>
           <div className="mt-3 flex items-center gap-2 text-[11px] text-muted">
             <Icon name="lock" size={12}/> Key goes in <code className="font-mono text-accent">Authorization: Bearer</code> — never in the URL.
           </div>

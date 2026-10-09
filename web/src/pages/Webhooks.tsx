@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import {
-  PageHeader, Card, Button, Input, Field, Badge, Icon, Modal, Confirm, EmptyState, useToast,
+  PageHeader, Card, Button, Input, Field, Badge, Icon, Modal, Confirm, EmptyState,
+  SegmentedControl, Skeleton, useToast,
 } from '../components/ui'
 
 type Hook = {
@@ -106,7 +107,7 @@ export default function Webhooks() {
   }
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <PageHeader
         eyebrow="Govern · Events"
         title="Webhooks"
@@ -120,7 +121,11 @@ export default function Webhooks() {
 
       {err && <Card><EmptyState icon="alert" title="Could not load webhooks" hint={err} /></Card>}
 
-      {!err && loading && <Card><div className="text-sm text-muted py-4">Loading…</div></Card>}
+      {!err && loading && (
+        <Card className="space-y-3">
+          {[0,1,2].map(i => <Skeleton key={i} className="h-20 w-full" />)}
+        </Card>
+      )}
 
       {!err && !loading && hooks.length === 0 && (
         <Card>
@@ -136,29 +141,29 @@ export default function Webhooks() {
       {hooks.length > 0 && (
         <div className="space-y-3">
           {hooks.map(h => (
-            <Card key={h.id} className="!p-5 hover:border-muted/60 transition-colors">
+            <Card key={h.id} className="hover:border-muted/40 transition-colors">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-medium">{h.name}</span>
-                    {h.enabled ? <Badge tone="good">enabled</Badge> : <Badge tone="neutral">disabled</Badge>}
+                    <span className="font-medium text-[15px] -tracking-tight">{h.name}</span>
+                    {h.enabled ? <Badge tone="good" dot>enabled</Badge> : <Badge tone="neutral">disabled</Badge>}
                     {h.events
                       ? <Badge tone="info">{h.events.split(',').length} events</Badge>
                       : <span className="text-xs text-muted">all events</span>}
                   </div>
                   <div className="font-mono text-xs text-muted mt-1 truncate" title={h.url}>{h.url}</div>
-                  <div className="text-xs text-muted mt-1">
+                  <div className="text-xs text-muted font-mono mt-1">
                     {h.last_status
-                      ? <>last delivery: <span className={h.last_status.startsWith('2') ? 'text-accent' : 'text-amber'}>{h.last_status}</span></>
+                      ? <>last delivery: <span className={h.last_status.startsWith('2') ? 'text-good' : 'text-danger'}>{h.last_status}</span></>
                       : 'no deliveries yet'}
                   </div>
                 </div>
-                <div className="flex items-center gap-1 shrink-0">
+                <div className="flex items-center gap-1.5 shrink-0">
                   <Button variant="secondary" size="sm" disabled={testing === h.id} onClick={() => test(h)}>
                     {testing === h.id ? '…' : 'Test'}
                   </Button>
                   <Button variant="ghost" size="sm" onClick={() => openEdit(h)} title="Edit"><Icon name="pencil" size={14} /></Button>
-                  <Button variant="ghost" size="sm" className="text-red-400 hover:bg-red-500/10" onClick={() => setDeleteTarget(h)} title="Delete">
+                  <Button variant="danger" size="sm" onClick={() => setDeleteTarget(h)} title="Delete">
                     <Icon name="trash" size={14} />
                   </Button>
                 </div>
@@ -187,34 +192,26 @@ export default function Webhooks() {
               />
             </Field>
 
-				<Field label="Payload format">
-					<div className="flex gap-1.5">
-						{(['json', 'discord', 'slack'] as const).map((f) => (
-							<button
-								key={f}
-								type="button"
-								onClick={() => setEditing({ ...editing, format: f } as typeof editing)}
-								className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors focus:outline-none ${
-									(editing?.format || 'json') === f
-										? 'border-accent/60 bg-accent/10 text-accent'
-										: 'border-stone text-muted hover:text-paper'
-								}`}
-							>
-								{f === 'json' ? 'Generic JSON' : f === 'discord' ? 'Discord' : 'Slack'}
-							</button>
-						))}
-					</div>
-					<p className="text-xs text-muted mt-1">
-						{editing?.format === 'discord'
+				<Field label="Payload format"
+					hint={
+						editing?.format === 'discord'
 							? 'Formats the payload for Discord incoming webhooks (message + embed).'
 							: editing?.format === 'slack'
 								? 'Formats the payload for Slack incoming webhooks ({text: ...}).'
-								: 'Raw gateway event envelope ({event, payload, ts}).'}
-					</p>
+								: 'Raw gateway event envelope ({event, payload, ts}).'
+					}>
+					<SegmentedControl<'json' | 'discord' | 'slack'>
+						options={[
+							{ value: 'json', label: 'Generic JSON' },
+							{ value: 'discord', label: 'Discord' },
+							{ value: 'slack', label: 'Slack' },
+						]}
+						value={editing?.format || 'json'}
+						onChange={f => setEditing({ ...editing, format: f } as typeof editing)}
+					/>
 				</Field>
             <Field label="Events" hint="Leave all unchecked to receive every event.">
               <div>
-                <div className="text-xs font-medium text-muted uppercase tracking-wide mb-1.5">Events</div>
                 <div className="flex flex-wrap gap-1.5">
                   {EVENT_TYPES.map(e => (
                     <button
@@ -222,8 +219,8 @@ export default function Webhooks() {
                       onClick={() => toggleEvent(e)}
                       className={`px-2 py-1 rounded-md text-xs font-mono border transition-colors focus:outline-none ${
                         events.includes(e)
-                          ? 'border-accent/60 bg-accent/10 text-accent'
-                          : 'border-stone text-muted hover:text-paper'
+                          ? 'border-accent/50 bg-accent/10 text-accent'
+                          : 'border-stone text-muted hover:text-paper hover:border-muted/40'
                       }`}
                     >
                       {e}

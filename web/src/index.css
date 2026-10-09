@@ -3,23 +3,25 @@
 @tailwind utilities;
 
 /* ------------------------------------------------------------------ */
-/* Ledger tokens — warm editorial surfaces, one persimmon accent.      */
-/* :root is the dim room; html.light is the default reading room.      */
+/* Precision tokens — cool slate neutrals, one indigo accent.          */
+/* :root is dark; html.light is the default reading room.              */
+/* Plates (ink/cream) stay dark-on-light-text in BOTH themes.          */
 /* ------------------------------------------------------------------ */
 :root {
   color-scheme: dark;
-  --c-graphite: 22 19 15;       /* app background */
-  --c-surface: 30 27 22;        /* card surface   */
-  --c-raised: 43 38 30;         /* raised/hover   */
-  --c-paper: 236 231 219;       /* primary text   */
-  --c-stone: 63 56 45;          /* borders        */
-  --c-muted: 161 150 132;       /* secondary text */
-  --c-danger: 224 109 86;
-  --c-accent: 228 110 54;       /* ember          */
-  --c-onaccent: 255 255 255;
-  --c-ink: 235 230 219;         /* solid fills    */
-  --c-cream: 24 21 17;          /* text on fills  */
-  --c-amber: 214 164 74;
+  --c-graphite: 5 8 15;          /* app background (near-black slate) */
+  --c-surface: 17 24 39;         /* card surface                      */
+  --c-raised: 30 41 59;          /* raised / hover                    */
+  --c-paper: 231 236 245;        /* primary text                      */
+  --c-stone: 40 51 71;           /* borders / hairlines               */
+  --c-muted: 148 163 184;        /* secondary text                    */
+  --c-danger: 248 113 113;
+  --c-good: 52 211 153;          /* healthy / positive                */
+  --c-accent: 129 140 248;       /* indigo (interactive)              */
+  --c-onaccent: 8 12 24;         /* text on solid accent              */
+  --c-ink: 5 8 15;               /* plate background (always dark)    */
+  --c-cream: 241 245 249;        /* text on plates (always light)     */
+  --c-amber: 251 191 36;
 
   --shadow-card: 0 1px 2px rgb(0 0 0 / 0.35);
   --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.6);
@@ -27,43 +29,40 @@
 
 html.light {
   color-scheme: light;
-  --c-graphite: 243 241 234;    /* bone page      */
-  --c-surface: 255 255 255;     /* cards          */
-  --c-raised: 234 231 220;
-  --c-paper: 29 26 21;          /* warm ink       */
-  --c-stone: 221 216 202;
-  --c-muted: 109 102 87;
-  --c-danger: 178 58 32;
-  --c-accent: 194 72 21;        /* persimmon      */
+  --c-graphite: 246 247 249;     /* cool page gray     */
+  --c-surface: 255 255 255;      /* cards              */
+  --c-raised: 238 241 245;
+  --c-paper: 11 18 32;           /* slate ink text     */
+  --c-stone: 226 231 239;
+  --c-muted: 91 102 122;
+  --c-danger: 220 38 38;
+  --c-good: 4 120 87;
+  --c-accent: 79 70 229;         /* indigo-600         */
   --c-onaccent: 255 255 255;
-  --c-ink: 29 26 21;
-  --c-cream: 246 243 234;
-  --c-amber: 146 96 16;
-}
+  --c-ink: 17 24 39;             /* plates stay dark   */
+  --c-cream: 241 245 249;
+  --c-amber: 180 83 9;
 
-html.light {
-  --shadow-card: 0 1px 2px rgb(29 26 21 / 0.07);
-  --shadow-pop: 0 16px 40px -12px rgb(29 26 21 / 0.22);
+  --shadow-card: 0 1px 2px rgb(11 18 32 / 0.06);
+  --shadow-pop: 0 16px 40px -12px rgb(11 18 32 / 0.22);
 }
-
-html { font-size: 15px; }
 
 body {
   @apply bg-app text-paper font-sans antialiased;
-  transition: background-color 0.25s ease, color 0.25s ease;
+  transition: background-color 0.2s ease, color 0.2s ease;
   text-rendering: optimizeLegibility;
 }
 
-::selection { background: rgb(var(--c-accent) / 0.22); }
+::selection { background: rgb(var(--c-accent) / 0.25); }
 
 *:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(var(--c-accent) / 0.45);
-  border-radius: 8px;
+  box-shadow: 0 0 0 2px rgb(var(--c-graphite)), 0 0 0 4px rgb(var(--c-accent) / 0.55);
+  border-radius: 6px;
 }
 
-/* Serif display face — headlines only. */
-.font-display { font-family: "Fraunces", Georgia, serif; letter-spacing: -0.01em; }
+/* Display face — Inter, tight tracking (sans-only system). */
+.font-display { font-family: "Inter", system-ui, sans-serif; font-weight: 600; letter-spacing: -0.02em; }
 
 /* Scrollbars — slim, themed, unobtrusive */
 * { scrollbar-width: thin; scrollbar-color: rgb(var(--c-stone)) transparent; }

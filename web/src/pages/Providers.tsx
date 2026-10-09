@@ -8,7 +8,7 @@ import {
 const PROVIDER_WRITER_ROLES = ['admin', 'support', 'member']
 
 function healthTextCls(status?: string | null): string {
-  if (status === 'up') return 'text-accent'
+  if (status === 'up') return 'text-good'
   if (status === 'down') return 'text-danger'
   return 'text-muted'
 }
@@ -92,7 +92,7 @@ function OAuthUsage({ providerId, defId, type, name }: { providerId: string; def
     return () => { live = false }
   }, [providerId])
   if (loading) return <div className="pt-1"><Skeleton className="h-[52px]" /></div>
-  if (error) return <div className="text-[11px] text-muted/80 font-mono leading-relaxed">Usage unavailable — {error}</div>
+  if (error) return <div className="text-[11px] text-muted font-mono leading-relaxed">Usage unavailable — {error}</div>
   if (!data) return null
   if (kind === 'devin') {
     const rows: { label: string; used?: number; remaining?: number; reset?: string }[] = []
@@ -140,13 +140,14 @@ function OAuthUsage({ providerId, defId, type, name }: { providerId: string; def
         <ModelQuotaRow key={m.model_id} m={m} />
       ))}
       {models.length > 0 && (
-        <button
+        <Button
           type="button"
+          variant="subtle"
+          size="sm"
           onClick={() => setModalOpen(true)}
-          className="text-[11px] font-semibold text-accent hover:underline"
         >
           View all {models.length} models
-        </button>
+        </Button>
       )}
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={`${name || 'OAuth'} usage`} width="max-w-lg">
         <div className="space-y-3">
@@ -317,7 +318,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
   return (
     <div className="space-y-6">
       <PageHeader eyebrow="Connect · Supply" title="Providers" description="Upstream endpoints behind every bare model name. Health is probed after discovery — down providers are skipped by failover."
-        actions={<><Badge tone="good" dot>{list.length} connected</Badge>{up>0 && <Badge tone="neutral">{up} healthy</Badge>}{down>0 && <Badge tone="bad">{down} down</Badge>}</>} />
+        actions={<><Badge tone="good" dot>{list.length} connected</Badge>{up>0 && <Badge tone="good">{up} healthy</Badge>}{down>0 && <Badge tone="bad">{down} down</Badge>}</>} />
 
       {loadError && (
         <Card><EmptyState icon="alert" title="Could not load providers" hint={loadError}
@@ -329,7 +330,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
           <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
             <div>
               <Eyebrow>New upstream</Eyebrow>
-              <h2 className="font-display font-bold text-lg tracking-tight mt-1.5">Add provider</h2>
+              <h2 className="font-display text-[15px] font-semibold -tracking-tight mt-1.5">Add provider</h2>
               <p className="text-xs text-muted mt-1">Models auto-discover in the background after creation.</p>
             </div>
             <Badge tone="neutral">{TYPE_META[type]?.blurb || type}</Badge>
@@ -360,7 +361,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
           {err && <div className="mt-3"><ErrorNote message={err} /></div>}
           <div className="mt-5 flex items-center gap-3">
             <Button variant="primary" onClick={create}><Icon name="plus" size={15} /> Add provider</Button>
-            <span className="text-[11px] text-muted">Health settles within ~30s of discovery.</span>
+            <span className="text-xs text-muted">Health settles within ~30s of discovery.</span>
           </div>
         </Card>
       )}
@@ -368,9 +369,9 @@ export default function Providers({ role = 'admin' }: { role?: string }){
       {oauthDefs.length > 0 && (
         <Card>
           <div className="flex items-center gap-2.5 mb-1.5">
-            <span className="w-9 h-9 rounded-xl bg-accent/10 border border-accent/25 text-accent flex items-center justify-center"><Icon name="key" size={16} /></span>
+            <span className="w-9 h-9 rounded-lg bg-accent/10 border border-accent/25 text-accent flex items-center justify-center"><Icon name="key" size={16} /></span>
             <div>
-              <h2 className="font-display font-semibold tracking-tight">OAuth connections</h2>
+              <h2 className="font-display text-[15px] font-semibold -tracking-tight">OAuth connections</h2>
               <p className="text-xs text-muted">Sign in instead of pasting keys. One server registration adds future providers.</p>
             </div>
           </div>
@@ -388,7 +389,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
         {!loading && list.map(p=> (
           <Card key={p.id} className="flex flex-col group hover:border-muted/60 transition-colors">
             <div className="flex items-start gap-3">
-              <div className="w-11 h-11 rounded-xl bg-accent font-display font-bold text-[15px] flex items-center justify-center shrink-0 text-onaccent">
+              <div className="w-11 h-11 rounded-lg bg-accent font-display font-bold text-[15px] flex items-center justify-center shrink-0 text-onaccent">
                 {(p.name || '?').charAt(0).toUpperCase()}
               </div>
               <div className="min-w-0 flex-1">
@@ -399,7 +400,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 </div>
               </div>
             </div>
-            <div className="mt-3.5 rounded-xl border border-stone/60 bg-app/50 px-3 py-2.5 space-y-1.5 text-xs min-h-[76px]">
+            <div className="mt-3.5 rounded-lg border border-stone/60 bg-app/50 px-3 py-2.5 space-y-1.5 text-xs min-h-[76px]">
               {(p.type === 'antigravity' || p.type === 'devin') && (
                 <div>{p.oauth_connected ? <Badge tone="good">OAuth {p.oauth_email || 'connected'}</Badge> : <Badge tone="neutral">OAuth not connected</Badge>}</div>
               )}
@@ -411,10 +412,10 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                   <span className="font-mono text-muted truncate flex-1" title={p.base_url}>{p.base_url}</span>
                   <CopyButton value={p.base_url} />
                 </div>
-              ) : <div className="text-muted/70 font-mono">official endpoint</div>}
-              {p.last_health && <div className="font-mono text-muted/80 truncate" title={p.last_health}>{p.last_health}</div>}
+              ) : <div className="text-muted font-mono">official endpoint</div>}
+              {p.last_health && <div className="font-mono text-muted truncate" title={p.last_health}>{p.last_health}</div>}
               {p.created_at && !isNaN(new Date(p.created_at).getTime()) && (
-                <div className="text-muted/60">since {new Date(p.created_at).toLocaleDateString()}</div>
+                <div className="text-muted">since {new Date(p.created_at).toLocaleDateString()}</div>
               )}
             </div>
             {canWrite && (
@@ -427,7 +428,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                   <Button variant="ghost" size="sm" onClick={()=>disconnectOAuth(p.id)}>Disconnect</Button></>
                 )}
                 <Button variant="ghost" size="sm" title={`Edit ${p.name}`} onClick={()=>openEdit(p)}><Icon name="pencil" size={14} /> Edit</Button>
-                <Button variant="ghost" size="sm" title={`Delete ${p.name}`} onClick={()=>setConfirmTarget(p)} className="hover:!text-danger"><Icon name="trash" size={14} /></Button>
+                <Button variant="danger" size="sm" title={`Delete ${p.name}`} onClick={()=>setConfirmTarget(p)}><Icon name="trash" size={14} /></Button>
               </div>
             )}
           </Card>
@@ -467,7 +468,7 @@ export default function Providers({ role = 'admin' }: { role?: string }){
             {oauthError && <ErrorNote message={oauthError} />}
             <p className="text-sm text-muted leading-relaxed">Sign-in opened in a new tab. After approving, copy the localhost URL from the address bar and paste it below.</p>
             <Field label="Sign-in URL" hint="Opened automatically — reopen if your popup blocker stopped it.">
-              <div className="flex items-center gap-2 rounded-xl border border-stone/60 bg-app/60 px-3 py-2">
+              <div className="flex items-center gap-2 rounded-lg border border-stone/60 bg-app/60 px-3 py-2">
                 <span className="font-mono text-xs truncate flex-1">{oauthSession.auth_url}</span>
                 <CopyButton value={oauthSession.auth_url} />
               </div>

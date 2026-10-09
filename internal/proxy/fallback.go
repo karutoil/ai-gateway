@@ -415,7 +415,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	// request_logs row was written — failures were invisible in the dashboard.
 	// Log the upstream's own answer and persist the failed request.
 	log.Error().Str("provider", lastProviderName).Str("model", model).Str("endpoint", endpoint).Int("upstream_status", lastFailStatus).Str("detail", truncateDetail(lastDetail)).Msg("all provider attempts failed")
-	h.logRequestExtendedBodies(keyPrefix, lastProviderID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{FallbackChain: marshalAttemptChain(chain)})
+	h.logRequestExtendedBodies(r.Context(), keyPrefix, lastProviderID, model, endpoint, status, time.Since(start).Milliseconds(), 0, 0, 0, isStream, nil, nil, &logMeta{FallbackChain: marshalAttemptChain(chain)})
 	terminalError(status, "all provider attempts failed")
 }
 

@@ -24,6 +24,13 @@ import (
 	"ai-gateway/internal/httperr"
 )
 
+// logGroupNoneLabel is the sentinel every grouping dimension substitutes for
+// NULL/empty values, so an empty bucket still carries a selectable label
+// rather than a blank row. logFilterWhere special-cases it (see
+// log_filters.go) so clicking the "(none)" group filters to exactly the rows
+// that produced it.
+const logGroupNoneLabel = "(none)"
+
 // logGroupDim describes one supported grouping dimension: the selected SQL
 // expression (aliased "dim") and whether enrichment lookups apply.
 type logGroupDim struct {
@@ -38,6 +45,15 @@ var logGroupDims = map[string]logGroupDim{
 	"finish_reason": {expr: `COALESCE(NULLIF(rl.finish_reason,''),'(none)')`},
 	"status":        {expr: `CAST(rl.status AS TEXT)`},
 	"error":         {expr: `CASE WHEN rl.error IS NOT NULL THEN 'error' ELSE 'ok' END`},
+	// app is the only attribution dimension offered for grouping. An operator
+	// bounds how many applications attribute to them, so the bucket count
+	// stays small. end_user is deliberately absent: it is unbounded by
+	// construction (one row per person or agent), and grouping by a
+	// high-cardinality identity is exactly what Langfuse forbids in its own
+	// metrics API because the rollup cost explodes. end_user remains
+	// available as a FILTER on /api/logs so it can still be ranked and
+	// drilled into per request.
+	"app": {expr: `COALESCE(NULLIF(rl.app,''),'(none)')`},
 }
 
 // LogGroup returns aggregated rows for one grouping dimension.

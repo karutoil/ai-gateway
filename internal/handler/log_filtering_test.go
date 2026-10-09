@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -305,5 +306,153 @@ func TestLogsExportCSV(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], "csv-c") {
 		t.Fatalf("filtered export row = %q", lines[1])
+	}
+}
+
+// TestLogsFinishReasonFilter covers the finish_reason filter added alongside
+// the "Finish reason" grouping dimension. The invariant that matters is
+// click-through consistency: for every group the Reports panel renders, the
+// filtered list must return exactly the rows that group counted — including
+// the "(none)" bucket, which is the case that silently breaks when a sentinel
+// is treated as a literal value.
+func TestLogsFinishReasonFilter(t *testing.T) {
+	h, _ := newTestAdminHandler(t)
+	ps := h.ProviderStore
+	prov, _ := ps.Create("prov-fr", "openai", "http://127.0.0.1:1", "sk-t")
+	pID := prov.ID
+	now := time.Now().UTC()
+
+	seedLogRows(t, h, []logSeed{
+		{model: "m1", endpoint: "chat", status: 200, latency: 10, tokens: 5, cost: 0.01, providerID: pID, finish: "stop", at: now.Add(-time.Minute)},
+		{model: "m1", endpoint: "chat", status: 200, latency: 10, tokens: 5, cost: 0.01, providerID: pID, finish: "stop", at: now.Add(-2 * time.Minute)},
+		{model: "m1", endpoint: "chat", status: 200, latency: 10, tokens: 5, cost: 0.01, providerID: pID, finish: "length", at: now.Add(-3 * time.Minute)},
+		// Empty finish_reason seeds as SQL NULL — the "(none)" bucket.
+		{model: "m2", endpoint: "chat", status: 502, latency: 10, tokens: 0, cost: 0, providerID: pID, errMsg: "boom", at: now.Add(-4 * time.Minute)},
+	})
+
+	r := newLogsRouter(h)
+
+	// Exact match returns only that reason.
+	code, _, rows := getJSON(t, r, "/api/logs?finish_reason=stop")
+	if code != 200 || len(rows) != 2 {
+		t.Fatalf("finish_reason=stop: code=%d rows=%d, want 200/2", code, len(rows))
+	}
+	code, _, rows = getJSON(t, r, "/api/logs?finish_reason=length")
+	if code != 200 || len(rows) != 1 {
+		t.Fatalf("finish_reason=length: code=%d rows=%d, want 200/1", code, len(rows))
+	}
+
+	// The sentinel must match NULL rows rather than searching for the literal
+	// string "(none)".
+	code, _, rows = getJSON(t, r, "/api/logs?finish_reason="+url.QueryEscape(logGroupNoneLabel))
+	if code != 200 || len(rows) != 1 {
+		t.Fatalf("finish_reason=(none): code=%d rows=%d, want 200/1", code, len(rows))
+	}
+
+	// Group-by and filter must agree on every bucket: this is what makes the
+	// Reports panel's click-through land on the set it displayed.
+	code, env, _ := getJSON(t, r, "/api/logs/group?group_by=finish_reason&range=30d")
+	if code != 200 {
+		t.Fatalf("group code=%d", code)
+	}
+	groupRows, _ := env["rows"].([]any)
+	if len(groupRows) == 0 {
+		t.Fatal("group returned no rows")
+	}
+	for _, gr := range groupRows {
+		g, _ := gr.(map[string]any)
+		dim, _ := g["group"].(string)
+		grouped := int(g["requests"].(float64))
+		code, _, filtered := getJSON(t, r, "/api/logs?finish_reason="+url.QueryEscape(dim)+"&since=30d")
+		if code != 200 {
+			t.Fatalf("filtered fetch for %q: code=%d", dim, code)
+		}
+		if len(filtered) != grouped {
+			t.Errorf("click-through mismatch for group %q: group counted %d, filter returned %d", dim, grouped, len(filtered))
+		}
+	}
+}
+
+// TestAttributionFiltersAndGrouping covers the attribution read surface. The
+// design rule under test: `app` is groupable because an operator bounds how
+// many applications attribute to them, while `end_user` is filter-only because
+// it is unbounded by construction — grouping by it would make the rollup
+// explode.
+func TestAttributionFiltersAndGrouping(t *testing.T) {
+	h, _ := newTestAdminHandler(t)
+	ps := h.ProviderStore
+	prov, _ := ps.Create("prov-attr", "openai", "http://127.0.0.1:1", "sk-t")
+	now := time.Now().UTC()
+
+	seed := func(id, endUser, app string) {
+		t.Helper()
+		var eu, ap any
+		if endUser != "" {
+			eu = endUser
+		}
+		if app != "" {
+			ap = app
+		}
+		if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(id,provider_id,model,endpoint,status,latency_ms,created_at,total_tokens,cost_usd,end_user,app) VALUES(?,?,?,?,200,10,?,10,0.01,?,?)`),
+			id, prov.ID, "m", "chat", now.Add(-time.Minute), eu, ap); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("attr-1", "alice", "https://app-a.example")
+	seed("attr-2", "alice", "https://app-a.example")
+	seed("attr-3", "bob", "https://app-b.example")
+	seed("attr-4", "", "")
+
+	r := newLogsRouter(h)
+
+	// Exact end_user filter.
+	code, _, rows := getJSON(t, r, "/api/logs?end_user=alice")
+	if code != 200 || len(rows) != 2 {
+		t.Fatalf("end_user=alice: code=%d rows=%d, want 200/2", code, len(rows))
+	}
+	// Exact app filter, URL-escaped since app values are URLs.
+	code, _, rows = getJSON(t, r, "/api/logs?app="+url.QueryEscape("https://app-b.example"))
+	if code != 200 || len(rows) != 1 {
+		t.Fatalf("app filter: code=%d rows=%d, want 200/1", code, len(rows))
+	}
+
+	// app IS a group-by dimension.
+	code, env, _ := getJSON(t, r, "/api/logs/group?group_by=app&range=30d")
+	if code != 200 {
+		t.Fatalf("group_by=app code=%d", code)
+	}
+	groupRows, _ := env["rows"].([]any)
+	if len(groupRows) == 0 {
+		t.Fatal("group_by=app returned no rows")
+	}
+	// Click-through consistency, including the "(none)" bucket for
+	// unattributed traffic.
+	for _, gr := range groupRows {
+		g, _ := gr.(map[string]any)
+		dim, _ := g["group"].(string)
+		grouped := int(g["requests"].(float64))
+		q := "/api/logs?since=30d"
+		if dim != logGroupNoneLabel {
+			q += "&app=" + url.QueryEscape(dim)
+		}
+		_, _, filtered := getJSON(t, r, q)
+		if dim == logGroupNoneLabel {
+			// Unattributed rows have NULL app; filtering by the sentinel is
+			// not offered for app (the UI clears instead), so assert the
+			// bucket simply reflects the NULL rows.
+			if grouped != 1 {
+				t.Errorf("(none) app bucket = %d, want 1", grouped)
+			}
+			continue
+		}
+		if len(filtered) != grouped {
+			t.Errorf("click-through mismatch for app %q: counted %d, filtered %d", dim, grouped, len(filtered))
+		}
+	}
+
+	// end_user must NOT be a group-by dimension.
+	code, _, _ = getJSON(t, r, "/api/logs/group?group_by=end_user&range=30d")
+	if code == 200 {
+		t.Fatal("group_by=end_user was accepted; it must stay filter-only")
 	}
 }

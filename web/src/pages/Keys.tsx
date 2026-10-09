@@ -4,7 +4,7 @@ import ModelCombobox from '../components/ModelCombobox'
 import KeyAnalyticsModal from './KeyAnalyticsModal'
 import { can, canSeeKeys, ownKeysOnly } from '../lib/permissions'
 import {
-  PageHeader, Card, Button, Input, Field, Badge, Icon, CopyButton,
+  PageHeader, Card, Button, Input, Field, Badge, Icon, CopyButton, Select,
   TableShell, Th, Td, TableSkeleton, EmptyState, ErrorNote, Modal, Confirm, useToast,
 } from '../components/ui'
 
@@ -64,10 +64,12 @@ function keyBadges(k: any): React.ReactNode[] {
   if (k.ip_allowlist) {
     badges.push(<span key="ip" title={`IP allowlist: ${k.ip_allowlist}`}><Badge tone="info">IP restricted</Badge></span>)
   }
-  if (k.monthly_budget_usd && Number(k.monthly_budget_usd) > 0) {
+  // API serializes the cap as `monthly_usd_budget` (models.go json tag);
+  // the write payload below still uses `monthly_budget_usd` (admin handler).
+  if (k.monthly_usd_budget && Number(k.monthly_usd_budget) > 0) {
     badges.push(
-      <span key="budget" title={`Monthly spend cap $${k.monthly_budget_usd}`}>
-        <Badge tone="info">cap ${Number(k.monthly_budget_usd).toFixed(0)}/mo</Badge>
+      <span key="budget" title={`Monthly spend cap $${k.monthly_usd_budget}`}>
+        <Badge tone="info">cap ${Number(k.monthly_usd_budget).toFixed(0)}/mo</Badge>
       </span>,
     )
   }
@@ -289,7 +291,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
       originalOwner: k.created_by || '',
       expiresAt: k.expires_at ? String(k.expires_at).slice(0, 16) : '',
       ipAllowlist: k.ip_allowlist || '',
-      monthlyBudget: k.monthly_budget_usd ? String(k.monthly_budget_usd) : '',
+      monthlyBudget: k.monthly_usd_budget ? String(k.monthly_usd_budget) : '',
     })
     setEditError('')
   }
@@ -369,23 +371,23 @@ export default function Keys({ role = 'admin' }: { role?: string }){
           <>
             <Badge tone="neutral">{list.length} {list.length === 1 ? 'key' : 'keys'}</Badge>
             {canWrite && (
-              <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} />
-      {ownKeysOnly() && list.length === 0 && !loading && (
-        <Card className="!py-3">
-          <div className="flex items-center gap-2 text-sm text-muted">
-            <Icon name="key" size={15} className="text-amber" />
+              <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button>
+            )}
+          </>
+        }
+      />
+
+      {canWrite && ownKeysOnly() && list.length === 0 && !loading && (
+        <div className="rounded-lg border border-amber/30 bg-amber/10 px-4 py-3">
+          <div className="flex items-center gap-2 text-sm text-amber">
+            <Icon name="key" size={15} className="shrink-0" />
             <span>
               No keys are assigned to you yet. Keys created before owner assignment are invisible to you until an admin
               assigns one (Keys → Edit → Owner) or grants you <code className="font-mono">keys:read</code>.
             </span>
           </div>
-        </Card>
+        </div>
       )}
- Create key</Button>
-            )}
-          </>
-        }
-      />
 
       {loadError && (
         <Card>
@@ -400,7 +402,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
 
       {/* show-once secret — unmissable, secure-feeling */}
       {newKey && (
-        <div className="rounded-xl border border-accent/30 bg-accent/10 p-5">
+        <div className="rounded-lg border border-accent/30 bg-accent/10 p-5">
           <div className="flex items-start gap-3">
             <div className="w-9 h-9 rounded-lg bg-accent/15 text-accent flex items-center justify-center shrink-0">
               <Icon name="lock" size={17} />
@@ -419,11 +421,8 @@ export default function Keys({ role = 'admin' }: { role?: string }){
       )}
 
       {isSelectMode && (
-        <Card className="border-amber/30 bg-amber/5 flex flex-wrap items-center justify-between gap-3 !py-3.5">
-          <span className="flex items-center gap-2 text-sm text-amber font-medium">
-            <Icon name="alert" size={15} />
-            {selected.size} key(s) selected
-          </span>
+        <div className="rounded-lg border border-accent/30 bg-accent/10 flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+          <Badge tone="info" dot>{selected.size} key(s) selected</Badge>
           <div className="flex items-center gap-2">
             <Button variant="danger" size="sm" disabled={busy}
               onClick={()=>setConfirmRevoke({ ids: Array.from(selected), label: `${selected.size} selected key(s)` })}>
@@ -431,39 +430,38 @@ export default function Keys({ role = 'admin' }: { role?: string }){
             </Button>
             <Button variant="ghost" size="sm" onClick={clearSelection}>Clear</Button>
           </div>
-        </Card>
+        </div>
       )}
 
-      <TableShell>
-        <table className="w-full text-sm min-w-[860px]">
-          <thead>
-            <tr>
-              <Th className="w-10">
-                <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll}
-                  className="w-4 h-4 accent-accent cursor-pointer rounded" aria-label="Select all keys" />
-              </Th>
-              <Th>Name</Th>
-              <Th>Prefix</Th>
-              <Th>Limits</Th>
-              <Th>Created</Th>
-              <Th>Last used</Th>
-              <Th className="text-right">Actions</Th>
-            </tr>
-          </thead>
-          {loading ? (
-            <TableSkeleton rows={4} cols={CREATED_COL} />
-          ) : (
-            <tbody>
-              {list.map(k=> (
-                <tr key={k.id} className={`${isSelectMode && selected.has(k.id) ? 'bg-accent/5' : ''} hover:bg-stone/20 transition-colors`}>
-                  <Td className="text-center">
-                    <input type="checkbox" checked={selected.has(k.id)} onChange={()=>toggleSelect(k.id)}
-                      className="w-4 h-4 accent-accent cursor-pointer rounded" aria-label={`Select ${k.name}`} />
-                  </Td>
-                  <Td>
-                    <div className="group flex items-center gap-1.5 max-w-[220px]">
+      <TableShell minWidth={860}>
+        <thead>
+          <tr>
+            <Th className="w-10">
+              <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll}
+                className="w-4 h-4 accent-accent cursor-pointer rounded" aria-label="Select all keys" />
+            </Th>
+            <Th>Name</Th>
+            <Th>Prefix</Th>
+            <Th>Limits</Th>
+            <Th className="text-right">Created</Th>
+            <Th className="text-right">Last used</Th>
+            <Th className="text-right">Actions</Th>
+          </tr>
+        </thead>
+        {loading ? (
+          <TableSkeleton rows={4} cols={CREATED_COL} />
+        ) : (
+          <tbody>
+            {list.map(k=> (
+              <tr key={k.id} className={`${isSelectMode && selected.has(k.id) ? 'bg-accent/5' : ''} hover:bg-raised/60 transition-colors`}>
+                <Td className="text-center">
+                  <input type="checkbox" checked={selected.has(k.id)} onChange={()=>toggleSelect(k.id)}
+                    className="w-4 h-4 accent-accent cursor-pointer rounded" aria-label={`Select ${k.name}`} />
+                </Td>
+                <Td>
+                  <div className="max-w-[220px]">
+                    <div className="flex items-center gap-1.5">
                       <span className="font-medium truncate" title={k.name}>{k.name}</span>
-                  {keyBadges(k) && <div className="flex gap-1 mt-0.5">{keyBadges(k)}</div>}
                       {canUpdate && !isSelectMode && (
                         <button onClick={()=>startEdit(k)} title="Rename"
                           className="shrink-0 text-muted hover:text-paper transition-colors focus-visible:text-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded">
@@ -471,93 +469,94 @@ export default function Keys({ role = 'admin' }: { role?: string }){
                         </button>
                       )}
                     </div>
-                  </Td>
-                  <Td>
-                    <div className="flex items-center gap-1 -ml-1.5">
-                      <code className="font-mono text-xs text-muted bg-app border border-stone rounded-md px-1.5 py-0.5">{k.prefix}</code>
-                      <CopyButton value={String(k.prefix ?? '')} label="Copy prefix" />
+                    {keyBadges(k) && <div className="flex flex-wrap gap-1 mt-1">{keyBadges(k)}</div>}
+                  </div>
+                </Td>
+                <Td>
+                  <div className="flex items-center gap-1 -ml-1.5">
+                    <code className="font-mono text-xs text-muted bg-app border border-stone rounded-md px-1.5 py-0.5">{k.prefix}</code>
+                    <CopyButton value={String(k.prefix ?? '')} label="Copy prefix" />
+                  </div>
+                  {users.find(u=>u.id===k.created_by) && (
+                    <div className="text-[11px] text-muted mt-1">
+                      <Icon name="userCog" size={11} className="inline mr-0.5"/>
+                      {users.find(u=>u.id===k.created_by)!.display_name || users.find(u=>u.id===k.created_by)!.username}
                     </div>
-                    {users.find(u=>u.id===k.created_by) && (
-                      <div className="text-[10px] text-muted mt-1">
-                        <Icon name="userCog" size={9} className="inline mr-0.5"/>
-                        {users.find(u=>u.id===k.created_by)!.display_name || users.find(u=>u.id===k.created_by)!.username}
-                      </div>
-                    )}
-                  </Td>
-                  <Td>
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {limitChips(k).map(c => (
-                        <Badge key={c.label} tone="neutral"><span className="tabular-nums">{c.label}</span></Badge>
-                      ))}
-                    </div>
-                    <div className="mt-1">
-                      <Badge tone={k.allowed_models?.length ? 'info' : 'neutral'} dot={!!k.allowed_models?.length}>
-                        {k.allowed_models?.length ? (
-                          <><span className="tabular-nums">{k.allowed_models.length}</span> models allowed</>
-                        ) : 'All models'}
-                      </Badge>
-                    </div>
-                  </Td>
-                  <Td>
-                    <span className="text-xs text-muted whitespace-nowrap" title={k.created_at ? new Date(k.created_at).toLocaleString() : ''}>{ago(k.created_at)}</span>
-                  </Td>
-                  <Td>
-                    <span className="text-xs text-muted whitespace-nowrap" title={k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'never used'}>
-                      {ago(k.last_used_at)}
-                    </span>
-                  </Td>
-                  <Td>
-                    {canSeeKeys() ? (
-                      <div className="flex items-center justify-end gap-1">
-                        {/* Analytics is a VIEW capability: anyone who can see
-                            keys (all or own) can inspect usage — the backend
-                            scopes the data to owned keys for read_own users. */}
-                        <Button variant="ghost" size="sm" onClick={()=>setAnalyticsId(k.id)} title="View analytics">
-                          <Icon name="chart" size={13} />
+                  )}
+                </Td>
+                <Td>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {limitChips(k).map(c => (
+                      <Badge key={c.label} tone="neutral"><span className="tabular-nums">{c.label}</span></Badge>
+                    ))}
+                  </div>
+                  <div className="mt-1">
+                    <Badge tone={k.allowed_models?.length ? 'info' : 'neutral'} dot={!!k.allowed_models?.length}>
+                      {k.allowed_models?.length ? (
+                        <><span className="tabular-nums">{k.allowed_models.length}</span> models allowed</>
+                      ) : 'All models'}
+                    </Badge>
+                  </div>
+                </Td>
+                <Td className="text-right">
+                  <span className="text-xs font-mono tabular-nums text-muted whitespace-nowrap" title={k.created_at ? new Date(k.created_at).toLocaleString() : ''}>{ago(k.created_at)}</span>
+                </Td>
+                <Td className="text-right">
+                  <span className="text-xs font-mono tabular-nums text-muted whitespace-nowrap" title={k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'never used'}>
+                    {ago(k.last_used_at)}
+                  </span>
+                </Td>
+                <Td>
+                  {canSeeKeys() ? (
+                    <div className="flex items-center justify-end gap-1">
+                      {/* Analytics is a VIEW capability: anyone who can see
+                          keys (all or own) can inspect usage — the backend
+                          scopes the data to owned keys for read_own users. */}
+                      <Button variant="ghost" size="sm" onClick={()=>setAnalyticsId(k.id)} title="View analytics">
+                        <Icon name="chart" size={13} />
+                      </Button>
+                      {canRotateKey(k) && (
+                        <Button variant="ghost" size="sm" title="Rotate secret (old secret keeps working for 24h)"
+                          onClick={()=>setRotateTarget(k)}>
+                          <Icon name="refresh" size={13} />
                         </Button>
-                        {canRotateKey(k) && (
-                          <Button variant="ghost" size="sm" title="Rotate secret (old secret keeps working for 24h)"
-                            onClick={()=>setRotateTarget(k)}>
-                            <Icon name="refresh" size={13} />
-                          </Button>
-                        )}
-                        {(canUpdate || canLimit) && (
-                          <Button variant="secondary" size="sm" onClick={()=>openEditModal(k)} title="Edit limits & models">
-                            <Icon name="pencil" size={13} /> Edit
-                          </Button>
-                        )}
-                        {canDelete && (
-                          <Button variant="ghost" size="sm" className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
-                            title="Revoke key"
-                            onClick={()=>setConfirmRevoke({ ids: [k.id], label: `"${k.name}"` })}>
-                            <Icon name="trash" size={14} />
-                          </Button>
-                        )}
-                      </div>
-                    ) : (
-                      <span className="text-xs text-muted/50">read-only</span>
-                    )}
-                  </Td>
-                </tr>
-              ))}
-              {list.length===0 && (
-                <tr>
-                  <td colSpan={CREATED_COL}>
-                    <EmptyState icon="key" title="No API keys yet"
-                      hint={canWrite
-                        ? 'Generate a key and give it a nickname — nicknames appear in logs and analytics as prefix → nickname.'
-                        : 'No keys exist yet — ask an admin or support user to create one.'}
-                      action={canWrite ? <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button> : undefined} />
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          )}
-        </table>
+                      )}
+                      {(canUpdate || canLimit) && (
+                        <Button variant="secondary" size="sm" onClick={()=>openEditModal(k)} title="Edit limits & models">
+                          <Icon name="pencil" size={13} /> Edit
+                        </Button>
+                      )}
+                      {canDelete && (
+                        <Button variant="danger" size="sm"
+                          title="Revoke key"
+                          onClick={()=>setConfirmRevoke({ ids: [k.id], label: `"${k.name}"` })}>
+                          <Icon name="trash" size={14} />
+                        </Button>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="text-xs text-muted">read-only</span>
+                  )}
+                </Td>
+              </tr>
+            ))}
+            {list.length===0 && (
+              <tr>
+                <td colSpan={CREATED_COL}>
+                  <EmptyState icon="key" title="No API keys yet"
+                    hint={canWrite
+                      ? 'Generate a key and give it a nickname — nicknames appear in logs and analytics as prefix → nickname.'
+                      : 'No keys exist yet — ask an admin or support user to create one.'}
+                    action={canWrite ? <Button variant="primary" onClick={openCreate}><Icon name="plus" size={15} /> Create key</Button> : undefined} />
+                </td>
+              </tr>
+            )}
+          </tbody>
+        )}
       </TableShell>
 
       {!loading && list.length > 0 && (
-        <p className="flex items-start gap-2 text-xs text-muted -mt-2">
+        <p className="flex items-start gap-2 text-xs text-muted">
           <Icon name="zap" size={13} className="mt-0.5 shrink-0 text-muted" />
           <span>Click a name to rename · use Edit to manage rate limits &amp; the model allowlist · tick checkboxes to revoke in bulk. Full secrets are never stored for display — only the prefix survives.</span>
         </p>
@@ -586,7 +585,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
 
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <span className="text-xs font-medium text-muted uppercase tracking-wide">Allowed models</span>
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-muted">Allowed models</span>
               <span className="text-[11px] text-muted tabular-nums">{createForm.allowed.length ? `${createForm.allowed.length} restricted` : 'All models allowed'}</span>
             </div>
             <ModelCombobox
@@ -615,7 +614,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
           <Input value={editingName} onChange={e=>setEditingName(e.target.value)} autoFocus spellCheck={false}
             onKeyDown={e=>{ if(e.key==='Enter') saveEdit(); }} placeholder="e.g. prod-frontend" />
         </Field>
-        <div className="flex justify-end gap-2 mt-5">
+        <div className="flex justify-end gap-2 mt-6">
           <Button variant="ghost" onClick={cancelEdit}>Cancel</Button>
           <Button variant="primary" onClick={saveEdit} disabled={!editingName.trim()}>Save</Button>
         </div>
@@ -664,10 +663,9 @@ export default function Keys({ role = 'admin' }: { role?: string }){
         )}
         {canLimit && (
               <Field label="Owner" hint="Who can see this key with the keys:read_own permission. Unowned keys are visible only to users who can view all keys.">
-                <select
+                <Select
                   value={editModal.owner}
                   onChange={e=> setEditModal(prev=> prev ? {...prev, owner: e.target.value} : prev)}
-                  className="w-full bg-app border border-stone rounded-lg px-2 h-9 text-sm focus:outline-none focus:border-accent/60"
                 >
                   <option value="">Unowned (admins &amp; keys:read holders only)</option>
                   {users.map(u => (
@@ -675,12 +673,12 @@ export default function Keys({ role = 'admin' }: { role?: string }){
                       {u.display_name || u.username}
                     </option>
                   ))}
-                </select>
+                </Select>
               </Field>
             )}
 
             <div>
-              <div className="text-xs font-medium text-muted mb-2 uppercase tracking-wide">Rate limits</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">Rate limits</div>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <Field label="RPM" hint="per minute">
                   <Input value={editModal.rpm} onChange={e=> setEditModal(prev=> prev ? {...prev, rpm: e.target.value} : prev)}
@@ -704,7 +702,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
 
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <span className="text-xs font-medium text-muted uppercase tracking-wide">Allowed models</span>
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-muted">Allowed models</span>
                 <span className="text-[11px] text-muted tabular-nums">{editModal.allowed.length ? `${editModal.allowed.length} restricted` : 'All models allowed'}</span>
               </div>
               <ModelCombobox
@@ -719,7 +717,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
               </p>
             </div>
           </div>
-          <div className="flex justify-end gap-2 mt-6 pt-4 border-t border-stone">
+          <div className="flex justify-end gap-2 mt-6">
             <Button variant="ghost" onClick={closeEditModal} disabled={saving}>Cancel</Button>
             <Button variant="primary" onClick={saveEditModal} disabled={saving}>{saving ? 'Saving…' : 'Save changes'}</Button>
           </div>
@@ -744,7 +742,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
             </div>
           </>
         )}
-        <div className="flex justify-end gap-2 mt-5">
+        <div className="flex justify-end gap-2 mt-6">
           <Button variant="ghost" onClick={()=>setRotateTarget(null)}>Cancel</Button>
           <Button variant="primary" onClick={rotateKey} disabled={rotating}>
             {rotating ? 'Rotating…' : 'Rotate secret'}
@@ -757,7 +755,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
         {rotateResult && (
           <>
             <div className="rounded-lg border border-accent/40 bg-accent/5 p-3">
-              <div className="text-xs text-muted mb-1.5 uppercase tracking-wide">New secret — shown only once</div>
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-muted mb-1.5">New secret — shown only once</div>
               <code className="block font-mono text-sm break-all select-all text-accent">{rotateResult.secret}</code>
             </div>
             <div className="mt-3 flex items-center justify-between">
@@ -766,7 +764,7 @@ export default function Keys({ role = 'admin' }: { role?: string }){
             </div>
           </>
         )}
-        <div className="flex justify-end mt-5">
+        <div className="flex justify-end gap-2 mt-6">
           <Button variant="primary" onClick={()=>setRotateResult(null)}>I've saved it</Button>
         </div>
       </Modal>

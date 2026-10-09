@@ -85,6 +85,9 @@ var migration022SQL string
 //go:embed migrations/023_model_recycling_bin.sql
 var migration023SQL string
 
+//go:embed migrations/024_request_attribution.sql
+var migration024SQL string
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -130,7 +133,10 @@ func Q(query string) string { return Rebind(query) }
 // DateBucketExpr returns the daily bucket expression for request_logs charts.
 func DateBucketExpr(col string) string {
 	if Dialect() == "postgres" {
-		return "CAST(" + col + " AS DATE)"
+		// Aggregated chart keys must be strings on both drivers. PostgreSQL's
+		// DATE scans as time.Time with lib/pq, and scanning that into the
+		// response's string bucket silently drops every multi-day point.
+		return "to_char(" + col + " AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
 	}
 	return "date(" + col + ")"
 }
@@ -138,7 +144,7 @@ func DateBucketExpr(col string) string {
 // HourBucketExpr returns the hourly bucket expression for 24h charts.
 func HourBucketExpr(col string) string {
 	if Dialect() == "postgres" {
-		return `to_char(date_trunc('hour', ` + col + `), 'YYYY-MM-DD"T"HH24:00:00"Z"')`
+		return `to_char(date_trunc('hour', ` + col + ` AT TIME ZONE 'UTC'), 'YYYY-MM-DD"T"HH24:00:00"Z"')`
 	}
 	return "strftime('%Y-%m-%dT%H:00:00Z', " + col + ")"
 }
@@ -341,6 +347,7 @@ func Migrate(db *sql.DB) error {
 		{21, migration021SQL},
 		{22, migration022SQL},
 		{23, migration023SQL},
+		{24, migration024SQL},
 	}
 
 	for _, m := range migrations {

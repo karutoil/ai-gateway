@@ -180,15 +180,15 @@ export default function Models({ role = 'admin' }: { role?: string }){
         </Card>
       )}
 
-      {status && <div className="font-mono text-xs text-muted">{status.count} catalog · {list.length} provider models{isAdmin && isSelectMode && <> · <span className="text-amber">{selected.size} selected</span></>}</div>}
+      {status && <div className="font-mono text-xs text-muted">{status.count} catalog · {list.length} provider models{isAdmin && isSelectMode && <> · <span className="text-accent">{selected.size} selected</span></>}</div>}
       {providers.length===0 && (
-        <div className="border border-amber/30 bg-amber/10 rounded-xl p-3 text-sm flex items-center gap-2">
-          <Icon name="alert" size={14} className="text-amber shrink-0"/> Add a provider first{isAdmin ? ', then Discover.' : ' (admin-only).'}
+        <div className="border border-amber/30 bg-amber/10 rounded-lg p-3 text-sm text-amber flex items-center gap-2">
+          <Icon name="alert" size={14} className="shrink-0"/> Add a provider first{isAdmin ? ', then Discover.' : ' (admin-only).'}
         </div>
       )}
 
       {/* Search / filter row */}
-      <Card className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2 !rounded-xl !p-3">
+      <Card className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2">
         {isAdmin && (
           <label className="flex items-center gap-1.5 text-xs text-muted shrink-0 px-1 cursor-pointer">
             <input type="checkbox" checked={list.length>0 && selected.size===list.length} onChange={toggleAll} aria-label="Select all models" className="accent-accent rounded"/>
@@ -203,17 +203,17 @@ export default function Models({ role = 'admin' }: { role?: string }){
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={14}/></span>
           <Input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search model" className="pl-9"/>
         </div>
+        <span className="font-mono text-xs text-muted self-center px-1">{list.length}</span>
         {isAdmin && (
-          <Button variant="ghost" size="md" onClick={()=>setShowAdd(!showAdd)}>
+          <Button variant="ghost" size="md" onClick={()=>setShowAdd(!showAdd)} className="ml-auto">
             <Icon name="plus" size={15}/> Add
           </Button>
         )}
-        <span className="font-mono text-xs text-muted self-center px-1">{list.length}</span>
       </Card>
 
       {isAdmin && isSelectMode && (
-        <div className="border border-amber/30 bg-amber/10 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
-          <Badge tone="warn">{selected.size} model(s) selected</Badge>
+        <div className="border border-accent/30 bg-accent/10 rounded-lg p-3 flex flex-wrap items-center justify-between gap-3">
+          <Badge tone="info" dot>{selected.size} model(s) selected</Badge>
           <div className="flex gap-2">
             <Button variant="primary" size="sm" onClick={bulkEnrich} disabled={busy}>Enrich selected</Button>
             <Button variant="danger" size="sm" onClick={()=>setPendingDelete({kind:'bulk'})} disabled={busy}>Remove selected</Button>
@@ -241,7 +241,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
       )}
 
       {/* Model cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 md:gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
         {loading && Array.from({ length: 6 }).map((_, i)=>(
           <Skeleton key={i} className="h-44" />
         ))}
@@ -252,7 +252,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
           const isSelected = selected.has(m.id)
           const fullId = m.provider_name ? `${m.provider_name}/${m.model_id}` : m.model_id
           return (
-            <Card key={m.id} pad={false} className={`p-4 flex flex-col transition-colors hover:border-muted/60 ${isSelected && !isEdit ? 'border-amber/40 bg-amber/5' : ''}`}>
+            <div key={m.id} className={`rounded-lg shadow-card p-4 flex flex-col transition-colors border hover:border-muted/60 ${isSelected && !isEdit ? 'border-accent/30 bg-accent/10' : 'border-stone bg-surface'}`}>
               {/* Head */}
               <div className="flex items-start gap-2">
                 {isAdmin && (
@@ -261,7 +261,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
                 <div className="min-w-0 flex-1">
                   <div className="font-medium truncate" title={m.display_name}>{m.display_name || fullId}</div>
                   <div className="mt-0.5 flex items-center gap-0.5 text-xs text-muted font-mono min-w-0" title={fullId}>
-                    {m.provider_name ? <span className="shrink-0 text-muted/70">{m.provider_name}/</span> : null}
+                    {m.provider_name ? <span className="shrink-0 text-muted">{m.provider_name}/</span> : null}
                     <span className="truncate">{m.model_id}</span>
                     <CopyButton value={fullId}/>
                   </div>
@@ -282,7 +282,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
                       <>
                         <Badge tone="info">reasoning: {m.reasoning_type||'effort'}</Badge>
                         {shown.map((lv:string)=> <Badge key={lv} tone="neutral">{lv}{limits[lv] ? ':'+fmtK(limits[lv]) : ''}</Badge>)}
-                        {hidden > 0 && <span title={levels.join(', ')} className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-stone/50 text-muted">+{hidden}</span>}
+                        {hidden > 0 && <span title={levels.join(', ')} className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-raised text-muted border border-stone">+{hidden}</span>}
                       </>
                     ) : null}
                     {m.tool_call ? <Badge tone="neutral">tools</Badge> : null}
@@ -321,16 +321,16 @@ export default function Models({ role = 'admin' }: { role?: string }){
               {!isEdit && (
                 <div className="mt-3 rounded-lg border border-stone/70 bg-app/60 px-3 py-2.5 grid grid-cols-3 gap-2">
                   <div className="min-w-0">
-                    <div className="text-[10px] uppercase tracking-wider text-muted">ctx</div>
-                    <div className="font-mono text-xs mt-0.5 truncate" title={`${m.context_window ?? 0} tokens`}>{fmtK(m.context_window)}</div>
+                    <div className="text-[11px] uppercase tracking-wider font-semibold text-muted">ctx</div>
+                    <div className="font-mono tabular-nums text-xs mt-0.5 truncate" title={`${m.context_window ?? 0} tokens`}>{fmtK(m.context_window)}</div>
                   </div>
                   <div className="min-w-0">
-                    <div className="text-[10px] uppercase tracking-wider text-muted">max out</div>
-                    <div className="font-mono text-xs mt-0.5 truncate" title={`${m.max_output ?? 0} tokens`}>{fmtK(m.max_output)}</div>
+                    <div className="text-[11px] uppercase tracking-wider font-semibold text-muted">max out</div>
+                    <div className="font-mono tabular-nums text-xs mt-0.5 truncate" title={`${m.max_output ?? 0} tokens`}>{fmtK(m.max_output)}</div>
                   </div>
                   <div className="min-w-0">
-                    <div className="text-[10px] uppercase tracking-wider text-muted">cost /1M</div>
-                    <div className="font-mono text-xs mt-0.5 whitespace-nowrap">{fmtCost(m.input_cost)} / {fmtCost(m.output_cost)}</div>
+                    <div className="text-[11px] uppercase tracking-wider font-semibold text-muted">cost /1M</div>
+                    <div className="font-mono tabular-nums text-xs mt-0.5 whitespace-nowrap">{fmtCost(m.input_cost)} / {fmtCost(m.output_cost)}</div>
                   </div>
                 </div>
               )}
@@ -376,19 +376,19 @@ export default function Models({ role = 'admin' }: { role?: string }){
                     <Button variant="ghost" size="sm" onClick={()=>{ setEditId(m.id); setEdit({...m, reasoning_levels: m.reasoning_levels || '[]', reasoning_output_limits: m.reasoning_output_limits || '{}'})}} title="Edit">
                       <Icon name="pencil" size={14}/> Edit
                     </Button>
-                    <Button variant="ghost" size="sm" onClick={()=>setPendingDelete({kind:'model', id:m.id, label:fullId})}
-                      title={`Remove ${fullId} from discovery`} className="hover:text-red-400">
+                    <Button variant="danger" size="sm" onClick={()=>setPendingDelete({kind:'model', id:m.id, label:fullId})}
+                      title={`Remove ${fullId} from discovery`}>
                       <Icon name="trash" size={14}/>
                     </Button>
                   </>
                 ) : null}
               </div>
-            </Card>
+            </div>
           )
         })}
         {!loading && !loadError && list.length===0 && (
           <div className="col-span-full">
-            <EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above. Removed models sit in the recycling bin and stay out of discovery until restored.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/>
+            <Card><EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above. Removed models sit in the recycling bin and stay out of discovery until restored.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/></Card>
           </div>
         )}
       </div>
@@ -397,7 +397,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
       {(isAdmin || excluded.length > 0) && (
         <Card>
           <button type="button" onClick={()=>setBinOpen(o=>!o)} className="w-full flex items-center justify-between gap-3 text-left">
-            <span className="flex items-center gap-2 font-semibold tracking-tight">
+            <span className="flex items-center gap-2 font-display text-[15px] font-semibold -tracking-tight">
               <Icon name="trash" size={15}/> Recycling bin
               <Badge tone={excluded.length ? 'warn' : 'neutral'}>{excluded.length}</Badge>
             </span>
@@ -446,7 +446,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
 
       {/* Aliases (writes are admin-only; everyone can read) */}
       <Card>
-        <h3 className="font-semibold tracking-tight">Aliases</h3>
+        <h3 className="font-display text-[15px] font-semibold -tracking-tight">Aliases</h3>
         {isAdmin && (
           <div className="mt-3 flex flex-col sm:flex-row flex-wrap gap-2">
             <Input value={newAlias} onChange={e=>setNewAlias(e.target.value)} placeholder="alias" className="sm:w-48"/>
@@ -464,12 +464,12 @@ export default function Models({ role = 'admin' }: { role?: string }){
         <div className={`${isAdmin ? 'mt-3' : 'mt-3'} flex flex-wrap gap-2 font-mono text-xs`}>
           {aliases.map((a:any)=> (
             <span key={a.alias} className="inline-flex items-center gap-1.5 border border-stone rounded-full pl-3 pr-1 py-1 bg-app/50">
-              <b className="text-amber font-semibold">{a.alias}</b>
+              <b className="text-paper font-semibold">{a.alias}</b>
               <Icon name="chevronRight" size={11} className="text-muted"/>
               <span>{a.target}</span>
               {isAdmin && (
                 <button onClick={()=>setPendingDelete({kind:'alias', alias:a.alias})} aria-label={`Delete alias ${a.alias}`}
-                  className="ml-0.5 w-5 h-5 rounded-full flex items-center justify-center text-muted hover:text-red-400 hover:bg-stone/60 transition-colors">
+                  className="ml-0.5 w-5 h-5 rounded-full flex items-center justify-center text-muted hover:text-danger hover:bg-raised transition-colors">
                   <Icon name="x" size={12}/>
                 </button>
               )}
