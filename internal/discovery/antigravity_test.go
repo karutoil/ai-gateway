@@ -52,7 +52,15 @@ func TestEnrichAntigravityVariantRowUsesBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
-	want := antigravity.PublicModels[0]
+	var want antigravity.PublicModel
+	for _, m := range antigravity.PublicModels {
+		if m.ID == "gemini-3.8-flash" {
+			want = m
+		}
+	}
+	if want.ID == "" {
+		t.Fatal("gemini-3.8-flash missing from the static catalog")
+	}
 	if display != want.Name || ctx != want.ContextWindow || maxOut != want.MaxTokens {
 		t.Errorf("identity/context = %q/%d/%d, want %q/%d/%d",
 			display, ctx, maxOut, want.Name, want.ContextWindow, want.MaxTokens)

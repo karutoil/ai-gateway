@@ -1,6 +1,8 @@
 package antigravity
 
-// Public model catalog mirrors pi-antigravity ANTIGRAVITY_MODELS.
+// Public model catalog mirrors pi-antigravity ANTIGRAVITY_MODELS. Gemini 4
+// Argon's limits and pricing come from Google's published model card and the
+// Gemini API pricing page (Argon ships in Antigravity for AI Ultra subscribers).
 // Costs are per 1M tokens (input/output). Kept here so discovery can seed
 // provider_models without a live OAuth token.
 type PublicModel struct {
@@ -15,6 +17,9 @@ type PublicModel struct {
 }
 
 var PublicModels = []PublicModel{
+	// Gemini 4 Argon (2026-10): flagship reasoning model, 1M unified context.
+	// Intro pricing ($2/$10 per 1M) runs through 2026-11-30; $4/$20 from 2026-12-01.
+	{ID: "gemini-4-argon", Name: "Gemini 4 Argon (Antigravity)", ContextWindow: 1048576, MaxTokens: 65536, InputCost: 2.0, OutputCost: 10.0, CacheReadCost: 0.1, CacheWriteCost: 2.0},
 	{ID: "gemini-3.8-flash", Name: "Gemini 3.8 Flash (Antigravity)", ContextWindow: 1048576, MaxTokens: 65536, InputCost: 0.1, OutputCost: 0.4, CacheReadCost: 0.025, CacheWriteCost: 0.1},
 	{ID: "gemini-3.7-flash", Name: "Gemini 3.7 Flash (Antigravity)", ContextWindow: 1048576, MaxTokens: 65536, InputCost: 0.1, OutputCost: 0.4, CacheReadCost: 0.025, CacheWriteCost: 0.1},
 	{ID: "gemini-3.6-flash", Name: "Gemini 3.6 Flash (Antigravity)", ContextWindow: 1048576, MaxTokens: 65536, InputCost: 0.1, OutputCost: 0.4, CacheReadCost: 0.025, CacheWriteCost: 0.1},
@@ -37,11 +42,13 @@ var routingTable = map[string]routing{
 	"claude-opus-4-6":   {Minimal: "claude-opus-4-6-thinking", Low: "claude-opus-4-6-thinking", Medium: "claude-opus-4-6-thinking", High: "claude-opus-4-6-thinking", DefaultRequestID: "claude-opus-4-6-thinking"},
 	"claude-sonnet-4-6": {Off: "claude-sonnet-4-6", Minimal: "claude-sonnet-4-6", Low: "claude-sonnet-4-6", Medium: "claude-sonnet-4-6", High: "claude-sonnet-4-6", XHigh: "claude-sonnet-4-6", DefaultRequestID: "claude-sonnet-4-6"},
 	"gemini-3.1-pro":    {Off: "gemini-3.1-pro-low", Minimal: "gemini-3.1-pro-low", Low: "gemini-3.1-pro-low", Medium: "gemini-3.1-pro-low", High: "gemini-pro-agent", XHigh: "gemini-pro-agent", DefaultRequestID: "gemini-3.1-pro-low"},
-	"gemini-3.8-flash":  {Off: "gemini-3.8-flash-low", Minimal: "gemini-3.8-flash-low", Low: "gemini-3.8-flash-low", Medium: "gemini-3.8-flash-medium", High: "gemini-3.8-flash-high", XHigh: "gemini-3.8-flash-high", DefaultRequestID: "gemini-3.8-flash-low"},
-	"gemini-3.7-flash":  {Off: "gemini-3.7-flash-low", Minimal: "gemini-3.7-flash-low", Low: "gemini-3.7-flash-low", Medium: "gemini-3.7-flash-medium", High: "gemini-3.7-flash-high", XHigh: "gemini-3.7-flash-high", DefaultRequestID: "gemini-3.7-flash-low"},
-	"gemini-3.6-flash":  {Off: "gemini-3.6-flash-low", Minimal: "gemini-3.6-flash-low", Low: "gemini-3.6-flash-low", Medium: "gemini-3.6-flash-medium", High: "gemini-3.6-flash-high", XHigh: "gemini-3.6-flash-high", DefaultRequestID: "gemini-3.6-flash-low"},
-	"gemini-3.5-flash":  {Off: "gemini-3.5-flash-extra-low", Minimal: "gemini-3.5-flash-extra-low", Low: "gemini-3.5-flash-extra-low", Medium: "gemini-3.5-flash-low", High: "gemini-3-flash-agent", XHigh: "gemini-3-flash-agent", DefaultRequestID: "gemini-3.5-flash-extra-low"},
-	"gpt-oss-120b":      {Off: "gpt-oss-120b-medium", Minimal: "gpt-oss-120b-medium", Low: "gpt-oss-120b-medium", Medium: "gpt-oss-120b-medium", High: "gpt-oss-120b-medium", DefaultRequestID: "gpt-oss-120b-medium"},
+	// Argon exposes the documented thinking levels low/medium/high.
+	"gemini-4-argon":   {Off: "gemini-4-argon-low", Minimal: "gemini-4-argon-low", Low: "gemini-4-argon-low", Medium: "gemini-4-argon-medium", High: "gemini-4-argon-high", XHigh: "gemini-4-argon-high", DefaultRequestID: "gemini-4-argon-low"},
+	"gemini-3.8-flash": {Off: "gemini-3.8-flash-low", Minimal: "gemini-3.8-flash-low", Low: "gemini-3.8-flash-low", Medium: "gemini-3.8-flash-medium", High: "gemini-3.8-flash-high", XHigh: "gemini-3.8-flash-high", DefaultRequestID: "gemini-3.8-flash-low"},
+	"gemini-3.7-flash": {Off: "gemini-3.7-flash-low", Minimal: "gemini-3.7-flash-low", Low: "gemini-3.7-flash-low", Medium: "gemini-3.7-flash-medium", High: "gemini-3.7-flash-high", XHigh: "gemini-3.7-flash-high", DefaultRequestID: "gemini-3.7-flash-low"},
+	"gemini-3.6-flash": {Off: "gemini-3.6-flash-low", Minimal: "gemini-3.6-flash-low", Low: "gemini-3.6-flash-low", Medium: "gemini-3.6-flash-medium", High: "gemini-3.6-flash-high", XHigh: "gemini-3.6-flash-high", DefaultRequestID: "gemini-3.6-flash-low"},
+	"gemini-3.5-flash": {Off: "gemini-3.5-flash-extra-low", Minimal: "gemini-3.5-flash-extra-low", Low: "gemini-3.5-flash-extra-low", Medium: "gemini-3.5-flash-low", High: "gemini-3-flash-agent", XHigh: "gemini-3-flash-agent", DefaultRequestID: "gemini-3.5-flash-extra-low"},
+	"gpt-oss-120b":     {Off: "gpt-oss-120b-medium", Minimal: "gpt-oss-120b-medium", Low: "gpt-oss-120b-medium", Medium: "gpt-oss-120b-medium", High: "gpt-oss-120b-medium", DefaultRequestID: "gpt-oss-120b-medium"},
 }
 
 // ResolveRuntime maps a public model id + reasoning effort to a backend runtime id.
@@ -96,6 +103,13 @@ func ResolveRuntime(publicID, effort string) string {
 }
 
 // FallbackRuntime returns the previous-generation runtime when a next-gen id 404s.
+//
+// Only same-family generations qualify (3.8 -> 3.7 -> 3.6). Gemini 4 Argon has no
+// earlier generation, and silently answering an Argon request with a different
+// frontier model would corrupt both results and billing, so it is deliberately
+// absent here: a bad runtime id surfaces as a 404 instead. Pin
+// ANTIGRAVITY_RUNTIME_MODEL to override the runtime id if the backend names it
+// differently.
 func FallbackRuntime(runtime string) string {
 	switch {
 	case startsWith(runtime, "gemini-3.8-flash-"):
@@ -150,6 +164,7 @@ func ThinkingBudget(runtime, effort string) (includeThoughts bool, budget int) {
 // MaxOutputTokens returns the verified backend cap per runtime id.
 func MaxOutputTokens(publicID, runtime string) int {
 	caps := map[string]int{
+		"gemini-4-argon": 65536, "gemini-4-argon-low": 65536, "gemini-4-argon-medium": 65536, "gemini-4-argon-high": 65536,
 		"gemini-3.8-flash": 65536, "gemini-3.8-flash-low": 65536, "gemini-3.8-flash-medium": 65536, "gemini-3.8-flash-high": 65536,
 		"gemini-3.7-flash-low": 65536, "gemini-3.7-flash-medium": 65536, "gemini-3.7-flash-high": 65536,
 		"gemini-3.6-flash-low": 65536, "gemini-3.6-flash-medium": 65536, "gemini-3.6-flash-high": 65536,

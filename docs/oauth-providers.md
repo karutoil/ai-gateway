@@ -17,7 +17,7 @@ handler, route, migration, or UI changes.
    URL from the address bar.
 3. Paste it into the Connect modal → gateway exchanges the code, stores
    encrypted tokens, discovers models.
-4. Use models as `antigravity/gemini-3.8-flash`, `antigravity/claude-sonnet-4-6`, etc.
+4. Use models as `antigravity/gemini-4-argon`, `antigravity/gemini-3.8-flash`, `antigravity/claude-sonnet-4-6`, etc.
    via `/v1/chat/completions`, `/v1/messages`, or `/v1/responses`.
 
 ## User flow (Devin)
