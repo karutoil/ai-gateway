@@ -683,7 +683,10 @@ func (h *AdminHandler) RotateKey(w http.ResponseWriter, r *http.Request) {
 
 	k, raw, err := h.APIKeyStore.Rotate(id)
 	if err != nil {
-		http.Error(w, `{"error":"rotation failed: `+err.Error()+`"}`, http.StatusInternalServerError)
+		// JSON-encoded envelope: the old hand-concatenated string could emit
+		// invalid JSON (and raw driver internals) whenever err contained a
+		// quote or backslash.
+		httperr.Write(w, http.StatusInternalServerError, "rotation failed: "+err.Error(), httperr.TypeProxy)
 		return
 	}
 	if h.Recorder != nil {
@@ -1036,8 +1039,14 @@ func (h *AdminHandler) Stats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// latency p50/p95
+	//
+	// Sample-capped like LogGroup/perfBy: loading every latency row of a busy
+	// 30d window was unbounded memory. SQL already sorts, so the cap keeps the
+	// exact same percentile semantics up to latencySampleMax rows.
 	var latencies []int64
-	rows4, err := h.DB.Query(db.Q(`SELECT latency_ms FROM request_logs WHERE created_at >= ? AND latency_ms IS NOT NULL`+orgFilter+` ORDER BY latency_ms`), append([]any{start}, orgArgs...)...)
+	latArgs := append([]any{start}, orgArgs...)
+	latArgs = append(latArgs, latencySampleMax)
+	rows4, err := h.DB.Query(db.Q(`SELECT latency_ms FROM request_logs WHERE created_at >= ? AND latency_ms IS NOT NULL`+orgFilter+` ORDER BY latency_ms LIMIT ?`), latArgs...)
 	if err == nil {
 		defer rows4.Close()
 		for rows4.Next() {
@@ -1209,6 +1218,13 @@ func tpsForLog(latencyMs, ttftMs int64, completionTokens int) float64 {
 	}
 	return float64(completionTokens) / (float64(latencyMs) / 1000.0)
 }
+
+// latencySampleMax caps the per-request latency percentile sample size in
+// Stats and KeyAnalytics (rows are pre-sorted by SQL, so percentiles stay
+// exact up to the cap). Same contract as LogGroup's 100k and perfBy's 200k
+// caps: an unbounded 30d window on a busy gateway is a memory bomb, not a
+// statistic.
+const latencySampleMax = 200000
 
 func percentile(sorted []int64, p int) int64 {
 	if len(sorted) == 0 {

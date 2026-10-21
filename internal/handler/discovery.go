@@ -6,7 +6,9 @@ import (
 	"net/http"
 
 	"ai-gateway/internal/discovery"
+	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/rbac"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -16,12 +18,16 @@ type DiscoveryHandler struct {
 }
 
 func (h *DiscoveryHandler) Routes(r chi.Router) {
+	// Read routes stay open to authenticated users; every mutating route is
+	// gated on catalog:write. This route table is not what cmd/gateway mounts
+	// (it wires the handlers one by one with the same permissions), but any
+	// future mounting must not inherit an unguarded mutation surface.
 	r.Get("/", h.List)
-	r.Post("/discover-all", h.DiscoverAll)
-	r.Post("/", h.AddManual)
-	r.Put("/{id}", h.Update)
-	r.Post("/{id}/enrich", h.Enrich)
-	r.Delete("/{id}", h.Delete)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/discover-all", h.DiscoverAll)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/", h.AddManual)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Put("/{id}", h.Update)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/{id}/enrich", h.Enrich)
+	r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/{id}", h.Delete)
 }
 
 func (h *DiscoveryHandler) List(w http.ResponseWriter, r *http.Request) {

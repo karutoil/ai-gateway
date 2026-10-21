@@ -484,7 +484,10 @@ func main() {
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Put("/provider-models/{id}", discoveryHandler.Update)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/{id}/enrich", discoveryHandler.Enrich)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/provider-models/{id}", discoveryHandler.Delete)
-			mcpHandler := &handler.MCPHandler{Store: mcpStore, Manager: mcpManager, Recorder: rec}
+			// DB is wired so the per-key MCP permission endpoints can verify
+			// gateway_keys.org_id for tenant-scoped callers (see MCPHandler.
+			// requireKeyScope).
+			mcpHandler := &handler.MCPHandler{Store: mcpStore, Manager: mcpManager, Recorder: rec, DB: database}
 			mcpHandler.Routes(r)
 			r.Get("/provider-models/excluded", discoveryHandler.ListExcluded)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/excluded/{id}/restore", discoveryHandler.Restore)

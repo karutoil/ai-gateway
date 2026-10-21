@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"ai-gateway/internal/antigravity"
+	"ai-gateway/internal/auth"
 	"ai-gateway/internal/devin"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/middleware"
@@ -92,6 +93,38 @@ func (h *OAuthHandler) gatewayCallbackURL(r *http.Request) string {
 // clients work with zero OAuth-app setup. Operators with their own OAuth app
 // get server mode via the X-OAuth-Mode: redirect header when they registered
 // the gateway callback URL with the provider.
+// providerInCallerScope reports whether the caller may act on this provider
+// row through the OAuth surface: admins pass; org-scoped non-admins only on
+// their own org's providers; global (org-less) providers and mismatched orgs
+// are admin-only — the same contract requireWriteTarget enforces on
+// PUT/DELETE /providers/{id}. The OAuth endpoints previously skipped this
+// entirely, so any holder of providers:write (a default for member/support)
+// could read status, refresh, or DISCONNECT another org's provider, and
+// connect tokens into it via Exchange.
+func providerInCallerScope(r *http.Request, p *models.Provider) bool {
+	if auth.GetRole(r) == "admin" {
+		return true
+	}
+	org := auth.GetOrgID(r)
+	return org != "" && p.OrgID != nil && *p.OrgID == org
+}
+
+// requireProviderScope loads a provider by id and enforces the caller's org
+// scope. 404 (not 403) so other orgs' provider ids are not enumerable.
+// Returns nil after writing the response.
+func (h *OAuthHandler) requireProviderScope(w http.ResponseWriter, r *http.Request, id string) *models.Provider {
+	p, err := h.Providers.GetByID(id)
+	if err != nil {
+		httperr.NotFound(w, "provider not found")
+		return nil
+	}
+	if !providerInCallerScope(r, p) {
+		httperr.NotFound(w, "provider not found")
+		return nil
+	}
+	return p
+}
+
 func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var body oauthStartReq
@@ -106,10 +139,8 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 	var p *models.Provider
 	if body.ProviderID != "" {
-		var err error
-		p, err = h.Providers.GetByID(body.ProviderID)
-		if err != nil {
-			httperr.NotFound(w, "provider not found")
+		p = h.requireProviderScope(w, r, body.ProviderID)
+		if p == nil {
 			return
 		}
 	} else {
@@ -119,14 +150,35 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 		}
 		if !body.NewSubscription {
 			if existing, err := h.Providers.GetByName(name); err == nil && existing != nil {
-				p = existing
+				// Name reuse must respect the org boundary: a member must not
+				// attach tokens to another org's (or a global, admin-only)
+				// same-named provider. Provider names are globally unique, so
+				// refuse — the same failure POST /providers returns for a
+				// duplicate name.
+				if providerInCallerScope(r, existing) {
+					p = existing
+				} else {
+					httperr.Invalid(w, "provider name already in use")
+					return
+				}
 			}
 		}
 		if p == nil {
 			if body.NewSubscription {
 				name = h.Providers.UniqueName(name)
 			}
-			created, err := h.Providers.CreateWithOrg(name, defToProviderType(body.DefID), "", "", "")
+			// Non-admins create inside their own verified org — the same rule
+			// as POST /providers (CreateProvider). The old call hardcoded the
+			// org to "", minting GLOBAL providers writable by any member.
+			orgID := ""
+			if auth.GetRole(r) != "admin" {
+				orgID = auth.GetOrgID(r)
+				if orgID == "" {
+					httperr.Forbidden(w, "org scope required")
+					return
+				}
+			}
+			created, err := h.Providers.CreateWithOrg(name, defToProviderType(body.DefID), "", "", orgID)
 			if err != nil {
 				httperr.Invalid(w, err.Error())
 				return
@@ -205,6 +257,13 @@ func (h *OAuthHandler) Exchange(w http.ResponseWriter, r *http.Request) {
 	if providerID == "" {
 		providerID = pending.ProviderID
 	}
+	// The caller may only attach tokens to a provider in their own scope
+	// (admins pass). body.ProviderID is client-supplied; pending.ProviderID
+	// was bound at Start but validate both — a state token alone must not
+	// authorize writing credentials into another tenant's provider row.
+	if h.requireProviderScope(w, r, providerID) == nil {
+		return
+	}
 	if err := h.Providers.SetOAuthTokens(providerID, pending.DefID, tok); err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "failed to store oauth tokens", httperr.TypeProxy)
 		return
@@ -252,12 +311,11 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OAuthHandler) Status(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	p, err := h.Providers.GetByID(id)
-	if err != nil {
-		httperr.NotFound(w, "provider not found")
+	p := h.requireProviderScope(w, r, chi.URLParam(r, "id"))
+	if p == nil {
 		return
 	}
+	id := p.ID
 	h.Providers.EnrichOAuthOne(p)
 	tok, defID, terr := h.Providers.OAuthTokens(p)
 	connected := terr == nil && tok != nil && tok.Refresh != ""
@@ -274,29 +332,27 @@ func (h *OAuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OAuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	p, err := h.Providers.GetByID(id)
-	if err != nil {
-		httperr.NotFound(w, "provider not found")
+	p := h.requireProviderScope(w, r, chi.URLParam(r, "id"))
+	if p == nil {
 		return
 	}
-	access, project, email, err := h.Providers.EnsureFreshAccess(r.Context(), p, nil)
+	_, project, email, err := h.Providers.EnsureFreshAccess(r.Context(), p, nil)
 	if err != nil {
 		httperr.Write(w, http.StatusBadGateway, "oauth refresh failed: "+err.Error(), httperr.TypeProxy)
 		return
 	}
-	_ = access
+	_ = project
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "email": email, "project_id": project})
 }
 
 func (h *OAuthHandler) Disconnect(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, err := h.Providers.GetByID(id); err != nil {
-		httperr.NotFound(w, "provider not found")
+	p := h.requireProviderScope(w, r, id)
+	if p == nil {
 		return
 	}
-	if err := h.Providers.ClearOAuth(id); err != nil {
+	if err := h.Providers.ClearOAuth(p.ID); err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "disconnect failed", httperr.TypeProxy)
 		return
 	}
@@ -308,12 +364,11 @@ func (h *OAuthHandler) Disconnect(w http.ResponseWriter, r *http.Request) {
 // usage for Devin. Failures are 502 with a plain message — the UI keeps the
 // connected badge and shows the error inline.
 func (h *OAuthHandler) Usage(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	p, err := h.Providers.GetByID(id)
-	if err != nil {
-		httperr.NotFound(w, "provider not found")
+	p := h.requireProviderScope(w, r, chi.URLParam(r, "id"))
+	if p == nil {
 		return
 	}
+	id := p.ID
 	h.Providers.EnrichOAuthOne(p)
 	tok, defID, terr := h.Providers.OAuthTokens(p)
 	if terr != nil || tok == nil || tok.Refresh == "" {

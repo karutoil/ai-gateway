@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"ai-gateway/internal/audit"
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/mcp"
 	"ai-gateway/internal/middleware"
@@ -22,6 +24,10 @@ type MCPHandler struct {
 	Store    *mcp.Store
 	Manager  *mcp.Manager
 	Recorder audit.Recorder
+	// DB, when set, backs the tenant-scope check on the per-key permission
+	// endpoints (gateway_keys.org_id). Wired in cmd/gateway/main.go; when
+	// nil those checks fail closed for non-admin callers.
+	DB *sql.DB
 }
 
 // Routes registers the MCP management surface. Reads are available to every
@@ -74,6 +80,70 @@ func (h *MCPHandler) visibleServerIDs(r *http.Request) (map[string]bool, bool) {
 	return out, true
 }
 
+// serverInCallerScope reports whether the caller may see or act on srv.
+// Admins pass; global (org-less) servers are shared; everyone else must
+// match the server's org — the same rule ListServers, Update and Delete
+// already apply. The by-id endpoints (get/tools/enable/test/discover)
+// previously skipped it entirely: any member (mcp:write is a default for
+// member/support) could read or mutate another org's server by id.
+func serverInCallerScope(r *http.Request, srv *mcp.Server) bool {
+	if auth.GetRole(r) == "admin" {
+		return true
+	}
+	if srv.OrgID == nil || *srv.OrgID == "" {
+		return true
+	}
+	org := auth.GetOrgID(r)
+	return org != "" && *srv.OrgID == org
+}
+
+// requireServerScope loads a server by id (or slug) and enforces the caller's
+// org scope. Denies with 404 — ids from other orgs must not be enumerable.
+// Returns nil after writing the error response.
+func (h *MCPHandler) requireServerScope(w http.ResponseWriter, r *http.Request, id string) *mcp.Server {
+	srv, err := h.Store.GetServer(id)
+	if err != nil {
+		httperr.NotFound(w, "mcp server not found")
+		return nil
+	}
+	if !serverInCallerScope(r, srv) {
+		httperr.NotFound(w, "mcp server not found")
+		return nil
+	}
+	return srv
+}
+
+// requireKeyScope enforces tenant ownership of a gateway key for the
+// per-key MCP permission endpoints: admins pass; org-scoped callers may
+// only touch keys stored in their own org (404 otherwise); unscoped
+// non-admins pass only while the deployment has no organizations (the same
+// single-tenant contract as AdminHandler.resolveScope). Fails closed when
+// no DB handle is wired.
+func (h *MCPHandler) requireKeyScope(w http.ResponseWriter, r *http.Request, keyID string) bool {
+	if auth.GetRole(r) == "admin" {
+		return true
+	}
+	if h.DB == nil {
+		httperr.Forbidden(w, "org scope required")
+		return false
+	}
+	org := auth.GetOrgID(r)
+	if org == "" {
+		var cnt int
+		if err := h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM organizations`)).Scan(&cnt); err != nil || cnt > 0 {
+			httperr.Forbidden(w, "org scope required")
+			return false
+		}
+		return true
+	}
+	var cnt int
+	if err := h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM gateway_keys WHERE id=? AND org_id=?`), keyID, org).Scan(&cnt); err != nil || cnt == 0 {
+		httperr.NotFound(w, "key not found")
+		return false
+	}
+	return true
+}
+
 func (h *MCPHandler) ListServers(w http.ResponseWriter, r *http.Request) {
 	servers, err := h.Store.ListServers()
 	if err != nil {
@@ -94,9 +164,8 @@ func (h *MCPHandler) ListServers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *MCPHandler) GetServer(w http.ResponseWriter, r *http.Request) {
-	srv, err := h.Store.GetServer(chi.URLParam(r, "id"))
-	if err != nil {
-		httperr.NotFound(w, "mcp server not found")
+	srv := h.requireServerScope(w, r, chi.URLParam(r, "id"))
+	if srv == nil {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -156,6 +225,11 @@ func (h *MCPHandler) UpdateServer(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "invalid json")
 		return
 	}
+	// Tenant-scoped callers cannot move a server into another org (or make
+	// it global, which every tenant can then read): pin the stored org.
+	if auth.GetRole(r) != "admin" && existing.OrgID != nil {
+		in.OrgID = *existing.OrgID
+	}
 	srv, err := h.Store.Update(existing.ID, in)
 	if err != nil {
 		httperr.Invalid(w, err.Error())
@@ -204,7 +278,11 @@ func (h *MCPHandler) DisableServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *MCPHandler) setEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
-	id := chi.URLParam(r, "id")
+	srv := h.requireServerScope(w, r, chi.URLParam(r, "id"))
+	if srv == nil {
+		return
+	}
+	id := srv.ID
 	if err := h.Store.SetEnabled(id, enabled); err != nil {
 		httperr.NotFound(w, "mcp server not found")
 		return
@@ -223,13 +301,17 @@ func (h *MCPHandler) setEnabled(w http.ResponseWriter, r *http.Request, enabled 
 		action = "mcp_server_enable"
 	}
 	h.audit(r, action, id, nil)
-	srv, _ := h.Store.GetServer(id)
+	updated, _ := h.Store.GetServer(id)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(srv)
+	_ = json.NewEncoder(w).Encode(updated)
 }
 
 func (h *MCPHandler) TestServer(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+	srv := h.requireServerScope(w, r, chi.URLParam(r, "id"))
+	if srv == nil {
+		return
+	}
+	id := srv.ID
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -251,7 +333,11 @@ func (h *MCPHandler) TestServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *MCPHandler) DiscoverServer(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+	srv := h.requireServerScope(w, r, chi.URLParam(r, "id"))
+	if srv == nil {
+		return
+	}
+	id := srv.ID
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	tools, err := h.Manager.Discover(ctx, id)
@@ -265,7 +351,11 @@ func (h *MCPHandler) DiscoverServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *MCPHandler) ListServerTools(w http.ResponseWriter, r *http.Request) {
-	tools, err := h.Store.ListTools(chi.URLParam(r, "id"))
+	srv := h.requireServerScope(w, r, chi.URLParam(r, "id"))
+	if srv == nil {
+		return
+	}
+	tools, err := h.Store.ListTools(srv.ID)
 	if err != nil {
 		httperr.NotFound(w, "mcp server not found")
 		return
@@ -360,6 +450,9 @@ func (h *MCPHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 
 func (h *MCPHandler) GetKeyPermissions(w http.ResponseWriter, r *http.Request) {
 	keyID := chi.URLParam(r, "id")
+	if !h.requireKeyScope(w, r, keyID) {
+		return
+	}
 	perms, err := h.Store.ListKeyPermissions(keyID)
 	if err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "failed to read permissions", httperr.TypeProxy)
@@ -406,6 +499,9 @@ func (h *MCPHandler) GetKeyPermissions(w http.ResponseWriter, r *http.Request) {
 
 func (h *MCPHandler) SetKeyPermissions(w http.ResponseWriter, r *http.Request) {
 	keyID := chi.URLParam(r, "id")
+	if !h.requireKeyScope(w, r, keyID) {
+		return
+	}
 	var body struct {
 		Servers []struct {
 			ServerID     string   `json:"server_id"`

@@ -116,7 +116,12 @@ func (h *WebhookHandler) List(w http.ResponseWriter, r *http.Request) {
 			out = append(out, w2)
 		}
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+func validWebhookURL(u string) bool {
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
 }
 
 func (h *WebhookHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -126,8 +131,12 @@ func (h *WebhookHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.URL = strings.TrimSpace(in.URL)
-	if !strings.HasPrefix(in.URL, "http://") && !strings.HasPrefix(in.URL, "https://") {
+	if !validWebhookURL(in.URL) {
 		httperr.Invalid(w, "url must be http(s)")
+		return
+	}
+	if len(in.URL) > 2048 || len(strings.TrimSpace(in.Name)) > 128 {
+		httperr.Invalid(w, "name or url too long")
 		return
 	}
 	if !validEventCSV(in.Events) {
@@ -167,8 +176,14 @@ func (h *WebhookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "invalid json")
 		return
 	}
-	if in.URL != "" && !strings.HasPrefix(in.URL, "http") {
+	// Same strict scheme rule as Create: the old check accepted any
+	// "http"-prefixed string (e.g. "httpjunk:...").
+	if in.URL != "" && !validWebhookURL(strings.TrimSpace(in.URL)) {
 		httperr.Invalid(w, "url must be http(s)")
+		return
+	}
+	if len(in.URL) > 2048 || (in.Name != "" && len(strings.TrimSpace(in.Name)) > 128) {
+		httperr.Invalid(w, "name or url too long")
 		return
 	}
 	if !validEventCSV(in.Events) {
@@ -179,15 +194,18 @@ func (h *WebhookHandler) Update(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "format must be json, discord, or slack")
 		return
 	}
-	if in.Format == "" {
-		in.Format = "json"
+	// Partial-update semantics: fields ABSENT from the body keep their
+	// stored value. The previous statement unconditionally overwrote
+	// events, format and enabled, so renaming a webhook also cleared its
+	// event filter (silently widening delivery to ALL events), reset its
+	// format to json, and re-enabled a disabled webhook. enabled uses a
+	// nullable arg so "omitted" (nil) is distinguishable from false.
+	enabledArg := any(nil)
+	if in.Enabled != nil {
+		enabledArg = boolToInt(*in.Enabled)
 	}
-	enabled := 1
-	if in.Enabled != nil && !*in.Enabled {
-		enabled = 0
-	}
-	_, err := h.DB.Exec(db.Q(`UPDATE webhooks SET name=COALESCE(NULLIF(?,''), name), url=COALESCE(NULLIF(?,''), url), events=?, secret=CASE WHEN ? != '' THEN ? ELSE secret END, format=?, enabled=?, updated_at=? WHERE id=?`),
-		strings.TrimSpace(in.Name), strings.TrimSpace(in.URL), strings.TrimSpace(in.Events), in.Secret, in.Secret, in.Format, enabled, time.Now().UTC(), id)
+	_, err := h.DB.Exec(db.Q(`UPDATE webhooks SET name=COALESCE(NULLIF(?,''), name), url=COALESCE(NULLIF(?,''), url), events=COALESCE(NULLIF(?,''), events), secret=CASE WHEN ? != '' THEN ? ELSE secret END, format=COALESCE(NULLIF(?,''), format), enabled=COALESCE(?, enabled), updated_at=? WHERE id=?`),
+		strings.TrimSpace(in.Name), strings.TrimSpace(in.URL), strings.TrimSpace(in.Events), in.Secret, in.Secret, strings.TrimSpace(in.Format), enabledArg, time.Now().UTC(), id)
 	if err != nil {
 		http.Error(w, `{"error":"update failed"}`, http.StatusInternalServerError)
 		return

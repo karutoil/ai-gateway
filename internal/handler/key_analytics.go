@@ -197,9 +197,10 @@ func (h *AdminHandler) KeyAnalytics(w http.ResponseWriter, r *http.Request) {
 		rows3.Close()
 	}
 
-	// Latency percentiles within the window.
+	// Latency percentiles within the window (sample-capped, same as Stats).
 	var latencies []int64
-	rows4, err4 := h.DB.Query(db.Q(`SELECT rl.latency_ms FROM request_logs rl`+baseWhere+` AND rl.latency_ms IS NOT NULL`), baseArgs...)
+	latArgs := append(append([]any{}, baseArgs...), latencySampleMax)
+	rows4, err4 := h.DB.Query(db.Q(`SELECT rl.latency_ms FROM request_logs rl`+baseWhere+` AND rl.latency_ms IS NOT NULL LIMIT ?`), latArgs...)
 	if err4 == nil {
 		for rows4.Next() {
 			var v sql.NullInt64

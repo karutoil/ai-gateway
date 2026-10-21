@@ -38,11 +38,15 @@ func (h *OrgHandler) ensureTables() {
 }
 
 func (h *OrgHandler) Routes(r chi.Router) {
-	r.Get("/orgs", h.ListOrgs)
+	// Reads are gated by orgs:read — the write routes below already require
+	// orgs:write, but the two GETs previously had NO permission check, so any
+	// authenticated user (and any orgs:read revoke, which was silently
+	// ignored) could enumerate every org and membership (user ids + roles).
+	r.With(middleware.RequirePerm(rbac.PermOrgsRead)).Get("/orgs", h.ListOrgs)
 	r.With(middleware.RequirePerm(rbac.PermOrgsWrite)).Post("/orgs", h.CreateOrg)
 	r.With(middleware.RequirePerm(rbac.PermOrgsWrite)).Delete("/orgs/{id}", h.DeleteOrg)
 	r.With(middleware.RequirePerm(rbac.PermOrgsWrite)).Post("/orgs/{id}/members", h.AddMember)
-	r.Get("/orgs/{id}/members", h.ListMembers)
+	r.With(middleware.RequirePerm(rbac.PermOrgsRead)).Get("/orgs/{id}/members", h.ListMembers)
 }
 
 func (h *OrgHandler) CreateOrg(w http.ResponseWriter, r *http.Request) {
@@ -66,7 +70,10 @@ func (h *OrgHandler) CreateOrg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.Recorder != nil {
-		_ = h.Recorder.Log("admin", "create", "organization", id, body.Name)
+		// Record the ACTING subject, not a hardcoded "admin" — the audit
+		// trail previously attributed every org write to "admin" regardless
+		// of who performed it.
+		_ = h.Recorder.Log(auth.GetSubject(r), "create", "organization", id, body.Name)
 	}
 	org := models.Organization{ID: id, Name: body.Name, CreatedAt: now}
 	w.Header().Set("Content-Type", "application/json")
@@ -139,7 +146,7 @@ func (h *OrgHandler) DeleteOrg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.Recorder != nil {
-		_ = h.Recorder.Log("admin", "delete", "organization", id, r.URL.Path)
+		_ = h.Recorder.Log(auth.GetSubject(r), "delete", "organization", id, r.URL.Path)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -185,7 +192,7 @@ func (h *OrgHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.Recorder != nil {
-		_ = h.Recorder.Log("admin", "add_member", "membership", orgID, body.UserID+":"+body.Role)
+		_ = h.Recorder.Log(auth.GetSubject(r), "add_member", "membership", orgID, body.UserID+":"+body.Role)
 	}
 	id := uuid.NewString()
 	now := time.Now().UTC()

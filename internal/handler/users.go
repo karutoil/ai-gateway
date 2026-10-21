@@ -206,7 +206,9 @@ func (h *UsersHandler) PutUserPermissions(w http.ResponseWriter, r *http.Request
 			continue
 		}
 		if err := h.Store.SetPermission(id, perm, *granted); err != nil {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			// JSON envelope: hand-concatenating err.Error() broke the response
+			// body whenever the store error contained a quote.
+			httperr.Invalid(w, err.Error())
 			return
 		}
 	}
