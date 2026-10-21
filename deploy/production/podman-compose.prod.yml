@@ -38,15 +38,28 @@
 #     --label io.podman.compose.service=gateway \
 #     --network production_default --network-alias gateway \
 #     --env-file .env -p 8090:8090 -v $PWD/data:/data \
-#     --restart unless-stopped localhost/ai-gateway:prod
-#   podman stop ai-gateway-prod && podman rename ai-gateway-prod ai-gateway-prod-old
-#   podman rename ai-gateway-prod-new ai-gateway-prod && podman start ai-gateway-prod
+#     --stop-timeout 360 --restart unless-stopped localhost/ai-gateway:prod
+#   podman rename ai-gateway-prod ai-gateway-prod-old
+#   podman rename ai-gateway-prod-new ai-gateway-prod
+#   podman stop -t 360 ai-gateway-prod-old && podman start ai-gateway-prod
 #   podman rm ai-gateway-prod-old
 #
-# Note: podman-compose does not translate `stop_grace_period` into the
-# container's stop timeout (Config.StopTimeout stays at podman's 10s default).
-# Its own stop/restart/down paths pass `-t <stop_grace_period>`, so they drain
-# correctly; a manual `podman stop` does NOT — pass `-t 360` explicitly.
+# Order matters: rename first, so the only gap is stop -> start (~1s when
+# idle). Do NOT pass --health-cmd here — the image already ships the right
+# one. If you ever do override it, it MUST run under bash: the image has no
+# curl, and `/dev/tcp` is a bash feature, so a bare CMD-SHELL string fails
+# under /bin/sh with "cannot create /dev/tcp/...: Directory nonexistent" and
+# the container reports unhealthy while serving fine.
+#
+# `podman stop` without -t uses Config.StopTimeout, which podman-compose does
+# not set from `stop_grace_period` (it stays at podman's 10s default) — hence
+# --stop-timeout above and -t 360 below. A stop that exceeds the app's own
+# SHUTDOWN_GRACE_SECONDS is SIGKILLed, so keep -t above it.
+#
+# Post-swap checks: curl -s localhost:8090/health (version must be the new
+# build), podman ps must say (healthy), and
+# `podman exec ai-gateway-prod printenv SHUTDOWN_GRACE_SECONDS` must print a
+# number.
 #
 # Point your Cloudflare Tunnel at http://localhost:8090.
 
