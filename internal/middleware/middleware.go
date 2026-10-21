@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -288,7 +289,23 @@ func SetGatewayKey(r *http.Request, key *models.GatewayKey) *http.Request {
 // them via SetGatewayKey) MUST call it after verification: without it, a key
 // restricted by IP or over its monthly budget could shed both controls simply
 // by speaking MCP instead of plain HTTP.
-func AdmitKey(store *apikey.Store, w http.ResponseWriter, r *http.Request, key *models.GatewayKey) bool {
+// AdmitKeyResult describes an admission denial: HTTP status, a client
+// message, the OpenAI error type, and the Retry-After delay (string, set
+// only for spend-cap rejections). Status is 0 when the key is admitted.
+type AdmitKeyResult struct {
+	Status     int
+	Message    string
+	ErrType    string
+	RetryAfter string
+}
+
+// CheckAdmission runs the per-key admission policy (IP allowlist, calendar-
+// month spend cap) WITHOUT writing a response, so alternate authentication
+// surfaces can reject with their own envelope (the unified /mcp endpoint
+// answers with the JSON-RPC error object instead of the OpenAI-style body
+// AdmitKey writes on /v1). Callers must write the denial themselves when
+// Status is non-zero.
+func CheckAdmission(store *apikey.Store, r *http.Request, key *models.GatewayKey) AdmitKeyResult {
 	// Per-key IP allowlist: empty allows any client; the client IP must
 	// match an entry (exact IP or CIDR range) otherwise. clientIP reads the
 	// direct peer only, so it is spoof-safe: forwardedHeaders (the only place
@@ -296,8 +313,11 @@ func AdmitKey(store *apikey.Store, w http.ResponseWriter, r *http.Request, key *
 	// RemoteAddr to the verified real client IP.
 	if key.IPAllowlist != "" && !clientIPAllowed(clientIP(r), key.IPAllowlist) {
 		log.Warn().Str("key_prefix", key.Prefix).Str("client_ip", clientIP(r)).Msg("gateway key rejected: IP not allowed")
-		http.Error(w, `{"error":{"message":"client IP not allowed for this key","type":"permission_error"}}`, http.StatusForbidden)
-		return false
+		return AdmitKeyResult{
+			Status:  http.StatusForbidden,
+			Message: "client IP not allowed for this key",
+			ErrType: "permission_error",
+		}
 	}
 	// Monthly spend cap: calendar-month spend for this key must stay
 	// under the configured budget before admitting another request.
@@ -306,12 +326,27 @@ func AdmitKey(store *apikey.Store, w http.ResponseWriter, r *http.Request, key *
 	if key.MonthlyBudgetUSD > 0 {
 		if spent := store.MonthSpendUSDForPrefix(key.ID, key.Prefix); spent >= key.MonthlyBudgetUSD {
 			log.Warn().Str("key_prefix", key.Prefix).Float64("spent", spent).Float64("budget", key.MonthlyBudgetUSD).Msg("gateway key: monthly budget exceeded")
-			w.Header().Set("Retry-After", secondsUntilNextMonthUTC())
-			http.Error(w, `{"error":{"message":"monthly spend budget exceeded for this key","type":"budget_exceeded"}}`, http.StatusTooManyRequests)
-			return false
+			return AdmitKeyResult{
+				Status:     http.StatusTooManyRequests,
+				Message:    "monthly spend budget exceeded for this key",
+				ErrType:    "budget_exceeded",
+				RetryAfter: secondsUntilNextMonthUTC(),
+			}
 		}
 	}
-	return true
+	return AdmitKeyResult{}
+}
+
+func AdmitKey(store *apikey.Store, w http.ResponseWriter, r *http.Request, key *models.GatewayKey) bool {
+	res := CheckAdmission(store, r, key)
+	if res.Status == 0 {
+		return true
+	}
+	if res.RetryAfter != "" {
+		w.Header().Set("Retry-After", res.RetryAfter)
+	}
+	http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"type":%q}}`, res.Message, res.ErrType), res.Status)
+	return false
 }
 
 func attachGatewayKey(next http.Handler, w http.ResponseWriter, r *http.Request, key *models.GatewayKey) {

@@ -518,6 +518,32 @@ func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request
 		httperr.Proxy(w, status, msg)
 	}
 
+	// relayClientCaused relays a client-caused upstream error verdict exactly
+	// like the Completions/Responses handlers do (proxy.go): the FULL bounded
+	// clientBody with the upstream status and JSON content type — not a
+	// 512-char snippet inside the generic proxy_error envelope, which handed
+	// /v1/chat/completions, /v1/messages and /v1/embeddings clients truncated,
+	// mid-string-cut JSON for the same upstream error class. errSnippet is
+	// only a fallback when the body was unavailable. Once keepalive headers
+	// have flowed on a stream, a second status line is impossible: the verdict
+	// goes in-band as an SSE error frame instead.
+	relayClientCaused := func(outcome attemptOutcome) {
+		relay := outcome.clientBody
+		if relay == "" {
+			relay = outcome.errSnippet
+		}
+		if relay == "" {
+			relay = "upstream rejected the request"
+		}
+		if ttfb.headersCommitted() {
+			terminalError(outboundStatus(outcome.status), relay)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(outboundStatus(outcome.status))
+		_, _ = w.Write([]byte(relay))
+	}
+
 	var (
 		lastBW         *bufWriter
 		lastProvider   *models.Provider
@@ -598,7 +624,7 @@ func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request
 			// Client-caused 5xx (upstream "invalid_request" semantics):
 			// relay the upstream's verdict — no failover, no generic 502.
 			if outcome.clientCaused {
-				terminalError(outboundStatus(outcome.status), truncateDetail(outcome.errSnippet))
+				relayClientCaused(outcome)
 				return
 			}
 			if outcome.committed || !outcome.retriable {
@@ -631,7 +657,7 @@ func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request
 			// relay the upstream's verdict instead of the retryable-looking
 			// generic envelope.
 			if outcome.clientCaused {
-				terminalError(outboundStatus(outcome.status), truncateDetail(outcome.errSnippet))
+				relayClientCaused(outcome)
 				return
 			}
 			lastFailStatus = outcome.status

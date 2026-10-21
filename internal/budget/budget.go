@@ -23,7 +23,37 @@ type Limiter interface {
 	RecordUsage(prefix string, tokens int, costCents int, at time.Time)
 }
 
-// MemoryLimiter is used in unit tests for quota enforcement without DB
+// Chained composes limiters into one admission + recording pipeline.
+// Check denies on the FIRST non-nil verdict (fail-closed: any member's
+// over-quota or budget-unavailable error is returned as-is), and
+// RecordUsage fans out to every member so each stays consistent.
+//
+// Production wiring (cmd/gateway): GLOBAL_DAILY_TOKEN_LIMIT installs an
+// in-memory MemoryLimiter in front of the DB ledger — a deployment-wide
+// per-key default daily token cap that also covers keys with no DB-configured
+// limits (an emergency cost brake that needs no schema and no per-key row).
+type Chained []Limiter
+
+func (c Chained) Check(prefix string, promptTokens int) error {
+	for _, l := range c {
+		if err := l.Check(prefix, promptTokens); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c Chained) RecordUsage(prefix string, tokens int, costCents int, at time.Time) {
+	for _, l := range c {
+		l.RecordUsage(prefix, tokens, costCents, at)
+	}
+}
+
+var _ Limiter = Chained{}
+
+// MemoryLimiter is used in unit tests for quota enforcement without DB, and
+// in production as the optional GLOBAL_DAILY_TOKEN_LIMIT admission stage
+// composed in front of DBLimiter (see Chained).
 type MemoryLimiter struct {
 	mu              sync.Mutex
 	DailyTokenLimit int
@@ -540,6 +570,11 @@ func BudgetCheck(l Limiter) func(http.Handler) http.Handler { return Middleware(
 // post-response token/cost outcomes for key scope and, when known, org scope.
 type UsageSink struct {
 	Limiter *DBLimiter
+	// Extra, when set, receives the same usage events (the in-memory
+	// GLOBAL_DAILY_TOKEN_LIMIT stage composed via Chained on the admission
+	// path — without recording into it, its counters would stay frozen at
+	// zero and the cap would never trip).
+	Extra Limiter
 }
 
 func (u *UsageSink) RecordUsage(keyPrefix string, orgID *string, tokens int, costUSD float64, ts time.Time) {
@@ -548,6 +583,9 @@ func (u *UsageSink) RecordUsage(keyPrefix string, orgID *string, tokens int, cos
 	}
 	cents := int(math.Round(costUSD * 100))
 	u.Limiter.RecordUsage(keyPrefix, tokens, cents, ts)
+	if u.Extra != nil {
+		u.Extra.RecordUsage(keyPrefix, tokens, cents, ts)
+	}
 	if orgID != nil && *orgID != "" {
 		u.Limiter.RecordOrgUsage(*orgID, tokens, cents, ts)
 	}

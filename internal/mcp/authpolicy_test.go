@@ -9,6 +9,7 @@ package mcp
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -74,12 +75,24 @@ func TestMCPAuthEnforcesIPAllowlistAndMonthlyBudget(t *testing.T) {
 		t.Fatalf("allowed IP: code=%d called=%v, want 200/true", w.Code, called)
 	}
 
-	// Disallowed IP -> 403, same envelope /v1 answers with.
-	if w := do(locked.Key, "203.0.113.9"); w.Code != http.StatusForbidden || called {
-		t.Fatalf("disallowed IP: code=%d called=%v, want 403/false", w.Code, called)
+	// Disallowed IP -> 403. The MCP surface is JSON-RPC, so the rejection
+	// must use the writeMCPAuthError envelope (jsonrpc error object), not the
+	// OpenAI-style http.Error body /v1 answers with.
+	w403 := do(locked.Key, "203.0.113.9")
+	if w403.Code != http.StatusForbidden || called {
+		t.Fatalf("disallowed IP: code=%d called=%v, want 403/false", w403.Code, called)
 	}
-	if w := do(locked.Key, "203.0.113.9"); !strings.Contains(w.Body.String(), "client IP not allowed") {
-		t.Fatalf("403 body = %q, want the permission_error envelope", w.Body.String())
+	var rej struct {
+		JSONRPC string         `json:"jsonrpc"`
+		Error   map[string]any `json:"error"`
+		ID      any            `json:"id"`
+	}
+	if err := json.Unmarshal(w403.Body.Bytes(), &rej); err != nil {
+		t.Fatalf("403 body = %q, want a JSON-RPC envelope: %v", w403.Body.String(), err)
+	}
+	if rej.JSONRPC != "2.0" || rej.Error["code"] != float64(-32001) ||
+		!strings.Contains(rej.Error["message"].(string), "client IP not allowed") || rej.ID != nil {
+		t.Fatalf("403 envelope = %+v, want jsonrpc 2.0 code -32001 IP-allowlist message", rej)
 	}
 
 	// Spend over the monthly budget -> 429 even from the allowed IP.
@@ -91,8 +104,21 @@ func TestMCPAuthEnforcesIPAllowlistAndMonthlyBudget(t *testing.T) {
 		locked.ID, monthStart); err != nil {
 		t.Fatal(err)
 	}
-	if w := do(locked.Key, "10.1.2.3"); w.Code != http.StatusTooManyRequests || called {
-		t.Fatalf("over budget: code=%d called=%v, want 429/false", w.Code, called)
+	w429 := do(locked.Key, "10.1.2.3")
+	if w429.Code != http.StatusTooManyRequests || called {
+		t.Fatalf("over budget: code=%d called=%v, want 429/false", w429.Code, called)
+	}
+	// The 429 budget rejection is the same JSON-RPC envelope and keeps the
+	// Retry-After header the /v1 chain sets.
+	if w429.Header().Get("Retry-After") == "" {
+		t.Fatalf("429 missing Retry-After header")
+	}
+	if err := json.Unmarshal(w429.Body.Bytes(), &rej); err != nil {
+		t.Fatalf("429 body = %q, want a JSON-RPC envelope: %v", w429.Body.String(), err)
+	}
+	if rej.JSONRPC != "2.0" || rej.Error["code"] != float64(-32001) ||
+		!strings.Contains(rej.Error["message"].(string), "monthly spend budget exceeded") {
+		t.Fatalf("429 envelope = %+v, want jsonrpc 2.0 code -32001 budget message", rej)
 	}
 
 	// Raise the budget -> admitted again.

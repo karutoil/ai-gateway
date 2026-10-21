@@ -69,8 +69,16 @@ func (e *Endpoint) Auth(next http.Handler) http.Handler {
 		// Same per-key admission policy the /v1 chain enforces (IP allowlist,
 		// monthly spend cap): without this a key restricted by IP or over its
 		// budget could shed both controls by speaking MCP instead of plain
-		// HTTP. Admission failures answer with the same envelopes /v1 uses.
-		if !middleware.AdmitKey(e.APIKeys, w, r, key) {
+		// HTTP. Unlike GatewayAuth (which answers with OpenAI-style bodies on
+		// /v1), this is a JSON-RPC surface, so the rejection uses the same
+		// writeMCPAuthError envelope as every other auth failure above — an
+		// OpenAI http.Error body is not a valid MCP response. The HTTP status
+		// (403 / 429 + Retry-After) is kept.
+		if res := middleware.CheckAdmission(e.APIKeys, r, key); res.Status != 0 {
+			if res.RetryAfter != "" {
+				w.Header().Set("Retry-After", res.RetryAfter)
+			}
+			writeMCPAuthError(w, res.Status, res.Message)
 			return
 		}
 		r = middleware.SetGatewayKey(r, key)

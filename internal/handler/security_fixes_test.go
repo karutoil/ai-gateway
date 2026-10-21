@@ -25,6 +25,7 @@ import (
 	"ai-gateway/internal/mcp"
 	"ai-gateway/internal/mcp/mcptest"
 	"ai-gateway/internal/middleware"
+	"ai-gateway/internal/models"
 	"ai-gateway/internal/provider"
 	// Registers the real OAuth definitions (antigravity/devin) so Start can
 	// resolve def ids exactly like production.
@@ -543,6 +544,111 @@ func TestOAuthProviderScopeForNonAdmins(t *testing.T) {
 	h.Start(rec, r)
 	if rec.Code != http.StatusOK {
 		t.Errorf("admin Start foreign = %d, want 200", rec.Code)
+	}
+}
+
+// TestAdminOrgScopeSymmetry pins the one org-scope contract both helpers
+// must follow after the asymmetry fix: providerInCallerScope (OAuth surface)
+// previously let ANY admin cross org boundaries, while requireWriteTarget
+// (admin PUT/DELETE) required an org match even for admins. The aligned
+// rule: a caller with an org claim — admin or not — is tenant-scoped and
+// must match the target org; only a global admin (no org claim) acts
+// anywhere.
+func TestAdminOrgScopeSymmetry(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	master := make([]byte, 32)
+	for i := range master {
+		master[i] = byte(i + 3)
+	}
+	for _, org := range []string{"org-me", "org-other"} {
+		if _, err := database.Exec(db.Q(`INSERT INTO organizations(id,name,created_at) VALUES(?,?,?)`), org, org, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	providers := provider.NewStore(database, master)
+
+	mine, err := providers.CreateWithOrg("sym-mine", "antigravity", "", "", "org-me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := providers.CreateWithOrg("sym-foreign", "antigravity", "", "", "org-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	global, err := providers.Create("sym-global", "antigravity", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scopedReq := func(role, org string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/api/providers/x", nil)
+		ctx := auth.WithRole(r.Context(), role)
+		ctx = auth.WithSubject(ctx, role)
+		if org != "" {
+			ctx = auth.WithOrgID(ctx, org)
+		}
+		return r.WithContext(ctx)
+	}
+
+	// providerInCallerScope: admin WITH an org claim must match the target
+	// org (previously bypassed for admins); global admin passes anywhere.
+	for _, tc := range []struct {
+		name string
+		role string
+		org  string
+		p    *models.Provider
+		want bool
+	}{
+		{"global admin, own-org provider", "admin", "", mine, true},
+		{"global admin, foreign provider", "admin", "", foreign, true},
+		{"global admin, global provider", "admin", "", global, true},
+		{"tenant admin, own-org provider", "admin", "org-me", mine, true},
+		{"tenant admin, foreign provider", "admin", "org-me", foreign, false},
+		{"tenant admin, global provider", "admin", "org-me", global, false},
+		{"member, own-org provider", "member", "org-me", mine, true},
+		{"member, foreign provider", "member", "org-me", foreign, false},
+		{"member, global provider", "member", "org-me", global, false},
+		{"unscoped member, own-org provider", "member", "", mine, false},
+	} {
+		if got := providerInCallerScope(scopedReq(tc.role, tc.org), tc.p); got != tc.want {
+			t.Errorf("providerInCallerScope %s = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// requireWriteTarget: the same rule from the write side. Only the
+	// provider-in-org rows matter here (global rows never match an org
+	// claim, mirroring providerInCallerScope's tenant-admin/global case).
+	admin := &AdminHandler{DB: database}
+	for _, tc := range []struct {
+		name string
+		role string
+		org  string
+		id   string
+		want bool
+		// wantCode: 0 = nothing written (admitted, or denied upstream of this
+		// helper); otherwise the expected written status.
+		wantCode int
+	}{
+		{"global admin writes foreign", "admin", "", foreign.ID, true, 0},
+		{"tenant admin writes own org", "admin", "org-me", mine.ID, true, 0},
+		{"tenant admin writes foreign", "admin", "org-me", foreign.ID, false, http.StatusNotFound},
+		{"tenant admin writes global row", "admin", "org-me", global.ID, false, http.StatusNotFound},
+		// Unscoped non-admin is denied by the role check without writing a
+		// body (the route-level RBAC gate answers before this helper).
+		{"unscoped member writes anything", "member", "", foreign.ID, false, 0},
+	} {
+		rec := httptest.NewRecorder()
+		got := admin.requireWriteTarget(rec, scopedReq(tc.role, tc.org), "providers", tc.id)
+		if got != tc.want {
+			t.Errorf("requireWriteTarget %s = %v, want %v", tc.name, got, tc.want)
+		}
+		if tc.wantCode != 0 && rec.Code != tc.wantCode {
+			t.Errorf("requireWriteTarget %s: code = %d, want %d", tc.name, rec.Code, tc.wantCode)
+		}
 	}
 }
 

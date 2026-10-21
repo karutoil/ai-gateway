@@ -87,7 +87,9 @@ func (s *anthToOpenAICompletionStream) consume(raw []byte) []byte {
 			}
 			if d, ok := m["delta"].(map[string]interface{}); ok {
 				if sr, exists := d["stop_reason"]; exists {
-					s.stop = mapStopReason(sr)
+					// Legacy /v1/completions dialect: "tool_calls" is not a valid
+					// finish_reason there (see mapStopReasonLegacy).
+					s.stop = mapStopReasonLegacy(sr)
 				}
 			}
 		case "message_stop":

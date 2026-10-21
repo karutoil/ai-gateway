@@ -94,19 +94,23 @@ func (h *OAuthHandler) gatewayCallbackURL(r *http.Request) string {
 // get server mode via the X-OAuth-Mode: redirect header when they registered
 // the gateway callback URL with the provider.
 // providerInCallerScope reports whether the caller may act on this provider
-// row through the OAuth surface: admins pass; org-scoped non-admins only on
-// their own org's providers; global (org-less) providers and mismatched orgs
-// are admin-only — the same contract requireWriteTarget enforces on
-// PUT/DELETE /providers/{id}. The OAuth endpoints previously skipped this
-// entirely, so any holder of providers:write (a default for member/support)
-// could read status, refresh, or DISCONNECT another org's provider, and
-// connect tokens into it via Exchange.
+// row through the OAuth surface. The contract mirrors requireWriteTarget
+// (admin.go) exactly: a caller with an org claim — admin or not — is a
+// tenant-scoped caller and may only touch providers in their OWN org
+// (global providers and other orgs' rows are out of scope); only a global
+// admin (no org claim) may act anywhere. The OAuth endpoints previously
+// skipped this entirely, so any holder of providers:write (a default for
+// member/support) could read status, refresh, or DISCONNECT another org's
+// provider, and connect tokens into it via Exchange — and an org-scoped
+// admin could silently cross the same boundary that requireWriteTarget
+// enforced on PUT/DELETE /providers/{id}.
 func providerInCallerScope(r *http.Request, p *models.Provider) bool {
-	if auth.GetRole(r) == "admin" {
-		return true
-	}
 	org := auth.GetOrgID(r)
-	return org != "" && p.OrgID != nil && *p.OrgID == org
+	if org == "" {
+		// Global scope is admin-only (requireWriteTarget's orgID=="" branch).
+		return auth.GetRole(r) == "admin"
+	}
+	return p.OrgID != nil && *p.OrgID == org
 }
 
 // requireProviderScope loads a provider by id and enforces the caller's org

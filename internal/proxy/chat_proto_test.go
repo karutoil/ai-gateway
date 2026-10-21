@@ -124,6 +124,8 @@ func protoNewEnv(t *testing.T, up http.HandlerFunc, provType models.ProviderType
 			r.Post("/v1/messages", h.AnthropicMessages)
 		case "completions":
 			r.Post("/v1/completions", h.Completions)
+		case "embeddings":
+			r.Post("/v1/embeddings", h.Embeddings)
 		default:
 			t.Fatalf("unknown mount %q", m)
 		}

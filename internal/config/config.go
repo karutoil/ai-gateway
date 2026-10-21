@@ -28,6 +28,7 @@ import (
 // | CORS_ALLOWED_ORIGINS | no       | "" (= *)            | comma-separated origins, e.g. https://app.example.com,https://ai.example.com. Overrides PUBLIC_URL. Supports "*" |
 // | TRUSTED_PROXIES      | no       | ""                  | comma-separated IPs/CIDRs trusted for X-Forwarded-* / CF-Connecting-IP (empty = loopback only; "*" trusts all) |
 // | IMAGE_TIMEOUT_SECONDS| no       | 300                 | client first-byte budget for /v1/images/*: -1/unset = 300s default, 0 = disabled, N = N seconds |
+// | GLOBAL_DAILY_TOKEN_LIMIT | no   | 0 (disabled)        | in-memory per-key daily token cap enforced before the DB budget ledger (per-replica) |
 
 type Config struct {
 	Port               string
@@ -80,6 +81,14 @@ type Config struct {
 	RoutingLegacyFallback bool
 
 	MetricsRequireAuth bool
+
+	// GlobalDailyTokenLimit is an optional deployment-wide per-key daily
+	// token cap enforced IN MEMORY (budget.MemoryLimiter) in front of the
+	// DB-backed ledger — an emergency cost brake that applies even to keys
+	// with no DB-configured limits. GLOBAL_DAILY_TOKEN_LIMIT=0 (default)
+	// disables it. NOTE: state is per-process; each gateway replica enforces
+	// the cap against its own traffic only.
+	GlobalDailyTokenLimit int
 
 	// ImageTimeoutSecs is the client-facing first-byte budget for
 	// /v1/images/generations and /v1/images/edits. Image generation is
@@ -455,6 +464,9 @@ func Load() (*Config, error) {
 		RoutingLegacyFallback: getBool("ROUTING_LEGACY_FALLBACK"),
 
 		MetricsRequireAuth: getBool("METRICS_PROTECT"),
+
+		// Optional in-memory deployment-wide per-key daily token cap.
+		GlobalDailyTokenLimit: getInt("GLOBAL_DAILY_TOKEN_LIMIT", 0),
 
 		// Image endpoints get their own first-byte budget: image generation
 		// routinely exceeds the 85s chat budget. -1 = built-in default (300s).

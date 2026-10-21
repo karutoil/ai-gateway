@@ -278,10 +278,31 @@ func main() {
 	// field in the request.
 	go runVideoJobRetention(database)
 	rec := audit.NewDBRecorder(database)
-	limiter := budget.NewDBLimiter(database)
+	dbLimiter := budget.NewDBLimiter(database)
+	// Admission pipeline. With GLOBAL_DAILY_TOKEN_LIMIT set, an in-memory
+	// MemoryLimiter runs in front of the DB ledger: a deployment-wide
+	// per-key default daily token cap that also covers keys with no
+	// DB-configured limits (fail-closed on the limit: over-quota requests
+	// get the 429 over_quota envelope). Unset (default) keeps the exact
+	// previous behavior — DB ledger only.
+	var memStage *budget.MemoryLimiter
+	limiter := budget.Limiter(dbLimiter)
+	if cfg.GlobalDailyTokenLimit > 0 {
+		memStage = budget.NewMemoryLimiter(cfg.GlobalDailyTokenLimit)
+		limiter = budget.Chained{memStage, dbLimiter}
+	}
 	lbStore := lb.NewStore(database)
 	proxyHandler.LB = lbStore
-	proxyHandler.Usage = &budget.UsageSink{Limiter: limiter}
+	// Usage recording feeds every stage that admission consults: the DB
+	// ledger (key + org scopes) and, when installed, the in-memory cap —
+	// without recording into it its counters would stay frozen at zero and
+	// the cap would never trip. (Extra is assigned only when the stage is
+	// installed: a typed-nil *MemoryLimiter in the interface is non-nil.)
+	usageSink := &budget.UsageSink{Limiter: dbLimiter}
+	if memStage != nil {
+		usageSink.Extra = memStage
+	}
+	proxyHandler.Usage = usageSink
 
 	// Centralized MCP: one registry of upstream MCP servers, one authenticated
 	// /mcp endpoint for harnesses, and LiteLLM-compatible mcp references on the

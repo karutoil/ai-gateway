@@ -3400,6 +3400,19 @@ func mapStopReason(v interface{}) string {
 	}
 }
 
+// mapStopReasonLegacy is the /v1/completions dialect variant: the legacy
+// text-completion vocabulary has no "tool_calls" finish_reason (valid values
+// are stop/length/content_filter), and anthropicToOpenAICompletion emits no
+// tool_calls field at all — so a tool_use stop must render as "stop" there.
+// The chat-completions and responses paths keep mapStopReason, where
+// "tool_calls" is both valid and required for tool-invoking turns.
+func mapStopReasonLegacy(v interface{}) string {
+	if s, _ := v.(string); s == "tool_use" {
+		return "stop"
+	}
+	return mapStopReason(v)
+}
+
 // anthropicToOpenAICompletion converts a native Anthropic message body into
 // the LEGACY OpenAI text-completion shape consumed by /v1/completions clients
 // (choices[].text, object "text_completion") — the chat-completions converter
@@ -3467,7 +3480,7 @@ func anthropicToOpenAICompletion(body []byte, model string) []byte {
 			{
 				"index":         0,
 				"text":          text,
-				"finish_reason": mapStopReason(anth["stop_reason"]),
+				"finish_reason": mapStopReasonLegacy(anth["stop_reason"]),
 			},
 		},
 		"usage": usageOut,
