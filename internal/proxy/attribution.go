@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -144,8 +145,12 @@ func appFromReferer(r *http.Request) string {
 }
 
 // sanitizeAttribution bounds an attacker-influenced value before storage:
-// trims, drops control characters, and truncates. Without the cap, a client
-// could write arbitrarily large strings across a column that is indexed.
+// trims, drops control characters, and truncates on a rune boundary. Without
+// the cap, a client could write arbitrarily large strings across a column
+// that is indexed. A byte-blind cut (s[:200]) can split a multi-byte UTF-8
+// rune; Postgres then rejects the whole request_logs INSERT with "invalid
+// byte sequence" and the row is silently lost — so the cap must stay
+// rune-safe (truncateUTF8 backs off to the previous rune boundary).
 func sanitizeAttribution(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -159,7 +164,12 @@ func sanitizeAttribution(s string) string {
 	}, s)
 	cleaned = strings.TrimSpace(cleaned)
 	if len(cleaned) > maxAttributionLen {
-		cleaned = cleaned[:maxAttributionLen]
+		cleaned = truncateUTF8(cleaned, maxAttributionLen)
+	}
+	if !utf8.ValidString(cleaned) {
+		// Defensive: control stripping cannot split runes, but never store
+		// invalid UTF-8 (Postgres text columns reject it).
+		cleaned = strings.ToValidUTF8(cleaned, "")
 	}
 	return cleaned
 }

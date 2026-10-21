@@ -133,3 +133,56 @@ func TestRotateNotFoundOrRevoked(t *testing.T) {
 		t.Fatal("rotating a revoked key must fail")
 	}
 }
+
+// SECURITY: the post-rotation grace window must honor key expiry — an
+// expired key's OLD secret previously kept authenticating via
+// previous_hash, resurrecting credentials past their expiry.
+func TestGraceWindowHonorsExpiry(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	s := NewStore(database)
+
+	k, _ := s.Create("expired-grace")
+	past := time.Now().Add(-time.Hour)
+	if err := s.SetExpiresAt(k.ID, &past); err != nil {
+		t.Fatal(err)
+	}
+	_, newSecret, err := s.Rotate(k.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Old secret: grace window must NOT resurrect an expired key.
+	if _, ok := s.Verify(k.Key); ok {
+		t.Fatal("expired key's old secret must not authenticate via grace window")
+	}
+	// New secret: also rejected — the key is expired.
+	if _, ok := s.Verify(newSecret); ok {
+		t.Fatal("expired key's new secret must not authenticate")
+	}
+}
+
+// Control for the above: a NON-expired key's old secret still works in the
+// grace window (zero-downtime rotation contract preserved).
+func TestGraceWindowStillWorksForUnexpiredKey(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	s := NewStore(database)
+
+	k, _ := s.Create("live-grace")
+	future := time.Now().Add(24 * time.Hour)
+	if err := s.SetExpiresAt(k.ID, &future); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Rotate(k.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Verify(k.Key); !ok {
+		t.Fatal("unexpired key's old secret should still verify in grace window")
+	}
+}

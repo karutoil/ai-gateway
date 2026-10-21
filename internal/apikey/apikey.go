@@ -409,7 +409,10 @@ func (s *Store) verifyPreviousHash(raw string) (*models.GatewayKey, bool) {
 	hash := Hash(raw)
 	var id string
 	var rotatedAt sql.NullTime
-	err := s.db.QueryRow(db.Q(`SELECT id, rotated_at FROM gateway_keys WHERE previous_hash = ? AND revoked_at IS NULL`), hash).Scan(&id, &rotatedAt)
+	// SECURITY: expiry is enforced here exactly as in the primary lookup —
+	// previously an expired key's OLD secret kept authenticating through the
+	// rotation grace window, resurrecting credentials past their expiry.
+	err := s.db.QueryRow(db.Q(`SELECT id, rotated_at FROM gateway_keys WHERE previous_hash = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`), hash, time.Now().UTC()).Scan(&id, &rotatedAt)
 	if err != nil {
 		return nil, false
 	}

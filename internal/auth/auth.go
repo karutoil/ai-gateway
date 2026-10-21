@@ -50,9 +50,10 @@ func MakeToken(secret []byte, subject string) (string, error) {
 	return MakeTokenWithOrg(secret, subject, "", "admin")
 }
 
-// MakeTokenWithOrg mints a dashboard JWT. role MUST be a non-empty valid role
-// and version is the user's current token_version used for revocation; pass
-// -1 to omit the claim only for pre-migration compatibility paths (tests).
+// MakeTokenWithOrg mints a dashboard JWT. role MUST be a non-empty valid role.
+// Tokens minted this way carry token_version 0 (no revocation claim); use
+// MakeTokenFull — the canonical entry point — to embed the user's current
+// token_version for revocation on credential/role changes.
 func MakeTokenWithOrg(secret []byte, subject, orgID, role string) (string, error) {
 	return MakeTokenFull(secret, subject, orgID, role, 0)
 }
@@ -169,7 +170,10 @@ func adminMiddleware(secret []byte, checker SessionChecker) func(http.Handler) h
 					return
 				}
 				username, role, err := patIdentity(userID)
-				if err != nil {
+				if err != nil || username == "" || !ValidTokenRoles[role] {
+					// Fail closed: an unresolvable identity, or a role outside the
+					// allowlist (e.g. legacy/garbage DB roles), must never reach
+					// handlers — previously any string flowed into the role context.
 					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 					return
 				}

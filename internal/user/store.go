@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-gateway/internal/auth"
@@ -35,14 +36,16 @@ const MinPasswordLen = 8
 func IsValidRole(r string) bool { _, ok := ValidRoles[Role(strings.ToLower(r))]; return ok }
 func NormalizeRole(r string) Role {
 	r = strings.ToLower(strings.TrimSpace(r))
-	// Fail closed: unknown/empty roles normalize to least privilege.
+	// Fail closed: unknown/empty roles normalize to least privilege. Unknown
+	// roles previously mapped to member (which carries write permissions) —
+	// the opposite of the documented fail-closed intent.
 	if r == "" {
 		return RoleReadonly
 	}
 	if IsValidRole(r) {
 		return Role(r)
 	}
-	return RoleMember
+	return RoleReadonly
 }
 
 type DashboardUser struct {
@@ -460,19 +463,41 @@ func (s *Store) ClearPermission(userID, permission string) error {
 	return err
 }
 
+// dummyHash is burned on failed user lookups so an unknown username costs
+// the same bcrypt work as a known one. Without it, response time is a
+// username-enumeration oracle (fast 401 for missing users, ~50ms for real
+// ones).
+var (
+	dummyHashOnce sync.Once
+	dummyHash     string
+)
+
+func burnDummyBcrypt(pw string) {
+	dummyHashOnce.Do(func() { dummyHash = auth.HashPassword("timing-equalizer-dummy") })
+	_ = auth.VerifyPasswordHash(dummyHash, pw)
+}
+
 func (s *Store) VerifyPassword(username, password string) (*DashboardUser, bool) {
 	u, hash, err := s.GetByUsername(username)
-	if err != nil || u.Disabled {
+	if err != nil || u == nil {
+		// Timing equalizer: compare against a fixed dummy hash so unknown
+		// and disabled users take the same bcrypt path as real ones.
+		burnDummyBcrypt(password)
 		return nil, false
 	}
-	if auth.VerifyPasswordHash(hash, password) {
-		// Transparent upgrade from legacy unsalted SHA-256 to bcrypt.
-		if auth.NeedsRehash(hash) {
-			_ = s.UpgradePasswordHash(u.ID, password)
-		}
-		return u, true
+	valid := auth.VerifyPasswordHash(hash, password)
+	if u.Disabled {
+		// Disabled accounts still burn the comparison, then fail closed.
+		return nil, false
 	}
-	return nil, false
+	if !valid {
+		return nil, false
+	}
+	// Transparent upgrade from legacy unsalted SHA-256 to bcrypt.
+	if auth.NeedsRehash(hash) {
+		_ = s.UpgradePasswordHash(u.ID, password)
+	}
+	return u, true
 }
 
 // UpgradePasswordHash rewrites a legacy hash in place WITHOUT bumping

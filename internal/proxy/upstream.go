@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // TimeoutsConfig centralizes every deadline governing an upstream exchange.
@@ -434,4 +435,31 @@ func jsonEscape(s string) string {
 	}
 	// json.Marshal returns the quoted form; strip the surrounding quotes.
 	return string(b[1 : len(b)-1])
+}
+
+// truncateUTF8 caps s to max bytes without splitting a UTF-8 rune: a cut
+// landing inside a multi-byte sequence backs off to the previous rune
+// boundary. Byte-blind caps (s[:n]) can produce invalid UTF-8, which breaks
+// JSON strings relayed to clients and — for attribution values — fails the
+// whole request_logs INSERT on Postgres (invalid byte sequence for a text
+// column), silently dropping the row.
+func truncateUTF8(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	// Walk whole runes while the byte budget allows. A byte-blind cut can
+	// land either on a continuation byte OR on a lead byte whose sequence
+	// continues past the cap — both split a rune.
+	end := 0
+	for _, r := range s {
+		size := utf8.RuneLen(r)
+		if size < 0 || end+size > max {
+			break
+		}
+		end += size
+	}
+	return s[:end]
 }

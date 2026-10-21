@@ -965,7 +965,8 @@ func isOpencodeTarget(targetURL string) bool {
 }
 
 // errSnippet condenses an upstream error body to a single short log-safe
-// string: control characters stripped, capped to 200 bytes.
+// string: control characters stripped, capped to 200 bytes on a rune
+// boundary (never splitting a multi-byte sequence).
 func errSnippet(b []byte) string {
 	s := strings.Map(func(r rune) rune {
 		if r < 0x20 && r != '\t' {
@@ -973,10 +974,7 @@ func errSnippet(b []byte) string {
 		}
 		return r
 	}, strings.TrimSpace(string(b)))
-	if len(s) > 200 {
-		s = s[:200]
-	}
-	return s
+	return truncateUTF8(s, 200)
 }
 
 // deleteResponsesKey removes a top-level key from a Responses API body,
@@ -1229,6 +1227,11 @@ type attemptOutcome struct {
 	// (e.g. new-api "invalid_request" for JSON type mismatches). The terminal
 	// path relays the upstream body + status instead of the generic envelope.
 	clientCaused bool
+	// clientBody: the FULL bounded (≤1 MiB) upstream error body when
+	// clientCaused — the relay path must hand the client the upstream's
+	// complete JSON verdict, not a 2 KiB snippet truncated mid-string
+	// (which parsed as broken JSON on any larger error body).
+	clientBody string
 	// errText: transport-level error string (Client.Do failure). Empty when
 	// the upstream answered with a status.
 	errText string
@@ -1517,14 +1520,15 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if len(retryBody) > 0 {
 				lastErrSnippet = retryBody
 				if len(lastErrSnippet) > 2048 {
-					lastErrSnippet = lastErrSnippet[:2048]
+					lastErrSnippet = []byte(truncateUTF8(string(retryBody), 2048))
 				}
 			}
 			if clientCaused {
 				// Relay the upstream's invalid_request verdict as-is: the
 				// client needs the message, not a retryable-looking 500
-				// after pointless backoff.
-				return attemptOutcome{committed: false, status: status, retriable: false, errSnippet: string(lastErrSnippet), clientCaused: true}
+				// after pointless backoff. clientBody carries the complete
+				// bounded error body (errSnippet stays 2 KiB for logs).
+				return attemptOutcome{committed: false, status: status, retriable: false, errSnippet: string(lastErrSnippet), clientBody: string(retryBody), clientCaused: true}
 			}
 			if h.shouldRetryAttempt(retry, attempt, retryableCode(status), opts, endpoint) {
 				sleepCtx(ctx, retryAfterDelay(retryHdr, retry.Backoff(attempt)))
@@ -1927,27 +1931,40 @@ func retryableCode(status int) int {
 
 // injectStreamUsage adds stream_options.include_usage to an OpenAI-style
 // streaming body when absent and configured. Failures fall back silently.
+//
+// The edit is a raw-JSON splice (map[string]json.RawMessage), NOT an
+// interface{} round-trip: re-encoding through interface{} coerces every
+// number to float64 and silently corrupts integer literals above 2^53
+// (seed is spec'd up to 2^63-1; see replaceModelInBody for the same class).
 func injectStreamUsage(body []byte) ([]byte, bool) {
-	var m map[string]interface{}
-	if json.Unmarshal(body, &m) != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
 		return body, false
 	}
-	if m["stream"] != true {
+	if string(bytes.TrimSpace(top["stream"])) != "true" {
 		return body, false
 	}
-	so, ok := m["stream_options"].(map[string]interface{})
-	switch {
-	case !ok:
-		m["stream_options"] = map[string]interface{}{"include_usage": true}
-	default:
-		if v, exists := so["include_usage"]; exists {
-			if b, isBool := v.(bool); isBool && b {
+	if raw, ok := top["stream_options"]; ok {
+		var so map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &so); err != nil || so == nil {
+			// Absent-able/nil or non-object stream_options: set the whole
+			// object (previous behavior clobbered it too).
+			top["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+		} else {
+			if string(bytes.TrimSpace(so["include_usage"])) == "true" {
 				return body, false
 			}
+			so["include_usage"] = json.RawMessage(`true`)
+			nb, err := json.Marshal(so)
+			if err != nil {
+				return body, false
+			}
+			top["stream_options"] = nb
 		}
-		so["include_usage"] = true
+	} else {
+		top["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 	}
-	out, err := json.Marshal(m)
+	out, err := json.Marshal(top)
 	if err != nil {
 		return body, false
 	}
@@ -2796,12 +2813,40 @@ func chatToResponsesJSON(body []byte, model string) []byte {
 	text := contentToText(msg["content"])
 	usage, _ := chat["usage"].(map[string]interface{})
 	inTok, outTok := 0, 0
+	cacheRead, cacheWrite := 0, 0
+	cachedSubset := 0
 	if usage != nil {
 		if v, ok := usage["prompt_tokens"]; ok {
+			inTok = toInt(v)
+		} else if v, ok := usage["input_tokens"]; ok {
 			inTok = toInt(v)
 		}
 		if v, ok := usage["completion_tokens"]; ok {
 			outTok = toInt(v)
+		} else if v, ok := usage["output_tokens"]; ok {
+			outTok = toInt(v)
+		}
+		// Cache passthrough (both families): anthropic cache_read/
+		// cache_creation are ADDITIVE to input_tokens; OpenAI's
+		// prompt_tokens_details.cached_tokens is a SUBSET of prompt_tokens.
+		// The old translation dropped both, so the caller's re-extract of
+		// usage under-billed anthropic cached turns and re-priced OpenAI
+		// cached tokens at the fresh input rate.
+		if v, ok := usage["cache_read_input_tokens"]; ok {
+			cacheRead = toInt(v)
+		}
+		if v, ok := usage["cache_creation_input_tokens"]; ok {
+			cacheWrite = toInt(v)
+		}
+		for _, dk := range []string{"prompt_tokens_details", "input_tokens_details"} {
+			if pd, ok := usage[dk].(map[string]interface{}); ok {
+				if v, ok := pd["cached_tokens"]; ok {
+					if n := toInt(v); n > 0 {
+						cachedSubset = n
+						break
+					}
+				}
+			}
 		}
 	}
 	id, _ := chat["id"].(string)
@@ -2860,6 +2905,24 @@ func chatToResponsesJSON(body []byte, model string) []byte {
 			})
 		}
 	}
+	// Responses usage carries both cache families through so billing stays
+	// cache-aware: anthropic flat fields (additive to input_tokens) and the
+	// OpenAI *_tokens_details.cached_tokens subset. extractUsage folds the
+	// anthropic pair onto input; cacheSplitFromUsage prices them separately.
+	usageOut := map[string]interface{}{
+		"input_tokens":  inTok,
+		"output_tokens": outTok,
+		"total_tokens":  inTok + cacheRead + cacheWrite + outTok,
+	}
+	if cacheRead > 0 {
+		usageOut["cache_read_input_tokens"] = cacheRead
+	}
+	if cacheWrite > 0 {
+		usageOut["cache_creation_input_tokens"] = cacheWrite
+	}
+	if cachedSubset > 0 {
+		usageOut["input_tokens_details"] = map[string]interface{}{"cached_tokens": cachedSubset}
+	}
 	respObj := map[string]interface{}{
 		"id":          id,
 		"object":      "response",
@@ -2868,11 +2931,7 @@ func chatToResponsesJSON(body []byte, model string) []byte {
 		"model":       model,
 		"output":      output,
 		"output_text": text,
-		"usage": map[string]interface{}{
-			"input_tokens":  inTok,
-			"output_tokens": outTok,
-			"total_tokens":  inTok + outTok,
-		},
+		"usage":       usageOut,
 	}
 	if incompleteReason != "" {
 		// Spec-required truncation detail (max_output_tokens / content_filter)
@@ -3215,20 +3274,52 @@ func anthropicToOpenAIChatResponse(body []byte, model string) []byte {
 		return nil
 	}
 	var text string
+	// tool_use blocks must become chat tool_calls entries: dropping them
+	// (the old behavior) relayed a content:"" / finish:"stop" response for a
+	// turn in which the model invoked a tool — chat and /v1/responses agents
+	// could never see the invocation and their loops died silently.
+	var toolCalls []map[string]interface{}
 	for _, c := range contentArr {
-		if cm, ok := c.(map[string]interface{}); ok {
-			if cm["type"] == "text" {
-				if txt, ok := cm["text"].(string); ok {
-					text += txt
-				}
-			} else if cm["type"] == "thinking" {
-				// skip thinking
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch cm["type"] {
+		case "text":
+			if txt, ok := cm["text"].(string); ok {
+				text += txt
 			}
+		case "thinking":
+			// skip thinking
+		case "tool_use":
+			name, _ := cm["name"].(string)
+			id, _ := cm["id"].(string)
+			args := "{}"
+			switch in := cm["input"].(type) {
+			case string:
+				if in != "" {
+					args = in
+				}
+			case nil:
+				// no input → arguments "{}"
+			default:
+				if b, err := json.Marshal(in); err == nil && string(b) != "null" {
+					args = string(b)
+				}
+			}
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"id":   id,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": args,
+				},
+			})
 		}
 	}
 	usage, _ := anth["usage"].(map[string]interface{})
-	promptTokens := 0
-	completionTokens := 0
+	promptTokens, completionTokens := 0, 0
+	cacheRead, cacheWrite := 0, 0
 	if usage != nil {
 		if v, ok := usage["input_tokens"]; ok {
 			promptTokens = toInt(v)
@@ -3236,12 +3327,43 @@ func anthropicToOpenAIChatResponse(body []byte, model string) []byte {
 		if v, ok := usage["output_tokens"]; ok {
 			completionTokens = toInt(v)
 		}
+		if v, ok := usage["cache_read_input_tokens"]; ok {
+			cacheRead = toInt(v)
+		}
+		if v, ok := usage["cache_creation_input_tokens"]; ok {
+			cacheWrite = toInt(v)
+		}
+	}
+	// Anthropic prompt-cache tokens bill SEPARATELY from input_tokens (they
+	// are siblings, not a subset). The old translation dropped them, so the
+	// caller's re-extract of usage from the converted body under-billed every
+	// cached-prompt turn on the translated path. Carry the anthropic-family
+	// field names through: extractUsage folds them onto prompt exactly as it
+	// does for the raw anthropic body, and cacheSplitFromBody takes the
+	// additive branch (Fresh = input, cache split preserved) for pricing.
+	usageOut := map[string]interface{}{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + cacheRead + cacheWrite + completionTokens,
+	}
+	if cacheRead > 0 {
+		usageOut["cache_read_input_tokens"] = cacheRead
+	}
+	if cacheWrite > 0 {
+		usageOut["cache_creation_input_tokens"] = cacheWrite
 	}
 	id, _ := anth["id"].(string)
 	if id == "" {
 		id = "chatcmpl-" + uuid.NewString()[:8]
 	}
 	finish := mapStopReason(anth["stop_reason"])
+	message := map[string]interface{}{
+		"role":    "assistant",
+		"content": text,
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
 	openAIResp := map[string]interface{}{
 		"id":      id,
 		"object":  "chat.completion",
@@ -3249,31 +3371,30 @@ func anthropicToOpenAIChatResponse(body []byte, model string) []byte {
 		"model":   model,
 		"choices": []map[string]interface{}{
 			{
-				"index": 0,
-				"message": map[string]interface{}{
-					"role":    "assistant",
-					"content": text,
-				},
+				"index":         0,
+				"message":       message,
 				"finish_reason": finish,
 			},
 		},
-		"usage": map[string]interface{}{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
-		},
+		"usage": usageOut,
 	}
 	out, _ := json.Marshal(openAIResp)
 	return out
 }
 
 // mapStopReason translates an Anthropic stop_reason value into the OpenAI
-// finish_reason vocabulary. max_tokens → "length"; end_turn/stop_sequence and
-// anything unrecognized → "stop".
+// finish_reason vocabulary. max_tokens → "length"; tool_use → "tool_calls"
+// (a tool-invoking turn reported as "stop" makes agents treat the turn as
+// complete and discard the tool calls); refusal → "content_filter";
+// end_turn/stop_sequence and anything unrecognized → "stop".
 func mapStopReason(v interface{}) string {
 	switch s, _ := v.(string); s {
-	case "max_tokens":
+	case "max_tokens", "max_output_tokens":
 		return "length"
+	case "tool_use":
+		return "tool_calls"
+	case "refusal":
+		return "content_filter"
 	default:
 		return "stop"
 	}
@@ -3304,6 +3425,7 @@ func anthropicToOpenAICompletion(body []byte, model string) []byte {
 		}
 	}
 	promptTokens, completionTokens := 0, 0
+	cacheRead, cacheWrite := 0, 0
 	if usage, _ := anth["usage"].(map[string]interface{}); usage != nil {
 		if v, ok := usage["input_tokens"]; ok {
 			promptTokens = toInt(v)
@@ -3311,6 +3433,26 @@ func anthropicToOpenAICompletion(body []byte, model string) []byte {
 		if v, ok := usage["output_tokens"]; ok {
 			completionTokens = toInt(v)
 		}
+		if v, ok := usage["cache_read_input_tokens"]; ok {
+			cacheRead = toInt(v)
+		}
+		if v, ok := usage["cache_creation_input_tokens"]; ok {
+			cacheWrite = toInt(v)
+		}
+	}
+	// Same cache-token passthrough as anthropicToOpenAIChatResponse: the
+	// anthropic family's cache fields bill separately from input_tokens and
+	// were previously dropped here, under-billing translated turns.
+	usageOut := map[string]interface{}{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + cacheRead + cacheWrite + completionTokens,
+	}
+	if cacheRead > 0 {
+		usageOut["cache_read_input_tokens"] = cacheRead
+	}
+	if cacheWrite > 0 {
+		usageOut["cache_creation_input_tokens"] = cacheWrite
 	}
 	id, _ := anth["id"].(string)
 	if id == "" {
@@ -3328,11 +3470,7 @@ func anthropicToOpenAICompletion(body []byte, model string) []byte {
 				"finish_reason": mapStopReason(anth["stop_reason"]),
 			},
 		},
-		"usage": map[string]interface{}{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
-		},
+		"usage": usageOut,
 	}
 	out, _ := json.Marshal(resp)
 	return out
@@ -4022,11 +4160,18 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	if !out.committed {
 		// Client-caused upstream 5xx: relay the upstream's verdict (the
 		// generic "upstream unavailable" envelope would misclassify a
-		// deterministic client error as a provider health issue).
-		if out.clientCaused && out.errSnippet != "" {
+		// deterministic client error as a provider health issue). clientBody
+		// carries the complete error JSON; the 2 KiB errSnippet is only a
+		// log sample (truncating the client relay mid-string handed clients
+		// unparseable JSON for >2 KiB error bodies).
+		if out.clientCaused && (out.clientBody != "" || out.errSnippet != "") {
+			relay := out.clientBody
+			if relay == "" {
+				relay = out.errSnippet
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(outboundStatus(out.status))
-			_, _ = w.Write([]byte(out.errSnippet))
+			_, _ = w.Write([]byte(relay))
 			return
 		}
 		// Pre-commit terminal failure: write an explicit error instead of
@@ -5089,11 +5234,16 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	if !out.committed {
 		// Client-caused upstream 5xx (invalid_request / convert_request_failed
 		// semantics): relay the upstream's verdict instead of the generic
-		// retryable-looking envelope.
-		if out.clientCaused && out.errSnippet != "" {
+		// retryable-looking envelope. clientBody is the complete error JSON;
+		// the 2 KiB errSnippet is only a log sample.
+		if out.clientCaused && (out.clientBody != "" || out.errSnippet != "") {
+			relay := out.clientBody
+			if relay == "" {
+				relay = out.errSnippet
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(outboundStatus(out.status))
-			_, _ = w.Write([]byte(out.errSnippet))
+			_, _ = w.Write([]byte(relay))
 			return
 		}
 		// Pre-commit terminal failure (e.g. upstream answered 200 with an

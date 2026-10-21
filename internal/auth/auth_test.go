@@ -64,3 +64,49 @@ func TestAdminMiddlewareRejectsBadToken(t *testing.T) {
 		t.Fatalf("status %d", rec.Code)
 	}
 }
+
+// SECURITY: the PAT authentication path must fail closed when the wired
+// identity resolver returns a role outside the allowlist (or an empty
+// username) — previously any string flowed into the role context.
+func TestAdminMiddlewarePATRejectsInvalidRole(t *testing.T) {
+	SetPATAuthenticator(
+		func(raw string) (string, string, bool) { return "user-1", "", true },
+		func(userID string) (string, string, error) { return "legacyuser", "superuser", nil },
+	)
+	t.Cleanup(func() { SetPATAuthenticator(nil, nil) })
+
+	h := AdminMiddleware([]byte("test-jwt-secret-which-is-long-enough"))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/anything", nil)
+	req.Header.Set("Authorization", "Bearer gwp_sometokenvalue")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatalf("PAT with non-allowlisted role must be rejected, got %d", rec.Code)
+	}
+}
+
+func TestAdminMiddlewarePATValidRolePasses(t *testing.T) {
+	SetPATAuthenticator(
+		func(raw string) (string, string, bool) { return "user-1", "logs:read", true },
+		func(userID string) (string, string, error) { return "alice", "member", nil },
+	)
+	t.Cleanup(func() { SetPATAuthenticator(nil, nil) })
+
+	var gotRole, gotSubject, gotScopes string
+	h := AdminMiddleware([]byte("test-jwt-secret-which-is-long-enough"))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRole, gotSubject, gotScopes = GetRole(r), GetSubject(r), PATScopes(r)
+		w.WriteHeader(200)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/anything", nil)
+	req.Header.Set("Authorization", "Bearer gwp_anothertokenvalue")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("valid PAT must pass, got %d", rec.Code)
+	}
+	if gotRole != "member" || gotSubject != "alice" || gotScopes != "logs:read" {
+		t.Fatalf("context wrong: role=%q subject=%q scopes=%q", gotRole, gotSubject, gotScopes)
+	}
+}

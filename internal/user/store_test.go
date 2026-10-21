@@ -3,6 +3,7 @@ package user
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
@@ -93,5 +94,74 @@ func TestTokenVersionRevocation(t *testing.T) {
 	}
 	if _, exists := s.TokenVersionFor(u.Username); exists {
 		t.Fatal("disabled users must fail session validation")
+	}
+}
+
+// SECURITY: unknown roles must normalize to least privilege. Previously an
+// unknown role string mapped to member (which carries write permissions) —
+// the opposite of fail-closed.
+func TestNormalizeRoleFailsClosed(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Role
+	}{
+		{"", RoleReadonly},
+		{"guest", RoleReadonly},
+		{"SUPERUSER", RoleReadonly},
+		{"admin", RoleAdmin},
+		{"ADMIN", RoleAdmin},
+		{"  Support ", RoleSupport},
+		{"member", RoleMember},
+		{"readonly", RoleReadonly},
+	}
+	for _, c := range cases {
+		if got := NormalizeRole(c.in); got != c.want {
+			t.Errorf("NormalizeRole(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// SECURITY: VerifyPassword must burn comparable bcrypt work for unknown
+// usernames as for known ones — response time was a username-enumeration
+// oracle (instant fail for missing users, ~50ms for real ones).
+func TestVerifyPasswordTimingEqualizer(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewStore(database)
+	if _, err := s.Create("realuser", "real-password-1", "member", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if _, ok := s.VerifyPassword("realuser", "wrong-password"); ok {
+		t.Fatal("wrong password must fail")
+	}
+	knownDur := time.Since(start)
+
+	start = time.Now()
+	if _, ok := s.VerifyPassword("ghost-user", "wrong-password"); ok {
+		t.Fatal("unknown user must fail")
+	}
+	unknownDur := time.Since(start)
+
+	if unknownDur < 5*time.Millisecond {
+		t.Fatalf("unknown-user path too fast (%v) — enumeration oracle", unknownDur)
+	}
+	if unknownDur < knownDur/4 {
+		t.Fatalf("unknown-user path (%v) far cheaper than known-user path (%v) — enumeration oracle", unknownDur, knownDur)
+	}
+
+	// Disabled users fail closed (and still burn the comparison).
+	du, err := s.Create("disableduser", "password-123", "member", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDisabled(du.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.VerifyPassword("disableduser", "password-123"); ok {
+		t.Fatal("disabled user must not authenticate even with correct password")
 	}
 }

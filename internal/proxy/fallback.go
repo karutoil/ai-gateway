@@ -686,10 +686,11 @@ func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request
 	terminalError(status, "all provider attempts failed")
 }
 
-// truncateDetail bounds upstream error text for structured logs.
+// truncateDetail bounds upstream error text for structured logs. The cut is
+// rune-safe: a byte-blind split can emit invalid UTF-8 into log fields.
 func truncateDetail(s string) string {
 	if len(s) > 512 {
-		return s[:512] + "…"
+		return truncateUTF8(s, 512) + "…"
 	}
 	return s
 }

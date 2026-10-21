@@ -69,8 +69,18 @@ func (h *Handler) proxyDevin(w http.ResponseWriter, r *http.Request, chatBody []
 		return
 	}
 
-	userJWT, chatBase, err := devin.GetUserJWT(sessionToken, devinEndpoints(p)[0], h.clientOrDefault())
-	if err != nil {
+	// The auth exchange follows the same endpoint fallback as chat traffic:
+	// a dead custom mirror must not fail the request when the built-in host
+	// is reachable.
+	var userJWT, chatBase string
+	for _, base := range devinEndpoints(p) {
+		jwt, customBase, err := devin.GetUserJWT(sessionToken, base, h.clientOrDefault())
+		if err == nil {
+			userJWT, chatBase = jwt, customBase
+			break
+		}
+	}
+	if userJWT == "" {
 		httperr.Write(w, http.StatusBadGateway, "devin authentication failed — reconnect in Providers", httperr.TypeProxy)
 		h.logRequestExtended(ctx, keyPrefix, p.ID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
 		return
@@ -394,12 +404,13 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 	finishLen := false
 
 	var staging []byte
+	var readErr error
 	buf := make([]byte, 32<<10)
 	for {
 		if r.Context().Err() != nil {
 			break
 		}
-		n, readErr := resp.Body.Read(buf)
+		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			staging = append(staging, buf[:n]...)
 		}
@@ -450,9 +461,19 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 				}
 			}
 		}
-		if readErr != nil {
+		if rerr != nil {
+			readErr = rerr
 			break
 		}
+	}
+	if readErr != nil && readErr != io.EOF && r.Context().Err() == nil {
+		// The upstream died mid-stream after headers flowed. Emit the
+		// in-band error terminator (clients would otherwise hang waiting
+		// for frames that never arrive) and record the 502 row — without
+		// this the truncated exchange was logged as a successful 200.
+		writeSSEUpstreamError(w, false, "Devin stream error: upstream connection failed: "+readErr.Error())
+		h.logDevinTrailer(r.Context(), model, wire, chatIn, "chat.completions", keyPrefix, providerID, start, true, "read: "+readErr.Error())
+		return
 	}
 	for _, tc := range tools.FinalRawCalls() {
 		args := tc.ArgsJSON
@@ -492,14 +513,18 @@ func (h *Handler) serveDevinBuffered(ctx context.Context, w http.ResponseWriter,
 }
 
 // collectDevinDeltas drains framed deltas; the first trailer error wins.
+// Read and frame-decode failures are returned as error strings too: callers
+// otherwise render them as a successful EMPTY completion (200 with no
+// content), hiding upstream transport failures from clients and request
+// history.
 func collectDevinDeltas(body io.Reader) ([]devin.Delta, string) {
 	raw, err := io.ReadAll(io.LimitReader(body, 8<<20))
 	if err != nil {
-		return nil, ""
+		return nil, "upstream read failed: " + err.Error()
 	}
 	frames, _, err := devin.ParseFrames(raw)
 	if err != nil {
-		return nil, ""
+		return nil, "malformed upstream frame: " + err.Error()
 	}
 	var out []devin.Delta
 	for _, fr := range frames {

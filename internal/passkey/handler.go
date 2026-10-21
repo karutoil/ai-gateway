@@ -1,6 +1,7 @@
 package passkey
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -16,7 +17,9 @@ import (
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/user"
 
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
@@ -226,24 +229,23 @@ func (h *Handler) BeginLogin(w http.ResponseWriter, r *http.Request) {
 	if username != "" {
 		u, _, err := h.UserStore.GetByUsername(username)
 		if err != nil {
-			// Anti-enumeration: unknown usernames get the SAME discoverable-
-			// login options shape as a real begin (never a 404 oracle). The
-			// stored session belongs to no user, so FinishLogin always fails.
-			options, session, derr := h.WebAuthn.BeginDiscoverableLogin()
-			if derr != nil {
-				http.Error(w, `{"error":"failed to begin login"}`, http.StatusInternalServerError)
-				return
-			}
-			sessionID := "decoy:" + time.Now().Format(time.RFC3339Nano)
-			h.sessions.Store(sessionID, sessionEntry{Data: *session, UserID: "", ExpiresAt: time.Now().Add(5 * time.Minute)})
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"options": options, "session": sessionID})
+			// Anti-enumeration: unknown usernames get a DECOY ceremony whose
+			// response is shape-identical to a real begin (options structure,
+			// allowCredentials cardinality, random challenge, same session-ID
+			// format). The stored session belongs to no user, so FinishLogin
+			// always fails closed. A plain discoverable ceremony here would
+			// leak the username's existence: real begins carry allowCredentials,
+			// discoverable ones never do.
+			h.decoyBeginLogin(w)
 			return
 		}
 		waUser, _ := h.loadWebAuthnUser(u.ID)
 		options, session, err := h.WebAuthn.BeginLogin(waUser)
-		if err != nil {
-			http.Error(w, `{"error":"failed to begin login"}`, http.StatusInternalServerError)
+		// Users with no enrolled credentials (or any begin failure) get the
+		// same decoy — previously this returned a 500, a direct existence
+		// oracle.
+		if err != nil || len(waUser.Creds) == 0 {
+			h.decoyBeginLogin(w)
 			return
 		}
 		sessionID := u.ID + ":" + time.Now().Format(time.RFC3339Nano)
@@ -258,6 +260,41 @@ func (h *Handler) BeginLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionID := "discoverable:" + time.Now().Format(time.RFC3339Nano)
+	h.sessions.Store(sessionID, sessionEntry{Data: *session, UserID: "", ExpiresAt: time.Now().Add(5 * time.Minute)})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"options": options, "session": sessionID})
+}
+
+// decoyBeginLogin writes a login-begin response that is shape-identical to
+// a real one for a user with a single passkey: a synthetic WebAuthn user
+// carrying one random credential gets a genuine random-challenge ceremony.
+// The session is stored under a UUID-shaped id (same format as real user
+// ids) with an empty UserID, so any finish attempt fails closed with the
+// same 401 "auth failed" as a bad credential — and the decoy session id is
+// indistinguishable from a real one. An attacker cannot answer the random
+// challenge without the (nonexistent) private key.
+func (h *Handler) decoyBeginLogin(w http.ResponseWriter) {
+	fakeID := make([]byte, 32)
+	pub := make([]byte, 65) // P-256 point length; only the shape matters
+	_, _ = rand.Read(fakeID)
+	_, _ = rand.Read(pub)
+	fake := WebAuthnUser{
+		DashboardUser: &user.DashboardUser{ID: "decoy", Username: "decoy", Role: user.RoleReadonly},
+		Creds: []webauthn.Credential{{
+			ID:              fakeID,
+			PublicKey:       pub,
+			AttestationType: "none",
+			Transport:       []protocol.AuthenticatorTransport{protocol.Internal},
+		}},
+	}
+	options, session, err := h.WebAuthn.BeginLogin(fake)
+	if err != nil {
+		// Unreachable for a well-formed synthetic user; still fail 5xx-shape
+		// like a real begin failure would.
+		http.Error(w, `{"error":"failed to begin login"}`, http.StatusInternalServerError)
+		return
+	}
+	sessionID := uuid.NewString() + ":" + time.Now().Format(time.RFC3339Nano)
 	h.sessions.Store(sessionID, sessionEntry{Data: *session, UserID: "", ExpiresAt: time.Now().Add(5 * time.Minute)})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"options": options, "session": sessionID})
@@ -404,7 +441,10 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 
 	waUser, err := h.loadWebAuthnUser(entry.UserID)
 	if err != nil {
-		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+		// SECURITY: decoy sessions (empty UserID) and deleted users must fail
+		// with the SAME response as a bad credential — a 404 "user not found"
+		// here was an oracle distinguishing decoys from real sessions.
+		http.Error(w, `{"error":"auth failed"}`, http.StatusUnauthorized)
 		return
 	}
 	if waUser.DashboardUser != nil && waUser.DashboardUser.Disabled {
@@ -487,8 +527,13 @@ func (h *Handler) GenerateRecovery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
 		return
 	}
-	if targetID != "" && role != "admin" {
-		if u, _, err := h.UserStore.GetByUsername(subject); err == nil && u.ID != targetID {
+	// SECURITY: self-or-admin, fail closed. A subject that cannot be
+	// resolved (deleted user, unauthenticated caller) must NOT slip past this
+	// check: the previous guard only forbade when the lookup SUCCEEDED and
+	// mismatched, so an unresolved caller could regenerate recovery codes for
+	// ANY user_id and take the account over via VerifyRecovery.
+	if role != "admin" {
+		if ownID := h.ownUserID(subject); ownID == "" || ownID != targetID {
 			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 			return
 		}
@@ -514,8 +559,10 @@ func (h *Handler) DisablePasskey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
 		return
 	}
-	if targetID != "" && role != "admin" {
-		if u, _, err := h.UserStore.GetByUsername(subject); err == nil && u.ID != targetID {
+	// SECURITY: self-or-admin, fail closed (same rationale as
+	// GenerateRecovery — an unresolved subject must never reach the write).
+	if role != "admin" {
+		if ownID := h.ownUserID(subject); ownID == "" || ownID != targetID {
 			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 			return
 		}

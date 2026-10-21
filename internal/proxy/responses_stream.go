@@ -461,13 +461,20 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 
 // forceStreamTrue injects "stream":true into a JSON request body, overriding
 // whatever the translator carried (both dialects honor the boolean field).
+// The edit is a raw-JSON splice (map[string]json.RawMessage), NOT an
+// interface{} round-trip: re-encoding through interface{} coerces numbers to
+// float64 and corrupts integer literals above 2^53 (seed is spec'd up to
+// 2^63-1) — the same defect class replaceModelInBody documents.
 func forceStreamTrue(body []byte) ([]byte, bool) {
-	var m map[string]interface{}
-	if json.Unmarshal(body, &m) != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
 		return body, false
 	}
-	m["stream"] = true
-	out, err := json.Marshal(m)
+	if string(bytes.TrimSpace(top["stream"])) == "true" {
+		return body, false // already streaming: no rewrite needed
+	}
+	top["stream"] = json.RawMessage(`true`)
+	out, err := json.Marshal(top)
 	if err != nil {
 		return body, false
 	}

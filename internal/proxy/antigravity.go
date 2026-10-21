@@ -18,6 +18,7 @@ import (
 	"ai-gateway/internal/translate"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 // isAntigravity reports whether a provider speaks the Cloud Code Assist wire protocol.
@@ -79,9 +80,6 @@ func antigravityCost(publicID string, prompt, completion int) float64 {
 func (h *Handler) proxyAntigravity(w http.ResponseWriter, r *http.Request, originalBody, chatBody []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, p *models.Provider) {
 	publicID := antigravityPublicID(model, p)
 	effort := antigravityEffort(chatBody)
-	if pinned := strings.TrimSpace(os.Getenv("ANTIGRAVITY_RUNTIME_MODEL")); pinned != "" {
-		_ = pinned
-	}
 	runtime := antigravity.ResolveRuntime(publicID, effort)
 	if pinned := strings.TrimSpace(os.Getenv("ANTIGRAVITY_RUNTIME_MODEL")); pinned != "" {
 		runtime = pinned
@@ -466,11 +464,54 @@ func collectAntigravityChunks(resp *http.Response) ([]antigravity.ParsedChunk, e
 	return out, sc.Err()
 }
 
+// antigravityChunkErrorMessage returns the scrubbed in-band error message of
+// one parsed chunk, or "" when the chunk is not an upstream error frame.
+// Antigravity reports failures mid-SSE as data frames under a 200 status;
+// dropping them (the old behavior) turned upstream errors into silently
+// truncated successful responses.
+func antigravityChunkErrorMessage(c antigravity.ParsedChunk) string {
+	if !strings.HasPrefix(c.Finish, "error:") {
+		return ""
+	}
+	msg := ScrubSecrets(strings.TrimSpace(strings.TrimPrefix(c.Finish, "error:")))
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	return msg
+}
+
+// firstAntigravityStreamError returns the first in-band upstream error
+// message carried by parsed chunks, if any.
+func firstAntigravityStreamError(chunks []antigravity.ParsedChunk) string {
+	for _, c := range chunks {
+		if msg := antigravityChunkErrorMessage(c); msg != "" {
+			return msg
+		}
+	}
+	return ""
+}
+
+// logAntigravityStreamFailure records an upstream failure that surfaced
+// with or after the response body: a 502 row in request history plus a
+// structured server log, mirroring logDevinTrailer. Without it the failure
+// is invisible — the HTTP status is already (or would have been) 200.
+func (h *Handler) logAntigravityStreamFailure(ctx context.Context, keyPrefix, providerID, model, endpoint string, start time.Time, isStream bool, trailer string) {
+	h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+	log.Warn().Str("provider", providerID).Str("model", model).Str("endpoint", endpoint).
+		Bool("stream", isStream).Str("trailer", trailer).Msg("antigravity upstream stream error")
+}
+
 func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Request, resp *http.Response, model, publicID, runtime, keyPrefix string, start time.Time, providerID string, isStream bool) {
 	if !isStream {
 		chunks, err := collectAntigravityChunks(resp)
 		if err != nil {
 			httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
+			h.logAntigravityStreamFailure(r.Context(), keyPrefix, providerID, model, "chat.completions", start, false, "read: "+err.Error())
+			return
+		}
+		if msg := firstAntigravityStreamError(chunks); msg != "" {
+			httperr.Proxy(w, http.StatusBadGateway, "Antigravity stream error: "+msg)
+			h.logAntigravityStreamFailure(r.Context(), keyPrefix, providerID, model, "chat.completions", start, false, msg)
 			return
 		}
 		body, _, prompt, completion, total, finish := antigravity.NonStreamOpenAI(model, chunks)
@@ -502,7 +543,24 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		st.WriteChunk(antigravity.ParseChunk(strings.TrimPrefix(line, "data:")))
+		c := antigravity.ParseChunk(strings.TrimPrefix(line, "data:"))
+		if msg := antigravityChunkErrorMessage(c); msg != "" {
+			// Headers already flowed: terminate in-band and record the 502
+			// row — the old path dropped the frame and logged a successful
+			// truncated stream.
+			writeSSEUpstreamError(w, false, "Antigravity stream error: "+msg)
+			h.logAntigravityStreamFailure(r.Context(), keyPrefix, providerID, model, "chat.completions", start, true, msg)
+			return
+		}
+		st.WriteChunk(c)
+	}
+	if err := sc.Err(); err != nil && r.Context().Err() == nil {
+		// Upstream died mid-stream (reset / truncated chunked body): emit
+		// the in-band terminator so clients don't hang, and log the 502 row
+		// instead of a silent 200.
+		writeSSEUpstreamError(w, false, "Antigravity stream error: upstream connection failed: "+err.Error())
+		h.logAntigravityStreamFailure(r.Context(), keyPrefix, providerID, model, "chat.completions", start, true, "read: "+err.Error())
+		return
 	}
 	st.Close()
 	cost := antigravityCost(publicID, st.prompt, st.completion)
@@ -661,6 +719,7 @@ func (h *Handler) serveAntigravityAsAnthropic(w http.ResponseWriter, r *http.Req
 	chunks, err := collectAntigravityChunks(resp)
 	if err != nil {
 		httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
+		h.logAntigravityStreamFailure(r.Context(), keyPrefix, providerID, model, "messages", start, isStream, "read: "+err.Error())
 		return
 	}
 	h.serveChunksAsAnthropic(r.Context(), w, chunks, model, "messages", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
@@ -676,6 +735,12 @@ func antigravityCostFor(publicID string) func(prompt, completion int) float64 {
 // serveChunksAsAnthropic renders normalized chunks in the Anthropic messages
 // dialect. Shared by OAuth transports; costFn maps usage to USD.
 func (h *Handler) serveChunksAsAnthropic(ctx context.Context, w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
+	if msg := firstAntigravityStreamError(chunks); msg != "" {
+		// Nothing written yet: a plain 502 beats a silently truncated 200.
+		httperr.Proxy(w, http.StatusBadGateway, "Antigravity stream error: "+msg)
+		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		return
+	}
 	var texts []string
 	var toolCalls []antigravity.ParsedToolCall
 	prompt, completion := 0, 0
@@ -752,6 +817,7 @@ func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Req
 	chunks, err := collectAntigravityChunks(resp)
 	if err != nil {
 		httperr.Proxy(w, http.StatusBadGateway, "antigravity stream read failed")
+		h.logAntigravityStreamFailure(r.Context(), keyPrefix, providerID, model, "responses", start, isStream, "read: "+err.Error())
 		return
 	}
 	h.serveChunksAsResponses(r.Context(), w, chunks, model, "responses", antigravityCostFor(publicID), keyPrefix, providerID, start, isStream)
@@ -760,6 +826,12 @@ func (h *Handler) serveAntigravityAsResponses(w http.ResponseWriter, r *http.Req
 // serveChunksAsResponses renders normalized chunks in the OpenAI Responses
 // dialect. Shared by OAuth transports; costFn maps usage to USD.
 func (h *Handler) serveChunksAsResponses(ctx context.Context, w http.ResponseWriter, chunks []antigravity.ParsedChunk, model, endpoint string, costFn func(prompt, completion int) float64, keyPrefix, providerID string, start time.Time, isStream bool) {
+	if msg := firstAntigravityStreamError(chunks); msg != "" {
+		// Nothing written yet: a plain 502 beats a silently truncated 200.
+		httperr.Proxy(w, http.StatusBadGateway, "Antigravity stream error: "+msg)
+		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, isStream)
+		return
+	}
 	var texts []string
 	var toolCalls []antigravity.ParsedToolCall
 	prompt, completion := 0, 0

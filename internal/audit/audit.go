@@ -138,11 +138,11 @@ func LogFromRequest(rec Recorder, r *http.Request, targetID, meta string) {
 	if rec == nil || !ShouldAudit(r) {
 		return
 	}
-	actor := r.Header.Get("X-Actor")
-	if actor == "" {
-		actor = "admin"
-	}
-	_ = rec.Log(actor, strings.ToLower(r.Method), targetFromPath(r.URL.Path), targetID, meta)
+	// SECURITY: actor attribution must come from VERIFIED request context
+	// only (see actorFor). The previous version trusted the client-settable
+	// X-Actor header and defaulted to "admin" — any caller could forge the
+	// audit trail and pin its writes on an administrator.
+	_ = rec.Log(actorFor(r), strings.ToLower(r.Method), targetFromPath(r.URL.Path), targetID, meta)
 }
 
 // Wire is an alias for Middleware for callers that prefer Wire(rec) naming.
