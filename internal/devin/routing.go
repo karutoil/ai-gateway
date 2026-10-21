@@ -14,7 +14,10 @@ import (
 // row claims source "enriched". Instead discovery collapses variants to a
 // single base row carrying the observed levels, and the proxy routes an
 // explicit reasoning_effort back to the suffixed wire id (mirroring the
-// Antigravity collapseRuntime/ResolveRuntime pattern).
+// Antigravity collapseRuntime/ResolveRuntime pattern). When the base id
+// itself was never observed on the wire, the collapsed row also carries a
+// catch-all route so no-effort requests never emit a bare id the backend
+// rejects.
 
 // canonicalLevelRank orders observed levels low→high for stable storage.
 var canonicalLevelRank = map[string]int{
@@ -101,21 +104,42 @@ func CollapseReasoningVariant(id string) string {
 // (legacy suffix convention). A non-nil but empty routing means the server
 // declared no routable levels: the id passes through verbatim rather than
 // inventing a suffixed uid. Unknown effort tokens leave the id untouched.
+//
+// The catch-all route (defaultRouteKey) covers families whose base id was
+// never observed on the wire: no-effort and unrouted-effort requests fall
+// back to it instead of sending a bare id the backend rejects.
 func ResolveRuntime(model, effort string, routing map[string]string) string {
 	m := strings.TrimSpace(StripPrefix(model))
 	if m == "" {
 		return m
 	}
 	base := CollapseReasoningVariant(m)
+	_, _, suffixed := SplitReasoningSuffix(m)
+	defaultUID := func() string {
+		if routing == nil {
+			return ""
+		}
+		return strings.TrimSpace(routing[defaultRouteKey])
+	}
 	switch e := strings.ToLower(strings.TrimSpace(effort)); e {
 	case "":
+		if suffixed {
+			return m
+		}
+		if uid := defaultUID(); uid != "" {
+			return uid
+		}
 		return m
 	case "off", "none", "disabled":
 		if routing != nil {
 			if uid, ok := routing["off"]; ok && strings.TrimSpace(uid) != "" {
 				return uid
 			}
-			return base
+			// Stripping to the base only helps when the base itself is a
+			// wire id; the catch-all member is the safe target otherwise.
+			if uid := defaultUID(); uid != "" {
+				return uid
+			}
 		}
 		return base
 	default:
@@ -127,10 +151,35 @@ func ResolveRuntime(model, effort string, routing map[string]string) string {
 			if uid, ok := routing[tok]; ok && strings.TrimSpace(uid) != "" {
 				return uid
 			}
+			if !suffixed {
+				if uid := defaultUID(); uid != "" {
+					return uid
+				}
+			}
 			return m
 		}
 		return base + "-" + tok
 	}
+}
+
+// defaultRouteKey names the catch-all entry in a collapsed group's routing
+// map: the wire uid sent when the client asks for no effort, or for an
+// effort/off the family does not route, on a base id that was never observed
+// as a wire uid itself (e.g. swe-2 -> swe-2-medium/swe-2-high/swe-2-max; the
+// backend rejects the bare id). Groups with a live bare member never carry
+// this key — bare ids stay verbatim for them.
+const defaultRouteKey = "default"
+
+// pickDefaultUID selects the catch-all wire uid for a suffix-collapsed group
+// with no server-declared default member and no bare member: the lightest
+// observed tier (levels are rank-sorted ascending), matching the
+// least-surprise posture of the Antigravity tables, where unspecified effort
+// lands on the model's cheapest runtime.
+func pickDefaultUID(base string, levels []string) string {
+	if len(levels) == 0 {
+		return ""
+	}
+	return base + "-" + levels[0]
 }
 
 // CollapsedModel is one base model with the union of its observed reasoning
@@ -149,6 +198,8 @@ type CollapsedModel struct {
 	// it (family lanes) or variants were observed on the wire (suffix map).
 	// Nil selects the legacy "<base>-<level>" suffix convention; a non-nil
 	// but empty map means no routable levels — pass ids through verbatim.
+	// Suffix-collapsed groups whose base id was never observed as a wire uid
+	// carry a catch-all under defaultRouteKey.
 	Routing map[string]string
 	// Costs are per-million-token rates parsed from cost dimensions.
 	InputCost, OutputCost, CacheReadCost float64
@@ -294,11 +345,11 @@ func collectLane(lanes map[string]*laneAccum, order *[]string, m DiscoveredModel
 }
 
 // laneLevels returns the lane's routable effort levels in canonical order
-// (excluding the "off" route, which is not a reasoning level).
+// (excluding the "off" and catch-all routes, which are not reasoning levels).
 func laneLevels(routing map[string]string) []string {
 	var out []string
 	for lv := range routing {
-		if lv == "off" {
+		if lv == "off" || lv == defaultRouteKey {
 			continue
 		}
 		out = append(out, lv)
@@ -348,6 +399,8 @@ func CollapseModels(raw []DiscoveredModel) []CollapsedModel {
 	type accum struct {
 		rep      DiscoveredModel
 		hasRep   bool
+		hasBare  bool
+		defUID   string
 		bareName string
 		ctx, max int
 		image    bool
@@ -393,8 +446,14 @@ func CollapseModels(raw []DiscoveredModel) []CollapsedModel {
 		}
 		if !suffixed {
 			a.rep, a.hasRep, a.bareName = m, true, m.Name
+			a.hasBare = true
 		} else if !a.hasRep {
 			a.rep, a.hasRep = m, true
+		}
+		// A suffixed member the server flagged as its family default is the
+		// best catch-all when the bare base never shows up on the wire.
+		if suffixed && m.DefaultInFamily && a.defUID == "" {
+			a.defUID = m.ID
 		}
 		if m.ContextWindow > a.ctx {
 			a.ctx = m.ContextWindow
@@ -441,6 +500,20 @@ func CollapseModels(raw []DiscoveredModel) []CollapsedModel {
 			routing = map[string]string{}
 		} else {
 			routing = suffixRouting(base, levels)
+			// The base id never showed up on the wire (suffix-only family,
+			// e.g. swe-2): requests with no effort, or an effort this group
+			// cannot route, must land on a real member instead of a bare id
+			// the backend rejects. Prefer the server-declared default, else
+			// the lightest observed tier.
+			if !a.hasBare {
+				uid := a.defUID
+				if uid == "" {
+					uid = pickDefaultUID(base, levels)
+				}
+				if uid != "" {
+					routing[defaultRouteKey] = uid
+				}
+			}
 		}
 		ctx, max := a.ctx, a.max
 		if ctx <= 0 {
