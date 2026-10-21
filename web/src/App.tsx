@@ -678,7 +678,8 @@ function LoginScreen({ theme, toggle, login, loginWithToken, notice, onNoticeCon
               <>
                 <Input placeholder="Username" value={username} onChange={e=>setUsername(e.target.value)} autoComplete="username" />
                 <Input placeholder="Recovery code (XXXX-XXXX-XXXX-XXXX)" value={recoveryCode}
-                  onChange={e=>setRecoveryCode(e.target.value)} className="font-mono" />
+                  onChange={e=>setRecoveryCode(e.target.value)} className="font-mono"
+                  onKeyDown={e=>{ if(e.key==='Enter') doRecovery() }} />
                 <ErrorNote message={err} />
                 <Button variant="primary" size="lg" disabled={busy} onClick={doRecovery} className="w-full">
                   {busy ? 'Verifying…' : 'Verify recovery code'}

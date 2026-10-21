@@ -515,7 +515,11 @@ export default function Logs(){
     if (filters.end_user) p.end_user = filters.end_user
     if (filters.app) p.app = filters.app
     if (sortKey !== 'created_at') p.order = sortKey
-    if (sortKey !== 'created_at' && sortDir === 'asc') p.dir = 'asc'
+    // dir must be sent for ascending sorts on ANY column: the server honors
+    // dir with its default (created_at) column too, and gating it on
+    // sortKey !== 'created_at' meant the Time header's asc toggle was dropped
+    // (the request always came back newest-first).
+    if (sortDir === 'asc') p.dir = 'asc'
     if (filters.min_latency_ms) p.min_latency_ms = Number(filters.min_latency_ms)
     if (filters.max_latency_ms) p.max_latency_ms = Number(filters.max_latency_ms)
     return p
@@ -590,17 +594,29 @@ export default function Logs(){
 
   const fetchDetail = async (id:string)=>{
     try{
-      const res = await fetch(`/api/logs/${id}`, { credentials: 'same-origin' })
+      const res = await fetch(`/api/logs/${encodeURIComponent(id)}`, { credentials: 'same-origin' })
       if(res.ok) return await res.json()
+      if(res.status === 401) window.dispatchEvent(new CustomEvent('gw:unauthorized'))
     }catch{}
     return null
   }
 
+  // Monotonic request id: an out-of-order detail response (slow fetch for a
+  // previously clicked row, or a response landing after the modal closed)
+  // must never overwrite the detail of the row now selected.
+  const detailReq = useRef(0)
+  const closeDetail = () => {
+    detailReq.current++
+    setSelected(null)
+    setDetail(null)
+  }
   const handleRowClick = async (l:any)=>{
+    const req = ++detailReq.current
     setSelected(l)
     setDetail(null)
     setLoadingDetail(true)
     const d = await fetchDetail(l.id)
+    if (req !== detailReq.current) return
     setDetail(d || { log: l })
     setLoadingDetail(false)
   }
@@ -970,7 +986,7 @@ export default function Logs(){
       {/* Request detail modal */}
       <Modal
         open={selected!=null}
-        onClose={()=>{ setSelected(null); setDetail(null) }}
+        onClose={closeDetail}
         width="max-w-3xl"
         title={`Request ${selected ? selected.id.slice(0,8) : ''}`}
       >
@@ -995,7 +1011,7 @@ export default function Logs(){
         </div>
         <div className="flex justify-end gap-2 mt-5 pt-4 border-t border-stone">
           <CopyButton size="md" value={rawJson} label="Copy JSON"/>
-          <Button variant="secondary" onClick={()=>{setSelected(null); setDetail(null)}}>Close</Button>
+          <Button variant="secondary" onClick={closeDetail}>Close</Button>
         </div>
       </Modal>
 

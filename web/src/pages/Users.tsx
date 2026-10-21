@@ -302,8 +302,8 @@ export default function Users(){
                     ) : (
                       <button
                         className="inline-flex items-center gap-1.5 hover:text-accent transition-colors focus:outline-none"
-                        title={`${u.key_count ?? 0} key(s) assigned \u2014 click to view in API Keys`}
-                        onClick={() => navigate(`/keys?key_id=${u.id}`)}
+                        title={`${u.key_count ?? 0} key(s) assigned \u2014 open the API Keys page`}
+                        onClick={() => navigate('/keys')}
                       >
                         <Icon name="key" size={13} className={(u.key_count ?? 0) > 0 ? 'text-accent' : 'text-muted/40'} />
                         <span className="tabular-nums text-xs">{u.key_count ?? 0}</span>

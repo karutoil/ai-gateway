@@ -10,6 +10,7 @@
  */
 import { useMemo, useState } from 'react'
 import { Badge, Button, Icon, Progress } from '../../../components/ui'
+import { copyToClipboard } from '../../../lib/clipboard'
 import { fmtBytes, fmtTime, mediaErrorMessage, pct, splitFences } from '../../../lib/playground/format'
 import type { Attachment, Msg, RenderKind, VideoState } from '../../../lib/playground/types'
 import { modeOf } from '../constants'
@@ -193,7 +194,10 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
       <div className="flex items-center justify-between px-2.5 py-1 border-b border-cream/10">
         <span className="font-mono text-[10px] text-cream/50">{lang || 'code'}</span>
         <button
-          onClick={() => navigator.clipboard?.writeText(code).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200) }, () => {})}
+          // copyToClipboard carries the execCommand fallback for non-secure
+          // contexts; the raw `navigator.clipboard?.writeText(...).then(...)`
+          // pattern throws a TypeError on plain-HTTP self-hosted gateways.
+          onClick={() => { void copyToClipboard(code).then(ok => { if (ok) { setCopied(true); setTimeout(() => setCopied(false), 1200) } }) }}
           className="font-mono text-[10px] text-cream/50 hover:text-cream/90 transition-colors inline-flex items-center gap-1">
           <Icon name={copied ? 'check' : 'copy'} size={10} /> {copied ? 'copied' : 'copy'}
         </button>

@@ -3,6 +3,7 @@
  * and the per-conversation call history.
  */
 import { Badge, Button, Icon, useToast } from '../../components/ui'
+import { copyToClipboard } from '../../lib/clipboard'
 import { fmtBytes, fmtTime } from '../../lib/playground/format'
 import { extractUsageFromObject } from '../../lib/playground/protocol'
 import type { Call, Session } from '../../lib/playground/types'
@@ -37,8 +38,11 @@ export function Inspector({ tab, setTab, data, running, session, onClose, onPick
     { id: 'history', label: `History${calls.length ? ` (${calls.length})` : ''}` },
   ]
 
-  const copy = (v: any) => navigator.clipboard?.writeText(JSON.stringify(v, null, 2))
-    .then(() => toast.success('Copied JSON'), () => toast.error('Copy failed'))
+  // copyToClipboard carries the execCommand fallback for non-secure contexts;
+  // the raw `navigator.clipboard?.writeText(...).then(...)` pattern throws a
+  // TypeError on plain-HTTP self-hosted gateways.
+  const copy = (v: any) => copyToClipboard(JSON.stringify(v, null, 2))
+    .then(ok => ok ? toast.success('Copied JSON') : toast.error('Copy failed'), () => toast.error('Copy failed'))
 
   return (
     <>

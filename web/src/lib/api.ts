@@ -303,7 +303,7 @@ export const api = {
     create: (data: any) => req('/api/providers', { method:'POST', body: JSON.stringify(data)}),
     update: (id: string, data: { name?: string; base_url?: string; api_key?: string }) =>
       req(`/api/providers/${encodeURIComponent(id)}`, { method:'PUT', body: JSON.stringify(data)}),
-    remove: (id: string) => req(`/api/providers/${id}`, { method:'DELETE'}),
+    remove: (id: string) => req(`/api/providers/${encodeURIComponent(id)}`, { method:'DELETE'}),
     discover: (id: string) => req(`/api/providers/${id}/discover`, { method:'POST'}),
   },
   oauth: {
@@ -458,7 +458,7 @@ export const api = {
   },
   webhooks: {
     list: () => req('/api/webhooks'),
-    create: (data: { name: string; url: string; events?: string; secret?: string; enabled?: boolean }) =>
+    create: (data: { name: string; url: string; events?: string; secret?: string; enabled?: boolean; format?: 'json' | 'discord' | 'slack' }) =>
       req('/api/webhooks', { method: 'POST', body: JSON.stringify(data) }),
     update: (id: string, data: Record<string, unknown>) =>
       req(`/api/webhooks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),

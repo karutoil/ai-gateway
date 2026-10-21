@@ -470,9 +470,10 @@ export default function Models({ role = 'admin' }: { role?: string }){
           <div className="mt-3 flex flex-col sm:flex-row flex-wrap gap-2">
             <Input value={newAlias} onChange={e=>setNewAlias(e.target.value)} placeholder="alias" className="sm:w-48"/>
             <Input value={newTarget} onChange={e=>setNewTarget(e.target.value)} placeholder="target model" className="flex-1 min-w-[200px]"/>
-            <Button variant="primary" onClick={async()=>{
+            <Button variant="primary" disabled={!newAlias.trim() || !newTarget.trim()} onClick={async()=>{
+              if(!newAlias.trim() || !newTarget.trim()){ toast.error('alias and target are required'); return }
               try{
-                await api.catalog.createAlias(newAlias, newTarget)
+                await api.catalog.createAlias(newAlias.trim(), newTarget.trim())
                 setNewAlias(''); setNewTarget('')
                 toast.success('Alias added')
                 load()
