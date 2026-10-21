@@ -26,6 +26,28 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ai-gateway-podman.service
 #
+# ── Deploying a new build with minimal downtime ──────────────────────────────
+# `compose up -d --force-recreate` recreates EVERY service in the project,
+# including postgres and redis: podman-compose 1.3.0 ignores --no-deps on that
+# path. A postgres restart costs ~60s of 502s because the gateway blocks on
+# `depends_on: service_healthy`. When only the gateway image changed, swap the
+# container directly instead (stop is ~1s when no long request is in flight):
+#
+#   podman create --name ai-gateway-prod-new \
+#     --label io.podman.compose.project=production \
+#     --label io.podman.compose.service=gateway \
+#     --network production_default --network-alias gateway \
+#     --env-file .env -p 8090:8090 -v $PWD/data:/data \
+#     --restart unless-stopped localhost/ai-gateway:prod
+#   podman stop ai-gateway-prod && podman rename ai-gateway-prod ai-gateway-prod-old
+#   podman rename ai-gateway-prod-new ai-gateway-prod && podman start ai-gateway-prod
+#   podman rm ai-gateway-prod-old
+#
+# Note: podman-compose does not translate `stop_grace_period` into the
+# container's stop timeout (Config.StopTimeout stays at podman's 10s default).
+# Its own stop/restart/down paths pass `-t <stop_grace_period>`, so they drain
+# correctly; a manual `podman stop` does NOT — pass `-t 360` explicitly.
+#
 # Point your Cloudflare Tunnel at http://localhost:8090.
 
 services:
@@ -47,11 +69,19 @@ services:
       REDIS_URL: ${REDIS_URL:-}
 
       # ── Slow-endpoint knobs (invariant above) ──────────────────────────────
-      # Image first-byte budget. Unset in .env -> 300s default stands; set it
-      # explicitly here so `compose config` shows the effective value.
-      IMAGE_TIMEOUT_SECONDS: ${IMAGE_TIMEOUT_SECONDS:-300}
+      # LITERAL values, not ${VAR:-default}. podman-compose 1.3.0 substitutes a
+      # variable only when it is DEFINED (here: in .env, which is gitignored);
+      # for an undefined name it passes the whole "${VAR:-default}" string
+      # through verbatim. The Go parser then cannot read it as an integer and
+      # silently falls back to its own default — 90s for the drain window —
+      # which is BELOW the 300s image budget and breaks the invariant above.
+      # That is exactly what production was running before this was fixed, and
+      # it is invisible except for the boot WARNING in cmd/gateway/main.go.
+      # Verify after any edit: podman exec ai-gateway-prod printenv SHUTDOWN_GRACE_SECONDS
+      # must print a number, never "${...}".
+      IMAGE_TIMEOUT_SECONDS: 300
       # Drain window: must be >= IMAGE_TIMEOUT_SECONDS (300 + 30s slack).
-      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-330}
+      SHUTDOWN_GRACE_SECONDS: 330
     volumes:
       # Migrated copy of the dev database + auto-generated key files live here.
       - ./data:/data
