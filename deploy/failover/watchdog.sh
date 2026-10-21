@@ -28,16 +28,35 @@ if [[ -z "$PRIMARY_GATEWAY_URL" ]]; then
   PRIMARY_GATEWAY_URL="http://[$PRIMARY_HOST]:8090/health"
 fi
 
+# The timer fires every 30s but a full check round can take up to ~24s
+# (three 8s timeouts). A lock prevents overlapping runs from double-counting
+# failures or promoting twice (split-brain risk).
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+LOCK_FILE="$STATE_DIR/watchdog.lock"
+exec 9>"$LOCK_FILE" || { echo "watchdog: cannot open $LOCK_FILE" >&2; exit 2; }
+flock -n 9 || { echo "watchdog: another instance is running" >&2; exit 0; }
+
+# One-shot marker: auto-promote must fire at most once per outage. Cleared
+# when the primary becomes reachable again (rejoin via failback.sh).
+PROMOTED_FILE="$STATE_DIR/promoted"
+
 fails=0
 if [[ -f "$FAIL_FILE" ]]; then
   fails="$(cat "$FAIL_FILE" 2>/dev/null || echo 0)"
 fi
+# Counter file may be corrupt/truncated — never let it break arithmetic.
+[[ "$fails" =~ ^[0-9]+$ ]] || fails=0
 
 check_ok=true
 if [[ -n "$PRIMARY_DB_HOST" ]]; then
   if pg_isready -h "$PRIMARY_DB_HOST" -p "$PRIMARY_DB_PORT" >/dev/null 2>&1; then
     echo 0 >"$FAIL_FILE"
-    echo "watchdog: primary DB reachable via tunnel"
+    if [[ -f "$PROMOTED_FILE" ]]; then
+      rm -f "$PROMOTED_FILE"
+      echo "watchdog: primary DB reachable via tunnel again (run failback.sh on old primary)"
+    else
+      echo "watchdog: primary DB reachable via tunnel"
+    fi
     exit 0
   fi
   echo "watchdog: primary DB $PRIMARY_DB_HOST:$PRIMARY_DB_PORT unreachable"
@@ -69,12 +88,20 @@ echo "$fails" >"$FAIL_FILE"
 echo "watchdog: failure $fails/$FAIL_THRESHOLD"
 
 if [[ "$fails" -ge "$FAIL_THRESHOLD" ]]; then
+  if [[ -f "$PROMOTED_FILE" ]]; then
+    echo "watchdog: already promoted; waiting for primary recovery (run failback.sh on old primary)"
+    exit 1
+  fi
   if [[ "$AUTO_PROMOTE" == true ]]; then
     echo "watchdog: threshold reached, promoting"
     PROMOTE="$(dirname "$0")/promote.sh"
     [[ -x "$PROMOTE" ]] || PROMOTE="/opt/ai-gateway/deploy/failover/promote.sh"
-    "$PROMOTE" --force
-    echo 0 >"$FAIL_FILE"
+    if "$PROMOTE" --force; then
+      touch "$PROMOTED_FILE"
+      echo 0 >"$FAIL_FILE"
+    else
+      echo "watchdog: promote.sh failed — manual intervention required" >&2
+    fi
   else
     echo "watchdog: threshold reached (manual mode). Run promote.sh on standby."
   fi

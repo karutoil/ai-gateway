@@ -89,8 +89,10 @@ services:
     container_name: ai-gateway-postgres
     ports:
       - "5434:5432"
-    env_file:
-      - .env
+    # NO env_file here on purpose: .env holds every gateway secret
+    # (ADMIN_PASSWORD / MASTER_KEY / JWT_SECRET / provider keys); only
+    # POSTGRES_* values are interpolated below, so nothing else is exposed
+    # inside the container.
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-gateway}
       POSTGRES_DB: ${POSTGRES_DB:-gateway}

@@ -5,7 +5,9 @@ set -euo pipefail
 
 STANDBY="root@2402:1060:21ed:0:be24:11ff:fe5f:6dd1"
 SSH_KEY="$HOME/.ssh/id_ed25519_20260909"
-SSH="ssh -6 -o ConnectTimeout=15 -o StrictHostKeyChecking=no -i $SSH_KEY"
+# accept-new: first connection records the host key; later MITM/key changes
+# are rejected. (-o StrictHostKeyChecking=no would accept ANY key, forever.)
+SSH="ssh -6 -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -i $SSH_KEY"
 
 if [[ ! -f "$SSH_KEY" ]]; then
   echo "Missing $SSH_KEY" >&2

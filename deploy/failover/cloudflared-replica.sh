@@ -11,7 +11,18 @@ set -euo pipefail
 
 STANDBY="root@2402:1060:21ed:0:be24:11ff:fe5f:6dd1"
 SSH_KEY="$HOME/.ssh/id_ed25519_20260909"
-SSH="ssh -6 -o ConnectTimeout=15 -o StrictHostKeyChecking=no -i $SSH_KEY"
+# accept-new: first connection records the host key; later MITM/key changes
+# are rejected. (-o StrictHostKeyChecking=no would accept ANY key, forever.)
+SSH="ssh -6 -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -i $SSH_KEY"
+
+# Pin the cloudflared release (e.g. CLOUDFLARED_VERSION=2025.10.0). The
+# .deb is checksum-verified before dpkg -i; no unverified installs.
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-latest}"
+if [[ "$CLOUDFLARED_VERSION" == "latest" ]]; then
+  REL_URL="https://github.com/cloudflare/cloudflared/releases/latest/download"
+else
+  REL_URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}"
+fi
 
 TOKEN="$(sudo grep -oP '(?<=--token )\S+' /etc/systemd/system/cloudflared.service | head -n 1 || true)"
 if [[ -z "$TOKEN" ]]; then
@@ -21,8 +32,12 @@ fi
 
 # Write token to a protected file via stdin so it never appears in ps output.
 printf '%s' "$TOKEN" | $SSH "$STANDBY" "cat > /etc/ai-gateway/cloudflared-token && chmod 600 /etc/ai-gateway/cloudflared-token &&
-curl -fsSL -o /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb &&
-dpkg -i /tmp/cloudflared.deb && rm -f /tmp/cloudflared.deb &&
+curl -fsSL -o /tmp/cloudflared.deb $REL_URL/cloudflared-linux-amd64.deb &&
+curl -fsSL -o /tmp/cloudflared-checksums.txt $REL_URL/cloudflared-checksums.txt &&
+want=\"\$(awk '\$2 ~ /cloudflared-linux-amd64.deb\$/ {print \$1}' /tmp/cloudflared-checksums.txt | head -n 1)\" &&
+[ -n \"\$want\" ] &&
+echo \"\$want  /tmp/cloudflared.deb\" | sha256sum -c - &&
+dpkg -i /tmp/cloudflared.deb && rm -f /tmp/cloudflared.deb /tmp/cloudflared-checksums.txt &&
 cat >/etc/systemd/system/cloudflared.service <<'UNIT'
 [Unit]
 Description=cloudflared (standby replica)

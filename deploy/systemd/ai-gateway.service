@@ -16,9 +16,6 @@
 [Unit]
 Description=AI Gateway
 Documentation=file:///opt/ai-gateway/README.md
-# Restart cleanly on failure; never on clean exit.
-Restart=on-failure
-RestartSec=2
 # The socket unit provides the listening socket even before we start.
 Requires=ai-gateway.socket
 After=ai-gateway.socket
@@ -26,6 +23,9 @@ After=network.target
 
 [Service]
 Type=simple
+# Restart cleanly on failure; never on clean exit.
+Restart=on-failure
+RestartSec=2
 User=gateway
 Group=gateway
 EnvironmentFile=/etc/ai-gateway.env

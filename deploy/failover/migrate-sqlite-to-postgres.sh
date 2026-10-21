@@ -19,9 +19,9 @@ TS="$(date +%Y%m%d-%H%M%S)"
 BACKUP="backups/sqlite-pre-pg-$TS"
 mkdir -p "$BACKUP"
 echo "Backing up SQLite to $BACKUP"
-cp "$SQLITE_DB" "$BACKUP/gateway.db"
-cp "$SQLITE_DB-wal" "$BACKUP/" 2>/dev/null || true
-cp "$SQLITE_DB-shm" "$BACKUP/" 2>/dev/null || true
+# sqlite3 .backup takes a consistent snapshot (checkpoint + copy under the
+# DB lock). A raw `cp` of db/-wal/-shm can capture a torn state mid-write.
+sqlite3 "$SQLITE_DB" ".backup '$BACKUP/gateway.db'"
 
 echo "Booting gateway once against Postgres to create schema"
 DATABASE_URL="$PG_URL" timeout 60 ./bin/gateway --help >/dev/null 2>&1 || true
@@ -32,7 +32,14 @@ TABLES="providers gateway_keys request_logs models_catalog provider_models model
 mkdir -p "$BACKUP/csv"
 for t in $TABLES; do
   if sqlite3 "$SQLITE_DB" ".tables" | grep -qw "$t"; then
-    sqlite3 "$SQLITE_DB" ".headers on\n.mode csv\n.output $BACKUP/csv/$t.csv\nSELECT * FROM \"$t\";"
+    # NOTE: dot-commands need real newlines; a literal "\\n" inside one
+    # argument is rejected by the sqlite3 CLI.
+    sqlite3 "$SQLITE_DB" <<EOF
+.headers on
+.mode csv
+.output $BACKUP/csv/$t.csv
+SELECT * FROM "$t";
+EOF
     echo "  $t -> $BACKUP/csv/$t.csv"
   else
     echo "  $t missing, skipped"

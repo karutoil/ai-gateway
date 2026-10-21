@@ -202,13 +202,19 @@ download_release() {
     fi
     info "Checksum verified (${got:0:16}...)"
   else
-    warn "checksums.txt not available for this release — skipping verification"
+    if [ "${GATEWAY_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+      warn "checksums.txt not available for this release — continuing WITHOUT verification (GATEWAY_ALLOW_UNVERIFIED=1)"
+    else
+      die "checksums.txt not available for this release — refusing to install an unverified binary (GATEWAY_ALLOW_UNVERIFIED=1 to override)"
+    fi
   fi
   # The tarball may nest files under a versioned directory (CI layout:
   # ai-gateway_<ver>_<os>_<arch>/gateway) or be flat; find the binary either way.
   mkdir -p "${tmp}/extracted"
   tar -xzf "${tmp}/${asset}" -C "${tmp}/extracted"
-  RELEASE_BINARY="$(find "${tmp}/extracted" -type f -name gateway | head -n 1)"
+  # `head` closes the pipe early: under pipefail a SIGPIPE in find would abort
+  # the installer, so guard the pipeline and validate emptiness below.
+  RELEASE_BINARY="$(find "${tmp}/extracted" -type f -name gateway | head -n 1 || true)"
   [ -n "$RELEASE_BINARY" ] || die "tarball does not contain a gateway binary"
   RELEASE_DIR="$(dirname "$RELEASE_BINARY")"
 }
@@ -404,7 +410,7 @@ ENV=${env_mode}
 # HTTP listener port
 PORT=${port}
 
-# Dashboard admin password (${admin_pw})
+# Dashboard admin password
 ADMIN_PASSWORD=${admin_pw}
 
 # 32-byte hex keys used to encrypt stored provider credentials / sign sessions

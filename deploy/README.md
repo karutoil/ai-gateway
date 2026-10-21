@@ -17,7 +17,7 @@ a slow request is allowed to consume. Concretely, with the shipped defaults:
 | --- | --- | --- |
 | `IMAGE_TIMEOUT_SECONDS` | unset / `-1` = **300s** | client first-byte budget for `/v1/images/generations` and `/v1/images/edits`. `0` **disables** the watchdog (documented, and genuinely disabled as of P1-12). |
 | `SHUTDOWN_GRACE_SECONDS` | **90s** (config default) | how long `srv.Shutdown` waits for in-flight requests after SIGTERM. |
-| `stop_grace_period` / `TimeoutStopSec` | 360s / 95s | how long the *supervisor* waits before SIGKILL. Must exceed the drain window. |
+| `stop_grace_period` / `TimeoutStopSec` | 360s / 360s | how long the *supervisor* waits before SIGKILL. Must exceed the drain window. |
 
 **Why.** Image generation legitimately runs 10–60s and is allowed up to 300s.
 On a rolling deploy (or `compose up`, or any container recreate) the supervisor
@@ -38,7 +38,7 @@ closed`. With grace ≥ request duration all three return 200 with full bodies.
 - `docker-compose.yml` sets `SHUTDOWN_GRACE_SECONDS=330` and
   `stop_grace_period: 360s`.
 - `deploy/production/podman-compose.prod.yml` sets the same pair.
-- `deploy/systemd/ai-gateway.service` sets `TimeoutStopSec=95` — raise it
+- `deploy/systemd/ai-gateway.service` sets `TimeoutStopSec=360` — raise it
   together with `SHUTDOWN_GRACE_SECONDS` from `/etc/ai-gateway.env`.
 - `cmd/gateway/main.go` logs a boot-time WARNING when
   `ShutdownGraceSecs < ImageTimeoutSecs` (see §1.1). This is the backstop: a

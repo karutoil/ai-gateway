@@ -9,3 +9,11 @@ EnvironmentFile=-/etc/ai-gateway/watchdog.env
 ExecStart=/opt/ai-gateway/deploy/failover/watchdog.sh
 User=gateway
 Group=gateway
+# Creates /var/lib/ai-gateway (owned by gateway) for the fail counter,
+# lock file and promoted marker — the script must be able to write there.
+StateDirectory=ai-gateway
+# NOTE: no ProtectSystem/NoNewPrivileges here on purpose — with
+# AUTO_PROMOTE=true the script invokes promote.sh, which needs sudo,
+# systemctl and writes to /etc/ai-gateway. Hardening the unit would
+# silently break auto-promote. With AUTO_PROMOTE=false (default) the
+# script only reads /opt and probes the network.
