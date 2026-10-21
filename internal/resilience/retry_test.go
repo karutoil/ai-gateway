@@ -58,3 +58,48 @@ func TestIncBillableRetrySkipFoldsUnknownEndpoints(t *testing.T) {
 	IncBillableRetrySkip("totally-new-endpoint", 500)
 	IncBillableRetrySkip("", 0)
 }
+
+// The attempt budget bounds retry storms: attempt numbering starts at 0, so
+// MaxRetries=N must allow exactly N retries (N+1 upstream attempts total) and
+// nothing past them, regardless of status.
+func TestDefaultRetryPolicyAttemptBudget(t *testing.T) {
+	p := &DefaultRetryPolicy{MaxRetries: 2, BaseDelay: time.Millisecond}
+	for status := range map[int]bool{429: true, 500: true, 503: true, 504: true, 502: true} {
+		for attempt := 0; attempt < p.MaxRetries; attempt++ {
+			if !p.ShouldRetry(attempt, status) {
+				t.Fatalf("ShouldRetry(%d, %d) = false, want true (budget not spent)", attempt, status)
+			}
+		}
+		if p.ShouldRetry(p.MaxRetries, status) {
+			t.Fatalf("ShouldRetry(%d, %d) = true, want false (budget spent)", p.MaxRetries, status)
+		}
+	}
+	// 4xx is never retried (client error semantics).
+	for attempt := 0; attempt < 5; attempt++ {
+		if p.ShouldRetry(attempt, 400) || p.ShouldRetry(attempt, 401) {
+			t.Fatalf("4xx must never be retried (attempt %d)", attempt)
+		}
+	}
+}
+
+// Backoff grows exponentially, is jittered, and stays capped so a storm of
+// retries cannot sleep unboundedly.
+func TestDefaultRetryPolicyBackoffBounds(t *testing.T) {
+	p := &DefaultRetryPolicy{MaxRetries: 5, BaseDelay: 200 * time.Millisecond}
+	lo := time.Duration(float64(p.BaseDelay) * 0.5) // d/2 floor
+	for attempt := 0; attempt < 8; attempt++ {
+		d := p.Backoff(attempt)
+		if d < lo {
+			t.Fatalf("Backoff(%d) = %v below equal-jitter floor %v", attempt, d, lo)
+		}
+		if d > time.Second {
+			t.Fatalf("Backoff(%d) = %v above the 1s cap", attempt, d)
+		}
+		// Advance the floor for later attempts (capped like the delay itself).
+		dCap := float64(p.BaseDelay) * float64(int(1)<<uint(attempt))
+		if dCap > float64(time.Second) {
+			dCap = float64(time.Second)
+		}
+		lo = time.Duration(dCap / 2)
+	}
+}

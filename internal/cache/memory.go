@@ -72,7 +72,7 @@ func (m *MemoryCache) Set(key string, body []byte, status int, headers http.Head
 
 	// Room-making: evict expired entries first (cheap sweep), then LRU tail.
 	for len(m.entries) >= m.maxKeys {
-		if !m.evictExpiredLocked(expires) {
+		if !m.evictExpiredLocked() {
 			break
 		}
 	}
@@ -89,13 +89,18 @@ func (m *MemoryCache) Set(key string, body []byte, status int, headers http.Head
 	m.entries[key] = el
 }
 
-// evictExpiredLocked removes up to one expired entry per call and reports
-// whether any was removed. Sweeping amortizes over Sets without an O(n) pass
-// on every insert.
-func (m *MemoryCache) evictExpiredLocked(before time.Time) bool {
+// evictExpiredLocked removes up to one entry that has already expired (w.r.t.
+// the current time) and reports whether any was removed. Sweeping amortizes
+// over Sets without an O(n) pass on every insert.
+//
+// The previous signature compared each entry against the NEW entry's expiry:
+// with equal TTLs every existing entry expired "before" the incoming one, so
+// the sweep evicted a random map-ordered entry on every insert and the LRU
+// tail eviction below never ran.
+func (m *MemoryCache) evictExpiredLocked() bool {
 	now := time.Now()
 	for k, el := range m.entries {
-		if before.After(el.Value.(*entry).expires) || now.After(el.Value.(*entry).expires) {
+		if now.After(el.Value.(*entry).expires) {
 			m.removeLocked(el)
 			_ = k
 			return true

@@ -366,9 +366,13 @@ func doTokenRequest(ctx context.Context, tokenURL string, form url.Values, httpC
 	if data.RefreshToken == "" && form.Get("grant_type") == "authorization_code" {
 		return nil, fmt.Errorf("no refresh token received — re-authorize with offline access")
 	}
-	exp := time.Now().UnixMilli() + data.ExpiresIn*1000 - 5*60*1000
+	// Store the RAW expiry. The 5-minute refresh skew lives in
+	// Tokens.Expired (single source of truth): subtracting it here as well
+	// made every token refresh 10 minutes early, doubling the refresh
+	// cadence (and the invalid_grant exposure) for short-lived grants.
+	exp := time.Now().UnixMilli() + data.ExpiresIn*1000
 	if data.ExpiresIn <= 0 {
-		exp = time.Now().UnixMilli() + 55*60*1000
+		exp = time.Now().UnixMilli() + 60*60*1000
 	}
 	return &Tokens{Access: data.AccessToken, Refresh: data.RefreshToken, ExpiresAt: exp}, nil
 }

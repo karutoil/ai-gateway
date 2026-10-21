@@ -138,6 +138,27 @@ func (s *Store) EnsureFreshAccess(ctx context.Context, p *models.Provider, httpC
 	if !tok.Expired(time.Now()) && tok.Access != "" {
 		return tok.Access, tok.ProjectID, tok.Email, nil
 	}
+	// Serialize refreshes per provider: N concurrent requests with an
+	// expired token must produce ONE refresh grant. Google-style endpoints
+	// throttle or invalidate parallel refreshes of the same token
+	// (invalid_grant), which previously surfaced as spurious "oauth refresh
+	// failed" health flaps and retry storms.
+	lock := s.refreshLockFor(p.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	// Double-check under the lock: a concurrent caller may have completed
+	// the refresh while we were waiting. Re-read from the DB (the source of
+	// truth) and reuse the fresh token instead of refreshing again.
+	if tok2, defID2, err2 := s.OAuthTokens(p); err2 == nil {
+		if defID2 == defID && !tok2.Expired(time.Now()) && tok2.Access != "" {
+			return tok2.Access, tok2.ProjectID, tok2.Email, nil
+		}
+		// Not fresh (or a different def): at least adopt the freshest
+		// refresh token before refreshing (a rotation may have happened).
+		if tok2.Refresh != "" {
+			tok = tok2
+		}
+	}
 	refreshed, err := oauth.Refresh(ctx, def, tok.Refresh, httpClient)
 	if err != nil {
 		return "", "", "", fmt.Errorf("oauth refresh failed: %w", err)

@@ -108,36 +108,38 @@ func parseDataURI(uri string) (mediaType, data string, isData bool) {
 
 func openAIImageBlockToAnthropic(block map[string]interface{}) map[string]interface{} {
 	// OpenAI: {"type":"image_url","image_url":{"url":"...","detail":"auto"}}
-	if block["type"] == "image_url" {
-		if iu, ok := block["image_url"].(map[string]interface{}); ok {
-			if url, ok := iu["url"].(string); ok && url != "" {
-				if mt, d, ok := parseDataURI(url); ok {
-					return map[string]interface{}{
-						"type": "image",
-						"source": map[string]interface{}{
-							"type":       "base64",
-							"media_type": mt,
-							"data":       d,
-						},
-					}
-				}
-				// non-data URL: anthropic now supports url type, older needs base64
-				// emit url source for forward-compat
+	if block["type"] == "image_url" || block["type"] == "input_image" {
+		var urlStr string
+		switch iu := block["image_url"].(type) {
+		case map[string]interface{}:
+			urlStr, _ = iu["url"].(string)
+		case string:
+			urlStr = iu
+		}
+		if urlStr == "" {
+			// fallback try direct url field
+			urlStr, _ = block["url"].(string)
+		}
+		if urlStr != "" {
+			if mt, d, ok := parseDataURI(urlStr); ok {
 				return map[string]interface{}{
 					"type": "image",
 					"source": map[string]interface{}{
-						"type": "url",
-						"url":  url,
+						"type":       "base64",
+						"media_type": mt,
+						"data":       d,
 					},
 				}
 			}
-		}
-		// fallback try direct url field
-		if url, ok := block["url"].(string); ok {
-			if mt, d, ok := parseDataURI(url); ok {
-				return map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": mt, "data": d}}
+			// non-data URL: anthropic now supports url type, older needs base64
+			// emit url source for forward-compat
+			return map[string]interface{}{
+				"type": "image",
+				"source": map[string]interface{}{
+					"type": "url",
+					"url":  urlStr,
+				},
 			}
-			return map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "url", "url": url}}
 		}
 	}
 	// already anthropic image? keep
@@ -194,7 +196,11 @@ func normalizeOpenAIContentForAnthropic(content interface{}) interface{} {
 				if m["type"] == "input_text" {
 					m["type"] = "text"
 				}
-				if m["type"] == "image_url" || m["type"] == "image" {
+				// image_url (map or string form), input_image (Responses
+				// shape) and already-anthropic image blocks all convert here;
+				// forwarding them verbatim hands strict anthropic upstreams an
+				// unknown part type (400 / silently lost image).
+				if m["type"] == "image_url" || m["type"] == "image" || m["type"] == "input_image" {
 					out = append(out, openAIImageBlockToAnthropic(m))
 					continue
 				}
@@ -208,7 +214,7 @@ func normalizeOpenAIContentForAnthropic(content interface{}) interface{} {
 	}
 	var m map[string]interface{}
 	if json.Unmarshal(b, &m) == nil {
-		if m["type"] == "image_url" || m["type"] == "image" {
+		if m["type"] == "image_url" || m["type"] == "image" || m["type"] == "input_image" {
 			return openAIImageBlockToAnthropic(m)
 		}
 		if m["type"] == "input_text" {
@@ -772,7 +778,7 @@ func convertOpenAIAssistantToAnthropic(m OpenAIMessage) AnthropicMessage {
 		} else if json.Unmarshal(b, &arr) == nil {
 			for _, item := range arr {
 				if mm, ok := item.(map[string]interface{}); ok {
-					if mm["type"] == "image_url" {
+					if mm["type"] == "image_url" || mm["type"] == "input_image" {
 						contentBlocks = append(contentBlocks, openAIImageBlockToAnthropic(mm))
 					} else if mm["type"] == "text" {
 						contentBlocks = append(contentBlocks, mm)

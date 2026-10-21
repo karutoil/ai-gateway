@@ -55,6 +55,10 @@ func cacheKey(key string) string {
 }
 
 func (r *RedisCache) Get(key string) ([]byte, int, http.Header, bool) {
+	if r == nil || r.client == nil {
+		// Redis unavailable/wired-off: degrade to a miss, never panic.
+		return nil, 0, nil, false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()
 	data, err := r.client.Get(ctx, cacheKey(key)).Bytes()
@@ -74,6 +78,9 @@ func (r *RedisCache) Get(key string) ([]byte, int, http.Header, bool) {
 }
 
 func (r *RedisCache) Set(key string, body []byte, status int, headers http.Header, ttlSeconds int) {
+	if r == nil || r.client == nil {
+		return
+	}
 	if ttlSeconds <= 0 {
 		ttlSeconds = 30
 	}
@@ -91,6 +98,9 @@ func (r *RedisCache) Set(key string, body []byte, status int, headers http.Heade
 }
 
 func (r *RedisCache) Invalidate(pattern string) {
+	if r == nil || r.client == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -121,8 +131,8 @@ func (r *RedisCache) Invalidate(pattern string) {
 
 // Close closes the redis client.
 func (r *RedisCache) Close() error {
-	if r.client != nil {
-		return r.client.Close()
+	if r == nil || r.client == nil {
+		return nil
 	}
-	return nil
+	return r.client.Close()
 }

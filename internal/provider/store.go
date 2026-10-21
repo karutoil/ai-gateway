@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,10 +21,34 @@ var rrCounter uint64
 type Store struct {
 	db        *sql.DB
 	masterKey []byte
+
+	// refreshLocks serializes OAuth token refreshes per provider id:
+	// concurrent requests hitting an expired access token must share ONE
+	// refresh grant instead of racing N simultaneous token requests (which
+	// upstreams answer with invalid_grant / throttling).
+	refreshMu    sync.Mutex
+	refreshLocks map[string]*sync.Mutex
 }
 
 func NewStore(db *sql.DB, masterKey []byte) *Store {
-	return &Store{db: db, masterKey: masterKey}
+	return &Store{db: db, masterKey: masterKey, refreshLocks: map[string]*sync.Mutex{}}
+}
+
+// refreshLockFor returns the per-provider refresh mutex, creating it lazily
+// so Stores built before the field existed (or zero-valued in tests) still
+// serialize correctly.
+func (s *Store) refreshLockFor(id string) *sync.Mutex {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if s.refreshLocks == nil {
+		s.refreshLocks = map[string]*sync.Mutex{}
+	}
+	l := s.refreshLocks[id]
+	if l == nil {
+		l = &sync.Mutex{}
+		s.refreshLocks[id] = l
+	}
+	return l
 }
 
 func (s *Store) List() ([]models.Provider, error) {
