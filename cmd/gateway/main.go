@@ -203,6 +203,16 @@ func main() {
 	default:
 		proxyHandler.ImageTTFB = proxy.DefaultImageTTFB
 	}
+	// P1-16: SHUTDOWN_GRACE_SECONDS must cover the slowest request budget, or a
+	// rolling deploy cancels in-flight image generations (502 to the client and
+	// no billing row, because the DB is closed immediately after the drain).
+	// Warn loudly at boot instead of discovering it during a deploy.
+	// (Documented in deploy/README.md §1.1; the compose stacks encode the
+	// invariant — this is the backstop for hand-set env overrides.)
+	if msg := shutdownGraceWarning(cfg.ShutdownGraceSecs, imageBudget(proxyHandler)); msg != "" {
+		log.Warn().Int("shutdown_grace_seconds", cfg.ShutdownGraceSecs).
+			Dur("image_budget", imageBudget(proxyHandler)).Msg(msg)
+	}
 	proxyHandler.LegacyFallback = cfg.RoutingLegacyFallback
 	if cfg.RoutingLegacyFallback {
 		log.Info().Msg("ROUTING_LEGACY_FALLBACK=true: heuristic resolution enabled for bare model names without routing rules")
@@ -715,6 +725,15 @@ func main() {
 		log.Warn().Err(err).Msg("drain window expired; closing remaining connections")
 		_ = srv.Close()
 	}
+	// Drain the env-configured webhook dispatcher: Stop flushes the queued
+	// backlog (each attempt bounded by WebhookTimeout) so audit/key events
+	// emitted just before shutdown are delivered instead of dying with the
+	// worker goroutine. The DB-backed dispatcher (webhook.Global when DB
+	// webhooks are configured) has no backlog — it spawns per-event
+	// deliveries that are best-effort by design.
+	if d, ok := webhook.Global.(*webhook.HTTPDispatcher); ok {
+		d.Stop()
+	}
 	// Tear down MCP client sessions (their stdio child processes included)
 	// before the process exits so no orphan survives a restart.
 	mcpHealthCancel()
@@ -808,6 +827,33 @@ func forwardedHeaders(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// imageBudget resolves the effective first-byte budget for /v1/images/*,
+// or 0 when the watchdog is disabled (no meaningful budget to compare
+// against).
+func imageBudget(p *proxy.Handler) time.Duration {
+	if p.ImageTTFBDisabled {
+		return 0
+	}
+	if p.ImageTTFB == 0 {
+		return proxy.DefaultImageTTFB
+	}
+	return p.ImageTTFB
+}
+
+// shutdownGraceWarning reports the boot-time warning when the graceful-drain
+// window is shorter than the image first-byte budget: a SIGTERM in that window
+// force-cancels in-flight image generations (client sees 502, the request_logs
+// billing row is lost). Empty string means the configuration is fine.
+func shutdownGraceWarning(graceSecs int, budget time.Duration) string {
+	if budget <= 0 {
+		return "" // watchdog disabled: nothing to compare against
+	}
+	if time.Duration(graceSecs)*time.Second >= budget {
+		return ""
+	}
+	return "SHUTDOWN_GRACE_SECONDS is shorter than the image budget: a rolling deploy will cancel in-flight image generations (clients get 502 and the request_logs billing row is lost). Set SHUTDOWN_GRACE_SECONDS >= the image budget and raise the supervisor's stop timeout above it."
 }
 
 // runLogRetention deletes request_logs older than the configured retention

@@ -699,7 +699,12 @@ func TestPathSelectionRefusesUnknownAndUnauthorized(t *testing.T) {
 func TestSSETransportDiscoveryAndCall(t *testing.T) {
 	store, manager, _, _ := newFixture(t)
 	up := mcptest.NewSSE()
-	defer up.Close()
+	// The SSE session deliberately OUTLIVES the request context that
+	// established it (see Manager.connect): close the manager before the
+	// test server, or httptest.Server.Close blocks forever on the session's
+	// still-open event stream. manager.Close is idempotent, so the fixture's
+	// own cleanup is harmless.
+	defer func() { manager.Close(); up.Close() }()
 
 	srv, err := store.Create(ServerInput{Name: "SSE Server", Transport: "sse", URL: up.Server.URL})
 	if err != nil {

@@ -217,24 +217,11 @@ func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker
 					http.Error(w, `{"error":{"message":"invalid gateway api key","type":"authentication_error"}}`, http.StatusUnauthorized)
 					return
 				}
-				// Per-key IP allowlist: empty allows any client; the client IP must
-				// match an entry (exact IP or CIDR range) otherwise.
-				if key.IPAllowlist != "" && !clientIPAllowed(clientIP(r), key.IPAllowlist) {
-					log.Warn().Str("key_prefix", key.Prefix).Str("client_ip", clientIP(r)).Msg("gateway key rejected: IP not allowed")
-					http.Error(w, `{"error":{"message":"client IP not allowed for this key","type":"permission_error"}}`, http.StatusForbidden)
+				// Shared per-key admission policy (IP allowlist + monthly spend
+				// cap) — see AdmitKey. Alternate authentication surfaces (the
+				// unified /mcp endpoint) call the same helper.
+				if !AdmitKey(store, w, r, key) {
 					return
-				}
-				// Monthly spend cap: calendar-month spend for this key must stay
-				// under the configured budget before admitting another request.
-				// The prefix is passed too so spend that never got a key_id
-				// stamped (pre-backfill rows) still counts.
-				if key.MonthlyBudgetUSD > 0 {
-					if spent := store.MonthSpendUSDForPrefix(key.ID, key.Prefix); spent >= key.MonthlyBudgetUSD {
-						log.Warn().Str("key_prefix", key.Prefix).Float64("spent", spent).Float64("budget", key.MonthlyBudgetUSD).Msg("gateway key: monthly budget exceeded")
-						w.Header().Set("Retry-After", secondsUntilNextMonthUTC())
-						http.Error(w, `{"error":{"message":"monthly spend budget exceeded for this key","type":"budget_exceeded"}}`, http.StatusTooManyRequests)
-						return
-					}
 				}
 				attachGatewayKey(next, w, r, key)
 				return
@@ -289,6 +276,42 @@ func SetGatewayKey(r *http.Request, key *models.GatewayKey) *http.Request {
 		r.Header.Set("X-Gateway-Org", *key.OrgID)
 	}
 	return r
+}
+
+// AdmitKey applies the per-key admission policy shared by EVERY authenticated
+// gateway surface: the per-key IP allowlist and the calendar-month spend cap.
+// It writes the rejecting response and returns false when the key must not be
+// admitted; it writes nothing and returns true otherwise.
+//
+// GatewayAuth applies it inline on /v1. Alternate authentication surfaces
+// (the unified /mcp endpoint, which verifies sk-gw keys itself and attaches
+// them via SetGatewayKey) MUST call it after verification: without it, a key
+// restricted by IP or over its monthly budget could shed both controls simply
+// by speaking MCP instead of plain HTTP.
+func AdmitKey(store *apikey.Store, w http.ResponseWriter, r *http.Request, key *models.GatewayKey) bool {
+	// Per-key IP allowlist: empty allows any client; the client IP must
+	// match an entry (exact IP or CIDR range) otherwise. clientIP reads the
+	// direct peer only, so it is spoof-safe: forwardedHeaders (the only place
+	// X-Forwarded-For is honored) runs before routing and rewrites
+	// RemoteAddr to the verified real client IP.
+	if key.IPAllowlist != "" && !clientIPAllowed(clientIP(r), key.IPAllowlist) {
+		log.Warn().Str("key_prefix", key.Prefix).Str("client_ip", clientIP(r)).Msg("gateway key rejected: IP not allowed")
+		http.Error(w, `{"error":{"message":"client IP not allowed for this key","type":"permission_error"}}`, http.StatusForbidden)
+		return false
+	}
+	// Monthly spend cap: calendar-month spend for this key must stay
+	// under the configured budget before admitting another request.
+	// The prefix is passed too so spend that never got a key_id
+	// stamped (pre-backfill rows) still counts.
+	if key.MonthlyBudgetUSD > 0 {
+		if spent := store.MonthSpendUSDForPrefix(key.ID, key.Prefix); spent >= key.MonthlyBudgetUSD {
+			log.Warn().Str("key_prefix", key.Prefix).Float64("spent", spent).Float64("budget", key.MonthlyBudgetUSD).Msg("gateway key: monthly budget exceeded")
+			w.Header().Set("Retry-After", secondsUntilNextMonthUTC())
+			http.Error(w, `{"error":{"message":"monthly spend budget exceeded for this key","type":"budget_exceeded"}}`, http.StatusTooManyRequests)
+			return false
+		}
+	}
+	return true
 }
 
 func attachGatewayKey(next http.Handler, w http.ResponseWriter, r *http.Request, key *models.GatewayKey) {

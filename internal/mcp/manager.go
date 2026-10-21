@@ -37,7 +37,6 @@ type Manager struct {
 
 type serverConn struct {
 	session *sdk.ClientSession
-	client  *sdk.Client
 	cancel  context.CancelFunc
 
 	failures    int
@@ -155,16 +154,60 @@ func (m *Manager) connect(ctx context.Context, srv *Server) (*sdk.ClientSession,
 		return nil, err
 	}
 	client := sdk.NewClient(&sdk.Implementation{Name: "ai-gateway", Version: m.clientVersion()}, nil)
-	connectCtx, cancel := context.WithTimeout(ctx, m.callTimeout)
-	session, err := client.Connect(connectCtx, transport, nil)
-	if err != nil {
-		cancel()
-		return nil, err
+	// The session context owns the connection's lifetime. The legacy SSE
+	// transport ties its long-lived GET stream to the context passed to
+	// Connect (http.NewRequestWithContext in the SDK), so this context must
+	// carry NEITHER the caller's cancellation NOR a deadline:
+	//
+	//   - deriving it from the HTTP request context tore the session down
+	//     when the establishing request finished;
+	//   - the previous WithTimeout(ctx, callTimeout) variant killed every
+	//     SSE session callTimeout seconds after it was established — the
+	//     next tools/list then died with EOF and the outage was blamed on a
+	//     healthy upstream.
+	//
+	// The Streamable and stdio transports detach from / ignore the context,
+	// so this only matters for SSE, but it is applied uniformly. The
+	// handshake stays bounded by the watchdog below, which cancels this
+	// context (aborting an in-flight SSE GET) when Connect does not finish
+	// within callTimeout. The context is cancelled when the session is
+	// replaced or closed.
+	sessionCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	type connectOutcome struct {
+		session *sdk.ClientSession
+		err     error
 	}
-	// The connect context must OUTLIVE this function for the legacy SSE
-	// transport, whose session IS a long-lived GET stream: cancelling on
-	// return tears the stream down and the next tools/list dies with EOF.
-	// It is cancelled instead when the session is replaced or closed.
+	done := make(chan connectOutcome, 1)
+	go func() {
+		session, err := client.Connect(sessionCtx, transport, nil)
+		done <- connectOutcome{session: session, err: err}
+	}()
+	var out connectOutcome
+	watchdog := time.NewTimer(m.callTimeout)
+	defer watchdog.Stop()
+	select {
+	case out = <-done:
+	case <-watchdog.C:
+		cancel() // abort the in-flight handshake
+		// Connect must observe the cancellation and return promptly; if a
+		// transport that ignores the context completes later, close whatever
+		// it produced instead of leaking it.
+		select {
+		case out = <-done:
+		case <-time.After(2 * time.Second):
+			go func() {
+				if late := <-done; late.session != nil {
+					_ = late.session.Close()
+				}
+			}()
+			return nil, fmt.Errorf("mcp connect to server %q timed out after %s", srv.Slug, m.callTimeout)
+		}
+	}
+	if out.err != nil {
+		cancel()
+		return nil, out.err
+	}
+	session := out.session
 	m.mu.Lock()
 	if old := m.conns[srv.ID]; old != nil {
 		if old.cancel != nil {
@@ -172,7 +215,7 @@ func (m *Manager) connect(ctx context.Context, srv *Server) (*sdk.ClientSession,
 		}
 		_ = old.session.Close()
 	}
-	m.conns[srv.ID] = &serverConn{session: session, client: client, cancel: cancel, lastAttempt: time.Now(), failures: 0}
+	m.conns[srv.ID] = &serverConn{session: session, cancel: cancel, lastAttempt: time.Now(), failures: 0}
 	m.mu.Unlock()
 	return session, nil
 }

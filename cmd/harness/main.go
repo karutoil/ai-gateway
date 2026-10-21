@@ -86,7 +86,10 @@ func main() {
 		json.Unmarshal(b, &keys)
 		if len(keys) > 0 {
 			// create a fresh test key for harness (so we don't pollute asd)
-			creq, _ := http.NewRequest("POST", base+"/api/keys", bytes.NewReader([]byte(`{"name":"harness-"`+fmt.Sprint(time.Now().Unix())+`"}'`)))
+			// NOTE: the body must be valid JSON — a stray quote after the closing
+			// brace used to make this request a guaranteed 400, silently falling
+			// through to the plain-name key creation below.
+			creq, _ := http.NewRequest("POST", base+"/api/keys", bytes.NewReader([]byte(`{"name":"harness-"`+fmt.Sprint(time.Now().Unix())+`"}`)))
 			creq.Header.Set("Authorization", "Bearer "+adminToken)
 			creq.Header.Set("Content-Type", "application/json")
 			resp2, err := http.DefaultClient.Do(creq)

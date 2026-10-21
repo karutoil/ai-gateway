@@ -155,7 +155,11 @@ func main() {
 	must("Admin login", testAdminLogin)
 	must("Ensure provider ckff-muse exists", ensureProvider)
 	must("Ensure gateway key", ensureGatewayKey)
-	fmt.Printf("\nGateway key: %s...\n", gatewayKey[:14])
+	keyPrefix := gatewayKey
+	if len(keyPrefix) > 14 {
+		keyPrefix = keyPrefix[:14] // only the prefix is ever printed
+	}
+	fmt.Printf("\nGateway key: %s...\n", keyPrefix)
 	must("Verify model in catalog", testCatalog)
 	must("Verify model in provider_models", testProviderModel)
 

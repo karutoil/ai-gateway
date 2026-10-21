@@ -66,6 +66,13 @@ func (e *Endpoint) Auth(next http.Handler) http.Handler {
 			writeMCPAuthError(w, http.StatusUnauthorized, "invalid gateway api key")
 			return
 		}
+		// Same per-key admission policy the /v1 chain enforces (IP allowlist,
+		// monthly spend cap): without this a key restricted by IP or over its
+		// budget could shed both controls by speaking MCP instead of plain
+		// HTTP. Admission failures answer with the same envelopes /v1 uses.
+		if !middleware.AdmitKey(e.APIKeys, w, r, key) {
+			return
+		}
 		r = middleware.SetGatewayKey(r, key)
 		next.ServeHTTP(w, r)
 	})
