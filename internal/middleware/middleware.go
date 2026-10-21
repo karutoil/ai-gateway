@@ -97,18 +97,37 @@ func RequestID(next http.Handler) http.Handler {
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status  int
-	written int64
+	status    int
+	written   int64
+	cache     string // X-Cache disposition set by the proxy handler
+	cacheSeen bool
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
+	r.captureCache()
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// captureCache records the X-Cache disposition the proxy stamped on the
+// response. Called at WriteHeader and again from Write (for handlers that
+// write a body without an explicit WriteHeader, where the header map is
+// already final by the time we can observe it) so the accessor log line
+// carries the same value the client received.
+func (r *statusRecorder) captureCache() {
+	if r.cacheSeen {
+		return
+	}
+	if v := r.Header().Get("X-Cache"); v != "" {
+		r.cache = v
+		r.cacheSeen = true
+	}
 }
 
 func (r *statusRecorder) Write(b []byte) (int, error) {
 	if r.status == 0 {
 		r.status = 200
+		r.captureCache()
 	}
 	n, err := r.ResponseWriter.Write(b)
 	r.written += int64(n)
@@ -148,7 +167,24 @@ func Logger(next http.Handler) http.Handler {
 		}
 		prefix := SafePrefix(r)
 		_ = RedactHeaders(r.Header)
-		evt.Str("method", r.Method).Str("path", r.URL.Path).Int("status", status).Str("req_id", r.Header.Get("X-Request-ID")).Str("key_prefix", prefix).Int64("bytes", rec.written).Msg("request")
+		evt = evt.Str("method", r.Method).Str("path", r.URL.Path).Int("status", status).Str("req_id", r.Header.Get("X-Request-ID")).Str("key_prefix", prefix).Int64("bytes", rec.written)
+		// Cache section: the exact-match response cache's disposition for
+		// this request, mirroring request_logs.cache_status. "hit" means the
+		// body came from the gateway cache with no upstream call, so a run
+		// of hit lines against real traffic is the signal that upstream is
+		// being avoided; a run of "bypass" explains why it is not (stream
+		// with CACHE_STREAMS off, or a body over the cache size cap).
+		// "none" = handler outside the cache path (dashboard, health).
+		//
+		// Lowercased to the same vocabulary cache_status uses so the log
+		// line and the stored row agree — grep/logfmt and SQL filter on the
+		// same three values. The header itself stays uppercase on the wire.
+		cache := strings.ToLower(rec.cache)
+		if cache == "" {
+			cache = "none"
+		}
+		evt = evt.Str("cache", cache).Bool("cache_hit", cache == "hit")
+		evt.Msg("request")
 	})
 }
 
