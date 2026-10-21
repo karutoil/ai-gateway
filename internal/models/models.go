@@ -130,6 +130,13 @@ type RequestLog struct {
 	// CacheStatus is the request's disposition against the response cache:
 	// hit | miss | bypass. NULL on rows written before it existed.
 	CacheStatus string `json:"cache_status,omitempty"`
+	// Identity beyond the gateway key. EndUser and App are DECLARED by the
+	// caller (body `user` / X-End-User, X-App-Id / X-Title / Referer); Client
+	// is inferred from the User-Agent product token and is therefore present
+	// on essentially every row.
+	EndUser string `json:"end_user,omitempty"`
+	App     string `json:"app,omitempty"`
+	Client  string `json:"client,omitempty"`
 }
 
 // CatalogModel is enriched from models.dev

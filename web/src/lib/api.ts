@@ -130,9 +130,15 @@ export type AttributionReport = {
   generated: string
   apps: RankRow[]
   end_users: RankRow[]
+  /** calling client software (User-Agent product token), populated by default */
+  clients: RankRow[]
   coverage: {
     total_requests: number
     with_end_user: number
+    with_app: number
+    with_client: number
+    /** requests carrying any identity at all */
+    identified: number
     unattributed: number
     unpriced_requests: number
     unpriced_token_share: number
@@ -162,6 +168,8 @@ export type CostReport = {
   by_model: RankRow[]
   by_provider: RankRow[]
   by_app: RankRow[]
+  /** spend per calling client (User-Agent product token) — populated by default */
+  by_client: RankRow[]
   by_key: RankRow[]
 }
 
@@ -221,6 +229,8 @@ export type LogsQuery = {
   end_user?: string
   /** exact application identity */
   app?: string
+  /** exact calling client (User-Agent product token, e.g. "pi", "curl") */
+  client?: string
   /**
    * Server-side sort. The column is whitelisted by the API, so an unknown
    * value falls back to newest-first rather than erroring.
@@ -236,7 +246,7 @@ export type LogsQuery = {
 
 /** Params for GET /api/logs/group (group-by reporting). */
 export type LogsGroupQuery = Omit<LogsQuery, 'limit' | 'offset'> & {
-  group_by: 'key' | 'model' | 'provider' | 'endpoint' | 'finish_reason' | 'status' | 'error' | 'app'
+  group_by: 'key' | 'model' | 'provider' | 'endpoint' | 'finish_reason' | 'status' | 'error' | 'app' | 'client'
   /** window: 24h / 7d / 30d (default 7d) */
   range?: string
   limit?: number

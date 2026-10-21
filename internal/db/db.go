@@ -115,6 +115,9 @@ var migration032SQL string
 //go:embed migrations/033_passkey_backup_flags.sql
 var migration033SQL string
 
+//go:embed migrations/034_request_client.sql
+var migration034SQL string
+
 // migrationsList is the ordered set of embedded migrations. It is a function
 // (rather than an inline literal) so callers and tests can introspect the
 // schema version instead of hardcoding a count that goes stale on every new
@@ -160,6 +163,7 @@ func migrationsList() []struct {
 		{31, migration031SQL},
 		{32, migration032SQL},
 		{33, migration033SQL},
+		{34, migration034SQL},
 	}
 }
 

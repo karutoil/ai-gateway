@@ -48,6 +48,7 @@ export default function Costs() {
   const modelSort = useSort({ key: 'cost', dir: 'desc' })
   const provSort = useSort({ key: 'cost', dir: 'desc' })
   const appSort = useSort({ key: 'cost', dir: 'desc' })
+  const clientSort = useSort({ key: 'cost', dir: 'desc' })
   const keySort = useSort({ key: 'cost', dir: 'desc' })
   const cacheSort = useSort({ key: 'cost', dir: 'desc' })
 
@@ -67,6 +68,7 @@ export default function Costs() {
   const byModel = useMemo(() => sortRows(data?.by_model ?? [], modelSort.sort), [data, modelSort.sort])
   const byProvider = useMemo(() => sortRows(data?.by_provider ?? [], provSort.sort), [data, provSort.sort])
   const byApp = useMemo(() => sortRows(data?.by_app ?? [], appSort.sort), [data, appSort.sort])
+  const byClient = useMemo(() => sortRows(data?.by_client ?? [], clientSort.sort), [data, clientSort.sort])
   const byKey = useMemo(() => sortRows(data?.by_key ?? [], keySort.sort), [data, keySort.sort])
   const byCache = useMemo(() => sortRows(data?.by_cache_status ?? [], cacheSort.sort), [data, cacheSort.sort])
   const graph = useMemo(() => graphWindow(data?.daily ?? [], graphRange, data?.to ?? ''), [data, graphRange])
@@ -211,15 +213,20 @@ export default function Costs() {
           <section aria-label="Cost attribution" className="space-y-3">
             <h2 className="text-[15px] font-semibold -tracking-tight text-paper">Cost attribution</h2>
             <div className="grid gap-3 lg:grid-cols-2">
-              <Panel title="Spend by application" hint="Chargeback view; click an attributed app to inspect its requests.">
+              <Panel title="Spend by application" hint="Chargeback view of apps that declared themselves; click one to inspect its requests.">
                 {byApp.length === 0 ? (
                   <EmptyState icon="globe" title="No attributed spend"
-                    hint="Attribute requests with X-App-Id, X-Title or HTTP-Referer to see per-application cost." />
+                    hint="Attribute requests with X-App-Id, X-Title or HTTP-Referer to see per-application cost. Spend is still broken down by client below." />
                 ) : (
                   <BreakdownTable rows={byApp} sort={appSort.sort} onSort={appSort.toggle}
                     nameHeader="Application" columns={columns} maxRows={15}
                     onRowClick={(r) => { if (r.name !== '(unattributed)') go({ app: r.name }) }} />
                 )}
+              </Panel>
+              <Panel title="Spend by client" hint="The harness or SDK that called, from its User-Agent. Click one to inspect its requests.">
+                <BreakdownTable rows={byClient} sort={clientSort.sort} onSort={clientSort.toggle}
+                  nameHeader="Client" columns={columns} maxRows={15}
+                  onRowClick={(r) => { if (r.name !== '(unattributed)') go({ client: r.name }) }} />
               </Panel>
               <Panel title="Spend by key" hint="Which virtual credential is driving cost.">
                 <BreakdownTable rows={byKey} sort={keySort.sort} onSort={keySort.toggle}

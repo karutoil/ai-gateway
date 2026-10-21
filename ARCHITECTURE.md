@@ -113,11 +113,11 @@ sub-router with the same chain, because a browser refresh on the dashboard's
 
 ## Data Model
 
-Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 029_video_models.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). The highest embedded version is reported by `db.LatestMigrationVersion()`. Highlights:
+Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 034_request_client.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). The highest embedded version is reported by `db.LatestMigrationVersion()`. Highlights:
 
 - `providers` (AES-GCM `api_key_enc`, `base_url`, `health_status`, optional `org_id`)
 - `gateway_keys` (prefix + SHA256 hash, RPM/RPH/RPD/TPM, daily/monthly token & cost limits, `allowed_models`, optional `org_id`)
-- `request_logs` (model/endpoint/status/latency/ttft, tokens, cost, stream flag, optional bodies, error, `cache_hit` for gateway response-cache hits)
+- `request_logs` (model/endpoint/status/latency/ttft, tokens, cost, stream flag, optional bodies, error, `cache_hit` for gateway response-cache hits, `cache_status`, plus the identity triple `end_user` / `app` / `client` from 024 and 034 — see *Attribution* below)
 - `models_catalog`, `provider_models`, `model_aliases`, `system_config` — capability flags on both model tables: `decision` INT (026), `image` INT (027), `video` INT (029). Default 0 = text model; a model can carry several, and `GET /v1/models` reports each as a boolean plus a single `kind` label.
 - `video_jobs` (028) — `id` / `provider_id` / `key_prefix` / `dialect` / `model` / `upstream_id` / `prompt` / `seconds` / `size` / `status` / `progress` / `error_code` / `error_message` / `video_url` / `created_at` / `updated_at` / `completed_at` / `expires_at`. The durable mapping from a gateway-issued `video_…` id to the provider's own handle plus the last observed state (indexed on `key_prefix`, `provider_id`, `created_at`). `expires_at` **is** enforced for clients — an expired job answers `410` and is marked `failed`/`expired` — but no row is ever deleted; see the Operations section of `README.md` for retention.
 - `audit_logs` (actor, action, target, meta)
@@ -289,6 +289,24 @@ Reasoning mapping: OpenAI `reasoning_effort` (low/medium/high/max) <-> Anthropic
 - **Usage metering**: `STREAM_USAGE_INJECT` (default **true**) injects `include_usage` so OpenAI-compatible streams are metered; opt out with `STREAM_USAGE_INJECT=0`.
 - **Webhooks**: `webhook.Global` delivers audit + billing-export + over-quota events asynchronously (bounded queue, 2 attempts); `WEBHOOK_SECRET` signs deliveries as `X-Webhook-Signature: sha256=<hex HMAC>`.
 - **Metrics**: Prometheus at `/metrics` — `gateway_requests_total{provider,model,endpoint,status}`, `gateway_latency_ms{provider,endpoint}`, `gateway_cache_hits_total{result}`; `METRICS_PROTECT=true` gates it behind admin auth. OpenTelemetry metrics API is scaffolded but OTLP export is pending.
+
+---
+
+## Attribution (who used the gateway)
+
+Three identity columns on `request_logs`, in decreasing order of how much the caller has to do:
+
+| column | source (precedence) | populated by default? |
+| --- | --- | --- |
+| `end_user` | `X-End-User` → body `user` ([OI]) → body `metadata.user_id` (Anthropic) | no — the application must pass a user id |
+| `app` | `X-App-Id` → `X-Title` / `X-OpenRouter-Title` → origin of `HTTP-Referer` / `Referer` | no — the caller must declare itself |
+| `client` | `X-Client` → `User-Agent` product token (lowercased, version dropped) | **yes** — every HTTP client sends a UA |
+
+`client` exists because the first two do not work in practice. Harnesses only send `X-OpenRouter-Title` / `HTTP-Referer` when the upstream *is* OpenRouter (pi gates them on the host), and only send a body `user` when the application passes one, so a coding-agent deployment landed 100% NULL in both columns and the Attribution page was structurally empty. The UA product token is the one identity every caller supplies without knowing the gateway exists. It is kept in its own column rather than being folded into `app`: `app` means "the caller declared itself", `client` means "what the wire says called us", and reports must not blur a declaration with an inference.
+
+Both `app` and `client` are groupable (`GET /api/logs/group?group_by=app|client`) and filterable (`?app=`, `?client=`, exact match so a report drilldown selects exactly the bucket it counted). `end_user` stays filter/rank only — it is unbounded by construction, so grouping by it is the rollup explosion Langfuse explicitly forbids. `GET /api/analytics/attribution` returns `apps`, `end_users` and `clients` rankings plus a `coverage` block (`total_requests`, `with_app`, `with_end_user`, `with_client`, `identified`, `unattributed`), where `unattributed` counts rows with **no** identity of any kind.
+
+Every value is attacker-influenced: each is trimmed, stripped of control characters, capped at 200 bytes on a rune boundary, and rejected outright if it is a known sentinel (`undefined`, `null`, `NaN`, `nil`, `(null)`, `[object Object]`). The sentinel guard exists because a client that interpolates an unset variable into a header otherwise creates an identity literally named `undefined`, which is worse than no attribution at all — it looks like data.
 
 ---
 

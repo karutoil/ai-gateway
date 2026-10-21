@@ -1,0 +1,34 @@
+-- 034_request_client.sql — the calling client (harness / SDK) as an identity
+--
+-- Migration 024 added end_user and app, but both require the caller to opt in:
+-- end_user needs a body "user" field (or X-End-User), app needs X-App-Id /
+-- X-Title / HTTP-Referer. In practice nothing opts in. A capture of the
+-- production ingress showed a coding-agent request carrying exactly:
+--
+--     User-Agent: pi (linux 6.12.111+deb13-amd64; x64)
+--     X-Stainless-Lang: js
+--
+-- and no attribution header at all — so 100% of rows were NULL in both
+-- columns and the Attribution page was structurally empty. Harnesses only
+-- send X-OpenRouter-Title / HTTP-Referer when the upstream IS OpenRouter, and
+-- body "user" only when the application passes one.
+--
+--   client  the calling client software, derived from the User-Agent product
+--           token ("pi", "curl", "claude-cli", "[OI]") or an explicit
+--           X-Client header. Always available, so every request is attributed
+--           to something, with zero client changes.
+--
+-- This is deliberately a SEPARATE column rather than a fallback into app:
+-- app means "the application declared itself", client means "what the wire
+-- says called us". Reports may coalesce them for display, but storage must
+-- not blur a declaration with an inference.
+--
+-- Purely additive: legacy rows keep NULL.
+-- Purely additive: legacy rows keep NULL. There is deliberately no backfill
+-- script (unlike 021, which could classify rows from latency and token
+-- shape): the User-Agent was never persisted, and LOG_BODIES=false means the
+-- raw request is gone, so a historical row cannot be attributed to a client
+-- after the fact. Reports must therefore treat NULL as "written before 034",
+-- not as "no client".
+ALTER TABLE request_logs ADD COLUMN client TEXT;
+CREATE INDEX IF NOT EXISTS idx_request_logs_client ON request_logs(client);

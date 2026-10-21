@@ -1296,7 +1296,7 @@ func (h *AdminHandler) Logs(w http.ResponseWriter, r *http.Request) {
 
 	limArgs := append(append([]any{}, args...), limit, offset)
 	orderBy := logOrderClause(q)
-	rows, err := h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.cache_hit,rl.cache_status`+from+orderBy+` LIMIT ? OFFSET ?`), limArgs...)
+	rows, err := h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.cache_hit,rl.cache_status,rl.end_user,rl.app,rl.client`+from+orderBy+` LIMIT ? OFFSET ?`), limArgs...)
 	if err != nil {
 		// Fallback for DBs without ttft_ms/error columns.
 		rows, err = h.DB.Query(db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream`+from+orderBy+` LIMIT ? OFFSET ?`), limArgs...)
@@ -1360,8 +1360,9 @@ func scanRequestLogRow(rows *sql.Rows) (models.RequestLog, error) {
 		costUSD                                sql.NullFloat64
 		isStream, cacheHit                     sql.NullBool
 		errStr, cacheStatus                    sql.NullString
+		endUser, app, client                   sql.NullString
 	)
-	if err := rows.Scan(&l.ID, &keyPrefix, &providerID, &model, &endpoint, &status, &latencyMs, &ttft, &l.CreatedAt, &promptTok, &completionTok, &totalTok, &costUSD, &isStream, &errStr, &cacheHit, &cacheStatus); err != nil {
+	if err := rows.Scan(&l.ID, &keyPrefix, &providerID, &model, &endpoint, &status, &latencyMs, &ttft, &l.CreatedAt, &promptTok, &completionTok, &totalTok, &costUSD, &isStream, &errStr, &cacheHit, &cacheStatus, &endUser, &app, &client); err != nil {
 		return l, err
 	}
 	l.KeyPrefix = keyPrefix.String
@@ -1379,6 +1380,9 @@ func scanRequestLogRow(rows *sql.Rows) (models.RequestLog, error) {
 	l.Error = errStr.String
 	l.CacheHit = cacheHit.Bool
 	l.CacheStatus = cacheStatus.String
+	l.EndUser = endUser.String
+	l.App = app.String
+	l.Client = client.String
 	return l, nil
 }
 
@@ -1470,17 +1474,18 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 	var cacheRead, cacheWrite, reasoning sql.NullInt64
 	var cacheHit sql.NullBool
 	var cacheStatus sql.NullString
+	var endUser, app, client sql.NullString
 	var q string
 	if orgID != "" {
-		q = db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.request_body,rl.response_body,rl.finish_reason,rl.fallback_chain,rl.cache_read_tokens,rl.cache_write_tokens,rl.reasoning_tokens,rl.cache_hit,rl.cache_status FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE rl.id=? AND p.org_id=?`)
+		q = db.Q(`SELECT rl.id,rl.key_prefix,rl.provider_id,rl.model,rl.endpoint,rl.status,rl.latency_ms,rl.ttft_ms,rl.created_at,rl.prompt_tokens,rl.completion_tokens,rl.total_tokens,rl.cost_usd,rl.is_stream,rl.error,rl.request_body,rl.response_body,rl.finish_reason,rl.fallback_chain,rl.cache_read_tokens,rl.cache_write_tokens,rl.reasoning_tokens,rl.cache_hit,rl.cache_status,rl.end_user,rl.app,rl.client FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE rl.id=? AND p.org_id=?`)
 	} else {
-		q = db.Q(`SELECT id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,error,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status FROM request_logs WHERE id=?`)
+		q = db.Q(`SELECT id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,error,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status,end_user,app,client FROM request_logs WHERE id=?`)
 	}
 	args := []any{id}
 	if orgID != "" {
 		args = append(args, orgID)
 	}
-	err := h.DB.QueryRow(q, args...).Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &ttft, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream, &errStr, &reqBody, &respBody, &finishReason, &fallbackChain, &cacheRead, &cacheWrite, &reasoning, &cacheHit, &cacheStatus)
+	err := h.DB.QueryRow(q, args...).Scan(&l.ID, &l.KeyPrefix, &l.ProviderID, &l.Model, &l.Endpoint, &l.Status, &l.LatencyMs, &ttft, &l.CreatedAt, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.CostUSD, &l.IsStream, &errStr, &reqBody, &respBody, &finishReason, &fallbackChain, &cacheRead, &cacheWrite, &reasoning, &cacheHit, &cacheStatus, &endUser, &app, &client)
 	if err != nil {
 		// Fallback without ttft/error — still org-scoped.
 		var ferr error
@@ -1526,6 +1531,15 @@ func (h *AdminHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 		}
 		if cacheStatus.Valid {
 			l.CacheStatus = cacheStatus.String
+		}
+		if endUser.Valid {
+			l.EndUser = endUser.String
+		}
+		if app.Valid {
+			l.App = app.String
+		}
+		if client.Valid {
+			l.Client = client.String
 		}
 	}
 	// Enrich with provider name and key name

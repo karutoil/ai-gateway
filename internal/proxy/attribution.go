@@ -8,6 +8,7 @@ package proxy
 //
 //	end_user  X-End-User header  >  body "user" (OpenAI)  >  body "metadata.user_id" (Anthropic)
 //	app       X-App-Id header    >  X-Title / X-OpenRouter-Title  >  HTTP-Referer
+//	client    X-Client header    >  User-Agent product token
 //
 // The body `user` field matters because OpenAI clients already send it, so a
 // client that does nothing at all still gets per-end-user attribution — the
@@ -16,7 +17,15 @@ package proxy
 // referer/title pair mirrors OpenRouter's app-attribution headers so an
 // OpenRouter-shaped client works unchanged.
 //
-// Both values are attacker-influenced, so every write is length-capped and
+// client is the dimension that is populated BY DEFAULT. Harnesses send
+// X-OpenRouter-Title / HTTP-Referer only when the upstream is OpenRouter (pi
+// gates them on the host), and a body `user` only when the application passes
+// one, so before this every coding-agent request landed with end_user and app
+// both NULL and the Attribution page was structurally empty. The User-Agent
+// product token is always present, so it is the one identity every caller
+// supplies without knowing the gateway exists.
+//
+// All values are attacker-influenced, so every write is length-capped and
 // control characters are stripped before storage.
 
 import (
@@ -33,6 +42,9 @@ const (
 	HeaderEndUser = "X-End-User"
 	// HeaderAppID names the calling application explicitly.
 	HeaderAppID = "X-App-Id"
+	// HeaderClient names the calling client (harness / SDK) explicitly,
+	// overriding the User-Agent product token.
+	HeaderClient = "X-Client"
 	// HeaderTitle / HeaderReferer mirror OpenRouter's attribution headers so a
 	// client written against OpenRouter attributes correctly here unchanged.
 	HeaderTitle       = "X-Title"
@@ -48,10 +60,14 @@ const (
 type Attribution struct {
 	EndUser string
 	App     string
+	// Client is the calling client software ("pi", "curl", "claude-cli"),
+	// derived from the User-Agent product token unless X-Client overrides it.
+	// Unlike EndUser and App it is populated for essentially every request.
+	Client string
 }
 
 // Any reports whether anything was attributed.
-func (a Attribution) Any() bool { return a.EndUser != "" || a.App != "" }
+func (a Attribution) Any() bool { return a.EndUser != "" || a.App != "" || a.Client != "" }
 
 type attributionCtxKey struct{}
 
@@ -78,6 +94,7 @@ func attributionFromRequest(r *http.Request, body []byte) Attribution {
 	if r != nil {
 		a.EndUser = firstNonEmpty(headersGet(r, HeaderEndUser))
 		a.App = firstNonEmpty(headersGet(r, HeaderAppID), headersGet(r, HeaderTitle), headersGet(r, HeaderTitleAlt), appFromReferer(r))
+		a.Client = firstNonEmpty(headersGet(r, HeaderClient), clientFromUserAgent(r))
 	}
 	if len(body) > 0 {
 		if a.EndUser == "" {
@@ -86,6 +103,7 @@ func attributionFromRequest(r *http.Request, body []byte) Attribution {
 	}
 	a.EndUser = sanitizeAttribution(a.EndUser)
 	a.App = sanitizeAttribution(a.App)
+	a.Client = sanitizeAttribution(a.Client)
 	return a
 }
 
@@ -127,6 +145,52 @@ func endUserFromBody(body []byte) string {
 	return ""
 }
 
+// clientFromUserAgent derives the calling client from the User-Agent product
+// token.
+//
+// This is the only identity dimension a harness supplies by default. pi sends
+// "pi (linux 6.12.111+deb13-amd64; x64)" and the [OI] SDKs send
+// "[OI]/Python 1.30.0", so the product token is the leading segment up to the
+// first '/' or whitespace. Versions are dropped deliberately: "pi" is one
+// client across releases, and a per-version bucket would fragment the
+// dimension with no diagnostic gain (the SDK version is in X-Stainless-* when
+// it is ever needed).
+func clientFromUserAgent(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	if ua == "" {
+		return ""
+	}
+	token := ua
+	if i := strings.IndexAny(token, "/ \t"); i > 0 {
+		token = token[:i]
+	}
+	token = strings.ToLower(strings.TrimSpace(token))
+	// A UA that opens with a comment ("(compatible; ...)") has no product
+	// token; storing the fragment would be noise, not identity.
+	if token == "" || token[0] == '(' {
+		return ""
+	}
+	return token
+}
+
+// attributionSentinels are the literal strings a client sends when it
+// interpolates an UNSET variable into a header or body field. Storing them
+// makes a report claim an identity that does not exist — the exact "every
+// request is attributed to `undefined`" symptom — so they are treated as
+// "not supplied" and stored as NULL.
+var attributionSentinels = map[string]bool{
+	"undefined":       true,
+	"null":            true,
+	"nan":             true,
+	"nil":             true,
+	"(null)":          true,
+	"(undefined)":     true,
+	"[object object]": true,
+}
+
 // appFromReferer reduces a referer to its origin. Distinct paths on one site
 // are the same application, and collapsing them keeps the app dimension from
 // fragmenting per page.
@@ -163,6 +227,9 @@ func sanitizeAttribution(s string) string {
 		return r
 	}, s)
 	cleaned = strings.TrimSpace(cleaned)
+	if attributionSentinels[strings.ToLower(cleaned)] {
+		return ""
+	}
 	if len(cleaned) > maxAttributionLen {
 		cleaned = truncateUTF8(cleaned, maxAttributionLen)
 	}

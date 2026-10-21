@@ -32,7 +32,7 @@ import (
 //
 //	model, key (prefix), endpoint, status ("failed" or code), since (RFC3339 or Go duration),
 //	key_id, provider_id, stream (true/false), min_latency_ms, max_latency_ms,
-//	has_error (true), finish_reason (or "(none)"), end_user, app,
+//	has_error (true), finish_reason (or "(none)"), end_user, app, client,
 //	q (search: model, endpoint, error; bodies only with search_bodies=true)
 func logFilterWhere(orgID string, q url.Values) (whereSQL string, args []any) {
 	var where []string
@@ -97,6 +97,13 @@ func logFilterWhere(orgID string, q url.Values) (whereSQL string, args []any) {
 	if ap := strings.TrimSpace(q.Get("app")); ap != "" {
 		where = append(where, "rl.app = ?")
 		args = append(args, ap)
+	}
+	// client is the User-Agent-derived dimension. It is exact-match for the
+	// same reason as app: clicking a client in a report must select exactly
+	// the rows that bucket counted, not a prefix family.
+	if cl := strings.TrimSpace(q.Get("client")); cl != "" {
+		where = append(where, "rl.client = ?")
+		args = append(args, cl)
 	}
 	// Stream / non-stream. db.BoolLit renders 1/0 vs TRUE/FALSE per dialect.
 	if s := strings.TrimSpace(q.Get("stream")); s == "true" || s == "false" {

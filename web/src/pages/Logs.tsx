@@ -257,6 +257,17 @@ function DetailBody({ detail, selected, keyMap }: {
           <div className="text-xs mt-1 break-all">{detail.log?.endpoint || selected.endpoint}</div>
           <div className="text-xs text-muted font-mono truncate">{detail.log?.model || selected.model}</div>
         </div>
+        {/* Identity: who made this call. client is inferred from the
+            User-Agent and is almost always present; app and end_user are
+            only populated when the caller declared them. */}
+        <div className="rounded-lg border border-stone bg-raised/60 p-3">
+          <div className="text-xs text-muted">Identity</div>
+          <div className="mt-1 font-mono text-xs space-y-0.5 truncate">
+            <div title={String(detail.log?.client || selected.client || '')}>client: {detail.log?.client || selected.client || '—'}</div>
+            <div title={String(detail.log?.app || selected.app || '')}>app: {detail.log?.app || selected.app || '—'}</div>
+            <div title={String(detail.log?.end_user || selected.end_user || '')}>user: {detail.log?.end_user || selected.end_user || '—'}</div>
+          </div>
+        </div>
       </div>
 
       <div className="grid md:grid-cols-2 gap-3">
@@ -387,16 +398,18 @@ type LogFilters = {
   end_user: string
   /** exact application identity (X-App-Id / X-Title / HTTP-Referer origin) */
   app: string
+  /** exact calling client (User-Agent product token, e.g. "pi", "curl") */
+  client: string
 }
 
 const FILTER_DEFAULTS: LogFilters = {
   q: '', status: '', since: '24h', key_id: '', provider_id: '', model: '',
   stream: '', min_latency_ms: '', max_latency_ms: '', has_error: '', search_bodies: '',
-  finish_reason: '', end_user: '', app: '',
+  finish_reason: '', end_user: '', app: '', client: '',
 }
 
 /** Which filter fields are "advanced" (hidden behind More filters). */
-const ADVANCED_FIELDS: (keyof LogFilters)[] = ['min_latency_ms', 'max_latency_ms', 'search_bodies', 'model', 'end_user', 'app']
+const ADVANCED_FIELDS: (keyof LogFilters)[] = ['min_latency_ms', 'max_latency_ms', 'search_bodies', 'model', 'end_user', 'app', 'client']
 
 /** True when a field differs from its default (drives chips + active count). */
 function filterActive(f: LogFilters, k: keyof LogFilters): boolean {
@@ -425,6 +438,9 @@ const GROUP_DIMS = [
   // end_user is intentionally NOT here: it is unbounded by construction, so it
   // stays a filter/rank dimension rather than a rollup key.
   { value: 'app', label: 'App' },
+  // client is groupable for the same reason as app: the set of harnesses and
+  // SDKs calling the gateway is small and bounded.
+  { value: 'client', label: 'Client' },
   { value: 'status', label: 'Status' },
   { value: 'error', label: 'Errors' },
 ] as const
@@ -514,6 +530,7 @@ export default function Logs(){
     if (filters.finish_reason) p.finish_reason = filters.finish_reason
     if (filters.end_user) p.end_user = filters.end_user
     if (filters.app) p.app = filters.app
+    if (filters.client) p.client = filters.client
     if (sortKey !== 'created_at') p.order = sortKey
     // dir must be sent for ascending sorts on ANY column: the server honors
     // dir with its default (created_at) column too, and gating it on
@@ -763,6 +780,7 @@ export default function Logs(){
             <Input value={filters.max_latency_ms} onChange={e=>applyFilter({ max_latency_ms: e.target.value.replace(/\D/g,'') })} placeholder="Max latency ms" className="max-w-[120px] h-8 text-xs" inputMode="numeric"/>
             <Input value={filters.end_user} onChange={e=>applyFilter({ end_user: e.target.value })} placeholder="End user (exact)" className="max-w-[160px] h-8 text-xs"/>
             <Input value={filters.app} onChange={e=>applyFilter({ app: e.target.value })} placeholder="App (exact)" className="max-w-[160px] h-8 text-xs"/>
+            <Input value={filters.client} onChange={e=>applyFilter({ client: e.target.value })} placeholder="Client (exact)" className="max-w-[160px] h-8 text-xs"/>
           </div>
         )}
       </Card>
@@ -835,6 +853,7 @@ export default function Logs(){
                           // click lands on exactly the set this group counted.
                           else if (groupBy === 'finish_reason') applyFilter({ finish_reason: g.group })
                           else if (groupBy === 'app') applyFilter({ app: g.group === '(none)' ? '' : g.group })
+                          else if (groupBy === 'client') applyFilter({ client: g.group === '(none)' ? '' : g.group })
                           else if (groupBy === 'error') applyFilter({ has_error: g.group === 'error' ? 'true' : '' })
                           else applyFilter({ model: g.group })
                         }}
@@ -932,7 +951,7 @@ export default function Logs(){
                     aria-label={`Request ${String(l.id).slice(0,8)} — ${l.model}, status ${l.status}`}
                     className="hover:bg-raised/60 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/60">
                   <Td className="whitespace-nowrap text-xs font-mono text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
-                  <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}`}>{l.model}</span></Td>
+                  <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}${(l as any).client?` · client ${(l as any).client}`:''}`}>{l.model}</span></Td>
                   <Td><span className="block font-mono text-xs truncate max-w-[110px] text-muted" title={String(l.provider_id||'')}>{l.provider_id || '—'}</span></Td>
                   <Td className="text-center">
                     <span className="inline-flex flex-col items-center gap-0.5">

@@ -3028,11 +3028,12 @@ type logMeta struct {
 	CacheHit      bool   // served from the gateway response cache (X-Cache: HIT)
 	CacheStatus   string // hit | miss | bypass — disposition against the response cache
 	TtftMs        int64  // upstream time-to-first-chunk for streams (0 = non-stream / died before first chunk)
-	// EndUser / App are filled from the request context by the logging funnel
-	// (see attribution.go). They live here so every existing caller gets
-	// attribution without passing it explicitly.
+	// EndUser / App / Client are filled from the request context by the
+	// logging funnel (see attribution.go). They live here so every existing
+	// caller gets attribution without passing it explicitly.
 	EndUser string
 	App     string
+	Client  string
 }
 
 // logRequestExtendedDetail is the full-fidelity insert used when captured
@@ -3070,6 +3071,9 @@ func (h *Handler) logRequestExtendedBodies(ctx context.Context, keyPrefix, provi
 		}
 		if m.App == "" {
 			m.App = attr.App
+		}
+		if m.Client == "" {
+			m.Client = attr.Client
 		}
 	}
 	if h.Metrics != nil {
@@ -3155,10 +3159,10 @@ func (h *Handler) logRequestExtendedBodies(ctx context.Context, keyPrefix, provi
 	if ttft > 0 && latencyMs > ttft {
 		responseMs = latencyMs - ttft
 	}
-	if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,response_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status,end_user,app) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+	if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(id,key_prefix,provider_id,model,endpoint,status,latency_ms,ttft_ms,response_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,request_body,response_body,finish_reason,fallback_chain,cache_read_tokens,cache_write_tokens,reasoning_tokens,cache_hit,cache_status,end_user,app,client) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		id, keyPrefix, providerID, model, endpoint, status, latencyMs, ttft, responseMs, time.Now().UTC(), promptTokens, completionTokens, total, costUSD, isStream, nullIfEmpty(reqBodyStr), nullIfEmpty(respBodyStr),
 		nullIfEmpty(m.FinishReason), nullIfEmpty(m.FallbackChain), m.CacheRead, m.CacheWrite, m.Reasoning, cacheHit, nullIfEmpty(m.CacheStatus),
-		nullIfEmpty(m.EndUser), nullIfEmpty(m.App)); err != nil {
+		nullIfEmpty(m.EndUser), nullIfEmpty(m.App), nullIfEmpty(m.Client)); err != nil {
 		// The insert error was previously discarded, which let a dialect
 		// mismatch silently drop EVERY request row on Postgres. Log loudly so
 		// the next regression surfaces immediately.

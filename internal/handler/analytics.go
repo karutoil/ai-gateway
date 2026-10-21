@@ -133,7 +133,7 @@ type attributionRow struct {
 	LastSeen   string `json:"last_seen,omitempty"`
 }
 
-// Attribution reports usage grouped by application and by end user.
+// Attribution reports usage grouped by application, by end user and by client.
 //
 // end_user is a RANKING, not a group-by dimension: it is unbounded by
 // construction, so the query is bounded by LIMIT instead of materialising
@@ -152,13 +152,25 @@ func (h *AdminHandler) Attribution(w http.ResponseWriter, r *http.Request) {
 
 	apps := h.attributionBy("app", "end_user", whereSQL, args, limit)
 	users := h.attributionBy("end_user", "app", whereSQL, args, limit)
+	// client is the dimension that is populated for essentially every request
+	// (User-Agent product token), so it is what keeps this page from being
+	// empty when no integration declares an app or an end user.
+	clients := h.attributionBy("client", "app", whereSQL, args, limit)
 
 	// Coverage tells the operator how much traffic actually carries an
 	// identity — without it, a low ranking is indistinguishable from an
-	// integration that never sends attribution.
-	var totalRows, attributedApps, attributedUsers, unpriced, unpricedTokens int64
-	h.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM request_logs rl`+whereSQL), args...).Scan(&totalRows)
-	h.DB.QueryRow(db.Q(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN rl.end_user IS NOT NULL AND rl.end_user != '' THEN 1 ELSE 0 END),0) FROM request_logs rl`+whereSQL), args...).Scan(&attributedApps, &attributedUsers)
+	// integration that never sends attribution. The three dimensions are
+	// counted separately because they fail for different reasons: app and
+	// end_user need the caller to opt in, client never does.
+	var totalRows, withApp, withEndUser, withClient, identified, unpriced, unpricedTokens int64
+	h.DB.QueryRow(db.Q(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN rl.app IS NOT NULL AND rl.app != '' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN rl.end_user IS NOT NULL AND rl.end_user != '' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN rl.client IS NOT NULL AND rl.client != '' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN (rl.app IS NOT NULL AND rl.app != '')
+			OR (rl.end_user IS NOT NULL AND rl.end_user != '')
+			OR (rl.client IS NOT NULL AND rl.client != '') THEN 1 ELSE 0 END),0)
+		FROM request_logs rl`+whereSQL), args...).Scan(&totalRows, &withApp, &withEndUser, &withClient, &identified)
 	h.DB.QueryRow(db.Q(`SELECT COUNT(*), COALESCE(SUM(rl.total_tokens),0) FROM request_logs rl`+whereSQL+` AND rl.cost_usd = 0 AND rl.total_tokens > 0`), args...).Scan(&unpriced, &unpricedTokens)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -169,10 +181,17 @@ func (h *AdminHandler) Attribution(w http.ResponseWriter, r *http.Request) {
 		"generated": time.Now().UTC().Format(time.RFC3339),
 		"apps":      apps,
 		"end_users": users,
+		"clients":   clients,
 		"coverage": map[string]any{
-			"total_requests":       totalRows,
-			"with_end_user":        attributedUsers,
-			"unattributed":         totalRows - attributedUsers,
+			"total_requests": totalRows,
+			"with_end_user":  withEndUser,
+			"with_app":       withApp,
+			"with_client":    withClient,
+			"identified":     identified,
+			// unattributed now means "no identity of ANY kind", not "no end
+			// user". Counting only end_user made every harness request look
+			// unattributed even when its client was recorded.
+			"unattributed":         totalRows - identified,
 			"unpriced_requests":    unpriced,
 			"unpriced_token_share": unpricedTokens,
 		},
@@ -308,6 +327,7 @@ func (h *AdminHandler) Cost(w http.ResponseWriter, r *http.Request) {
 	byModel := h.costBy("COALESCE(NULLIF(rl.model,''),'(none)')", whereSQL, args, costJoin, 25)
 	byProvider := h.costBy("COALESCE(NULLIF(p.name,''),'(none)')", whereSQL, args, ` LEFT JOIN providers p ON rl.provider_id = p.id`, 25)
 	byApp := h.costBy("COALESCE(NULLIF(rl.app,''),'(unattributed)')", whereSQL, args, costJoin, 25)
+	byClient := h.costBy("COALESCE(NULLIF(rl.client,''),'(unattributed)')", whereSQL, args, costJoin, 25)
 	byKey := h.costBy("COALESCE(NULLIF(rl.key_prefix,''),'(none)')", whereSQL, args, costJoin, 25)
 
 	var unpriced, unpricedTokens int64
@@ -335,6 +355,7 @@ func (h *AdminHandler) Cost(w http.ResponseWriter, r *http.Request) {
 		"by_model":        byModel,
 		"by_provider":     byProvider,
 		"by_app":          byApp,
+		"by_client":       byClient,
 		"by_key":          byKey,
 	})
 }

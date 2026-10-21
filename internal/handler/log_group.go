@@ -54,6 +54,10 @@ var logGroupDims = map[string]logGroupDim{
 	// available as a FILTER on /api/logs so it can still be ranked and
 	// drilled into per request.
 	"app": {expr: `COALESCE(NULLIF(rl.app,''),'(none)')`},
+	// client is safe to group by for the same reason as app: the set of
+	// distinct clients is small (one per harness/SDK family), and it is the
+	// only attribution dimension populated without the caller opting in.
+	"client": {expr: `COALESCE(NULLIF(rl.client,''),'(none)')`},
 }
 
 // LogGroup returns aggregated rows for one grouping dimension.

@@ -29,6 +29,7 @@ type analyticsSeed struct {
 	model        string
 	endUser      string
 	app          string
+	client       string
 	status       int
 	prompt       int
 	completion   int
@@ -55,12 +56,12 @@ func seedAnalyticsRows(t *testing.T, h *AdminHandler, providerID string, seeds [
 		if _, err := h.DB.Exec(db.Q(`INSERT INTO request_logs(
 			id,provider_id,model,endpoint,status,latency_ms,ttft_ms,response_ms,created_at,
 			prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,
-			cache_read_tokens,cache_write_tokens,cache_status,end_user,app)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+			cache_read_tokens,cache_write_tokens,cache_status,end_user,app,client)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 			s.id, providerID, s.model, "chat", s.status, s.latencyMs, ttft, responseMs,
 			now.Add(-time.Duration(i+1)*time.Minute),
 			s.prompt, s.completion, s.prompt+s.completion, s.cost, true,
-			s.cacheRead, s.cacheWrite, s.cacheStatus, nullStr(s.endUser), nullStr(s.app)); err != nil {
+			s.cacheRead, s.cacheWrite, s.cacheStatus, nullStr(s.endUser), nullStr(s.app), nullStr(s.client)); err != nil {
 			t.Fatalf("seed %s: %v", s.id, err)
 		}
 	}
@@ -120,6 +121,71 @@ func TestAttributionReport(t *testing.T) {
 	}
 	if cov["unattributed"].(float64) != 1 {
 		t.Fatalf("unattributed = %v, want 1", cov["unattributed"])
+	}
+}
+
+// TestAttributionClientDimension covers the dimension that exists precisely
+// because nothing opts in: a harness sends a User-Agent and nothing else, so
+// before client existed these rows were unattributable and the whole page read
+// as empty.
+func TestAttributionClientDimension(t *testing.T) {
+	h, _ := newTestAdminHandler(t)
+	prov, _ := h.ProviderStore.Create("cliprov", "openai", "http://127.0.0.1:1", "sk-t")
+	seedAnalyticsRows(t, h, prov.ID, []analyticsSeed{
+		// Two harness calls: client only, no declared app, no named person.
+		{id: "cl1", model: "m1", client: "pi", status: 200, prompt: 100, completion: 50, cost: 0.10, latencyMs: 100},
+		{id: "cl2", model: "m1", client: "pi", status: 200, prompt: 100, completion: 50, cost: 0.10, latencyMs: 100},
+		// A browser call that also declared an app.
+		{id: "cl3", model: "m1", client: "mozilla", app: "https://app-a.example", status: 200, prompt: 10, completion: 5, cost: 0.01, latencyMs: 50},
+		// Nothing at all: the only truly unattributed row.
+		{id: "cl4", model: "m1", status: 200, prompt: 10, completion: 5, cost: 0.01, latencyMs: 50},
+	})
+
+	r := newAnalyticsRouter(h)
+	code, env, _ := getJSON(t, r, "/api/analytics/attribution?range=30d")
+	if code != 200 {
+		t.Fatalf("code=%d", code)
+	}
+
+	clients, _ := env["clients"].([]any)
+	if len(clients) != 2 {
+		t.Fatalf("clients=%d, want 2", len(clients))
+	}
+	// Ranked by spend: pi (0.20) leads mozilla (0.01).
+	top, _ := clients[0].(map[string]any)
+	if top["name"] != "pi" {
+		t.Fatalf("top client = %v, want pi", top["name"])
+	}
+	if top["requests"].(float64) != 2 {
+		t.Fatalf("pi requests = %v, want 2", top["requests"])
+	}
+
+	// Applications stay a DECLARED dimension: pi declared nothing, so it must
+	// not leak into the app ranking.
+	apps, _ := env["apps"].([]any)
+	if len(apps) != 1 {
+		t.Fatalf("apps=%d, want 1 (client must not become an app)", len(apps))
+	}
+
+	cov, _ := env["coverage"].(map[string]any)
+	if cov["total_requests"].(float64) != 4 {
+		t.Fatalf("total_requests = %v, want 4", cov["total_requests"])
+	}
+	if cov["with_client"].(float64) != 3 {
+		t.Fatalf("with_client = %v, want 3", cov["with_client"])
+	}
+	if cov["with_app"].(float64) != 1 {
+		t.Fatalf("with_app = %v, want 1", cov["with_app"])
+	}
+	if cov["with_end_user"].(float64) != 0 {
+		t.Fatalf("with_end_user = %v, want 0", cov["with_end_user"])
+	}
+	// identified counts any dimension; only cl4 carries none.
+	if cov["identified"].(float64) != 3 {
+		t.Fatalf("identified = %v, want 3", cov["identified"])
+	}
+	if cov["unattributed"].(float64) != 1 {
+		t.Fatalf("unattributed = %v, want 1 (a client alone is an identity)", cov["unattributed"])
 	}
 }
 
