@@ -79,8 +79,13 @@ COPY --from=web /src/cmd/gateway/web ./cmd/gateway/web
 # source change recompiled the whole dependency tree from scratch (~47s here,
 # dominated by the CGO SQLite amalgamation); with it, only the gateway's own
 # packages rebuild (~5s). Buildah/podman 5.4 supports RUN --mount=type=cache.
+# ARG VERSION/COMMIT stamp the /health report (GatewayVersion/GatewayCommit).
+ARG VERSION=""
+ARG COMMIT=""
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -buildvcs=false -o /out/gateway ./cmd/gateway
+    go build -trimpath -buildvcs=false \
+        -ldflags "-X ai-gateway/internal/handler.GatewayVersion=${VERSION} -X ai-gateway/internal/handler.GatewayCommit=${COMMIT}" \
+        -o /out/gateway ./cmd/gateway
 
 
 FROM debian:12.11-slim
