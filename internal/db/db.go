@@ -600,7 +600,7 @@ func Migrate(db *sql.DB) error {
 			steps := migrationStatements(trimmed)
 			tx, txErr := db.Begin()
 			if txErr != nil {
-				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
+				markMigrationDirty(db, m.version)
 				return fmt.Errorf("migration %d: begin transaction failed: %w", m.version, txErr)
 			}
 			failed := false
@@ -646,11 +646,11 @@ func Migrate(db *sql.DB) error {
 			}
 			if failed {
 				tx.Rollback()
-				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
+				markMigrationDirty(db, m.version)
 				return fmt.Errorf("migration %d failed: %w", m.version, execErr)
 			}
 			if err := tx.Commit(); err != nil {
-				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
+				markMigrationDirty(db, m.version)
 				return fmt.Errorf("migration %d commit failed: %w", m.version, err)
 			}
 		}
@@ -668,7 +668,7 @@ func Migrate(db *sql.DB) error {
 		if m.version == 8 {
 			applyHardeningV2Alters(db)
 		}
-		if _, err := db.Exec(upsertSchemaMigration(db, m.version, false), m.version); err != nil {
+		if err := markSchemaMigration(db, m.version, false); err != nil {
 			return fmt.Errorf("failed to record migration %d as applied: %w", m.version, err)
 		}
 	}
@@ -956,7 +956,12 @@ func BackfillKeyIDs(database *sql.DB) (int64, error) {
 	if database == nil {
 		return 0, nil
 	}
-	res, err := database.Exec(`UPDATE request_logs SET key_id = (SELECT k.id FROM gateway_keys k WHERE k.prefix = request_logs.key_prefix) WHERE key_id IS NULL AND key_prefix IN (SELECT prefix FROM gateway_keys)`)
+	// The HAVING COUNT(*)=1 guard implements the documented contract: with
+	// duplicate prefixes the correlated subquery would otherwise pick an
+	// ARBITRARY one of the colliding keys and silently attribute historical
+	// spend to a key that may not have made those requests. Ambiguous rows
+	// stay NULL until an operator resolves the collision.
+	res, err := database.Exec(`UPDATE request_logs SET key_id = (SELECT k.id FROM gateway_keys k WHERE k.prefix = request_logs.key_prefix) WHERE key_id IS NULL AND key_prefix IN (SELECT prefix FROM gateway_keys GROUP BY prefix HAVING COUNT(*) = 1)`)
 	if err != nil {
 		return 0, err
 	}
@@ -1063,12 +1068,32 @@ func logDuplicatePrefixes() {
 	fmt.Println("WARNING: gateway_keys contains duplicate prefixes; skipping UNIQUE index creation (resolve duplicates, then re-run)")
 }
 
-func upsertSchemaMigration(db *sql.DB, version int, dirty bool) string {
-	dirtyVal := BoolLit(false)
-	if dirty {
-		dirtyVal = BoolLit(true)
+// markSchemaMigration records a migration version as applied (dirty=false) or
+// failed (dirty=true).
+//
+// The failure-path callers previously Exec'd the upsert WITHOUT binding the
+// version placeholder: the generated SQL carries one `?`, and an Exec with no
+// arguments fails with "not enough args" (lib/pq: "no arguments provided"),
+// so the dirty flag was silently never written. A failed migration then
+// looked clean on the next boot and was blindly retried instead of aborting
+// with the operator-facing "marked dirty" error. This helper binds the
+// version and logs (rather than swallows) bookkeeping failures.
+func markSchemaMigration(db *sql.DB, version int, dirty bool) error {
+	dirtyVal := BoolLit(dirty)
+	q := Rebind(`INSERT INTO schema_migrations(version, dirty) VALUES(?, ` + dirtyVal + `)` + UpsertEnd([]string{"version"}, []string{"dirty"}))
+	if _, err := db.Exec(q, version); err != nil {
+		return err
 	}
-	return Rebind(`INSERT INTO schema_migrations(version, dirty) VALUES(?, ` + dirtyVal + `)` + UpsertEnd([]string{"version"}, []string{"dirty"}))
+	return nil
+}
+
+// markMigrationDirty is the failure-path wrapper: bookkeeping must not mask
+// the migration error, but a failure to write the dirty flag is logged so an
+// operator can spot a ledger that disagrees with the schema.
+func markMigrationDirty(db *sql.DB, version int) {
+	if err := markSchemaMigration(db, version, true); err != nil {
+		log.Error().Err(err).Int("version", version).Msg("failed to mark migration dirty in schema_migrations")
+	}
 }
 
 func applyLegacyAlters(db *sql.DB) {

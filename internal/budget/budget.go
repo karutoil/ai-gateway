@@ -48,8 +48,12 @@ func (m *MemoryLimiter) Check(prefix string, promptTokens int) error {
 	}
 	if m.tokensUsed[prefix]+promptTokens > m.DailyTokenLimit {
 		used := int64(m.tokensUsed[prefix] + promptTokens)
-		quotaErr("daily_token", int64(m.DailyTokenLimit), used, prefix, "")
-		return fmt.Errorf("%w: daily_token_limit %d exceeded", ErrOverQuota, m.DailyTokenLimit)
+		// Return the typed QuotaError (which emits the single billing.over_quota
+		// webhook from quotaErr). The previous shape called quotaErr purely for
+		// its webhook side effect, discarded the result, and returned a plain
+		// fmt.Errorf — the error type, limit kind and usage numbers were all
+		// lost to callers that wanted them.
+		return quotaErr("daily_token", int64(m.DailyTokenLimit), used, prefix, "")
 	}
 	return nil
 }
@@ -57,6 +61,15 @@ func (m *MemoryLimiter) Check(prefix string, promptTokens int) error {
 func (m *MemoryLimiter) RecordUsage(prefix string, tokens int, _ int, _ time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Anchor the daily window on FIRST USAGE, not only in Check: Check resets
+	// the counter whenever lastReset has no entry, so usage recorded before
+	// the first admission check (post-response recording of a request that
+	// was admitted when the limiter was installed mid-flight, or a test that
+	// records before checking) was silently discarded and the quota
+	// under-enforced. Recording anchors the window instead.
+	if _, ok := m.lastReset[prefix]; !ok {
+		m.lastReset[prefix] = time.Now().Truncate(24 * time.Hour)
+	}
 	m.tokensUsed[prefix] += tokens
 }
 
