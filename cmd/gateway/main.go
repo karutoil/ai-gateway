@@ -29,6 +29,7 @@ import (
 	"ai-gateway/internal/discovery"
 	"ai-gateway/internal/handler"
 	"ai-gateway/internal/lb"
+	"ai-gateway/internal/mcp"
 	"ai-gateway/internal/middleware"
 	_ "ai-gateway/internal/oauth/providers"
 	"ai-gateway/internal/otel"
@@ -101,6 +102,19 @@ func main() {
 	providerStore := provider.NewStore(database, cfg.MasterKey)
 	apiKeyStore := apikey.NewStore(database)
 	catalogStore := catalog.NewStore(database)
+	// Seed the curated capability registries (decision / image / video) in one
+	// transaction so every model class is listable and priced before the first
+	// catalog sync completes. This used to seed only decision models at boot and
+	// leave image/video to the 24h sync, so a fresh deployment listed zero image
+	// and zero video models until a sync happened to run.
+	//
+	// Insert-only: rows the operator edited (price, capability flags, name) are
+	// never overwritten, so a boot cannot revert a negotiated rate.
+	if n, err := catalogStore.SeedAllCuratedModels(); err != nil {
+		log.Warn().Err(err).Msg("curated model seed failed")
+	} else if n > 0 {
+		log.Debug().Int("models", n).Msg("curated models seeded")
+	}
 	userStore := user.NewStore(database)
 	// Bootstrap admin user from ADMIN_PASSWORD if no dashboard users exist.
 	// Production requires an explicit strong password (enforced by config.Load);
@@ -168,6 +182,27 @@ func main() {
 	proxyHandler.LogBodies = cfg.LogBodies
 	proxyHandler.BodyLogMaxBytes = cfg.BodyLogMaxBytes
 	proxyHandler.StreamUsageInject = cfg.StreamUsageInject
+	// Image endpoints get a longer client first-byte budget than chat: image
+	// generation is slow and would otherwise be cut off at the chat TTFB.
+	//
+	// Tri-state, matching the documented IMAGE_TIMEOUT_SECONDS contract:
+	//
+	//	unset / -1  => built-in default (proxy.DefaultImageTTFB, 300s)
+	//	0           => DISABLED: ImageTTFBDisabled, no first-byte watchdog
+	//	N (> 0)     => N seconds
+	//
+	// The disabled case needs its own flag because a zero time.Duration is
+	// already the "no override" zero value; see proxy.Handler
+	// .resolveTTFBBudget.
+	switch {
+	case cfg.ImageTimeoutSecs > 0:
+		proxyHandler.ImageTTFB = time.Duration(cfg.ImageTimeoutSecs) * time.Second
+	case cfg.ImageTimeoutSecs == 0:
+		proxyHandler.ImageTTFBDisabled = true
+		log.Warn().Msg("IMAGE_TIMEOUT_SECONDS=0: image first-byte budget DISABLED — a stalled upstream can hold an image request open indefinitely")
+	default:
+		proxyHandler.ImageTTFB = proxy.DefaultImageTTFB
+	}
 	proxyHandler.LegacyFallback = cfg.RoutingLegacyFallback
 	if cfg.RoutingLegacyFallback {
 		log.Info().Msg("ROUTING_LEGACY_FALLBACK=true: heuristic resolution enabled for bare model names without routing rules")
@@ -221,11 +256,38 @@ func main() {
 	if cfg.LogRetentionDays > 0 {
 		go runLogRetention(database, cfg.LogRetentionDays)
 	}
+	// Video-job retention. video_jobs is the ONLY table that records a
+	// provider job handle, so it cannot be derived from request_logs, and its
+	// rows carry the prompt text and a signed download URL. Until this sweep
+	// existed the only statement that removed a row was the client's own
+	// DELETE /v1/videos/{id}, so every create — including failed and abandoned
+	// ones — accumulated forever.
+	//
+	// Independent of LOG_RETENTION_DAYS: a finished job is useless to the client
+	// long before request telemetry is, and the prompt may be the most sensitive
+	// field in the request.
+	go runVideoJobRetention(database)
 	rec := audit.NewDBRecorder(database)
 	limiter := budget.NewDBLimiter(database)
 	lbStore := lb.NewStore(database)
 	proxyHandler.LB = lbStore
 	proxyHandler.Usage = &budget.UsageSink{Limiter: limiter}
+
+	// Centralized MCP: one registry of upstream MCP servers, one authenticated
+	// /mcp endpoint for harnesses, and LiteLLM-compatible mcp references on the
+	// LLM APIs. Credentials reuse the provider AES-GCM master key.
+	mcpStore := mcp.NewStore(database, cfg.MasterKey)
+	mcpManager := mcp.NewManager(mcpStore, time.Duration(cfg.MCPCallTimeoutSecs)*time.Second)
+	mcpBridge := mcp.NewBridge(mcpStore, mcpManager, cfg.MCPMaxRounds, time.Duration(cfg.MCPLoopTimeoutSecs)*time.Second)
+	proxyHandler.MCP = mcpBridge
+	mcpEndpoint := mcp.NewEndpoint(mcpStore, mcpManager, apiKeyStore)
+	// One version string in the binary: the MCP serverInfo and the clientInfo
+	// announced to upstream servers both report the gateway version.
+	mcpEndpoint.Version = handler.GatewayVersion
+	mcpManager.Version = handler.GatewayVersion
+	mcpHealthCtx, mcpHealthCancel := context.WithCancel(context.Background())
+	defer mcpHealthCancel()
+	go mcpManager.StartHealthLoop(mcpHealthCtx, time.Duration(cfg.MCPHealthIntervalSecs)*time.Second)
 
 	var rl middleware.Limiter
 	if cfg.RedisURL != "" {
@@ -422,6 +484,8 @@ func main() {
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Put("/provider-models/{id}", discoveryHandler.Update)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/{id}/enrich", discoveryHandler.Enrich)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Delete("/provider-models/{id}", discoveryHandler.Delete)
+			mcpHandler := &handler.MCPHandler{Store: mcpStore, Manager: mcpManager, Recorder: rec}
+			mcpHandler.Routes(r)
 			r.Get("/provider-models/excluded", discoveryHandler.ListExcluded)
 			r.With(middleware.RequirePerm(rbac.PermCatalogWrite)).Post("/provider-models/excluded/{id}/restore", discoveryHandler.Restore)
 			r.With(middleware.RequirePerm(rbac.PermProvidersWrite)).Post("/providers/{id}/discover", discoveryHandler.DiscoverProvider)
@@ -455,6 +519,28 @@ func main() {
 		r.Post("/completions", proxyHandler.Completions)
 		r.Post("/v1/embeddings", proxyHandler.Embeddings)
 		r.Post("/embeddings", proxyHandler.Embeddings)
+		// Images API — the standardized [OI]-compatible image-generation and
+		// image-edit endpoints. Both with and without /v1, like the other
+		// protocol endpoints. Always registered; unroutable until an
+		// image-capable provider exists.
+		r.Post("/v1/images/generations", proxyHandler.ImageGenerations)
+		r.Post("/images/generations", proxyHandler.ImageGenerations)
+		r.Post("/v1/images/edits", proxyHandler.ImageEdits)
+		r.Post("/images/edits", proxyHandler.ImageEdits)
+		// Videos API — asynchronous video generation. Create returns a job
+		// immediately (generation runs for minutes); clients poll the job and
+		// then download the bytes from the content route. Both with and
+		// without /v1, like the other protocol endpoints.
+		r.Post("/v1/videos", proxyHandler.VideoCreate)
+		r.Post("/videos", proxyHandler.VideoCreate)
+		r.Get("/v1/videos", proxyHandler.VideoList)
+		r.Get("/videos", proxyHandler.VideoList)
+		r.Get("/v1/videos/{id}", proxyHandler.VideoGet)
+		r.Get("/videos/{id}", proxyHandler.VideoGet)
+		r.Get("/v1/videos/{id}/content", proxyHandler.VideoContent)
+		r.Get("/videos/{id}/content", proxyHandler.VideoContent)
+		r.Delete("/v1/videos/{id}", proxyHandler.VideoDelete)
+		r.Delete("/videos/{id}", proxyHandler.VideoDelete)
 		r.Get("/v1/models", proxyHandler.Models)
 		r.Get("/v1/models/{id}", proxyHandler.GetModel)
 		// Anthropic compat — handle both /v1/messages and /messages for SDK baseURL flexibility
@@ -463,7 +549,49 @@ func main() {
 		// Responses API — both with and without /v1
 		r.Post("/v1/responses", proxyHandler.Responses)
 		r.Post("/responses", proxyHandler.Responses)
+		// System One / decision-model endpoint (noul/choice/score questions) —
+		// both with and without /v1, like the other protocol endpoints. Always
+		// registered: it is unroutable without a decision-capable provider, and
+		// gating it would make decision models second-class citizens.
+		r.Post("/v1/systemone", proxyHandler.SystemOne)
+		r.Post("/systemone", proxyHandler.SystemOne)
+		// Centralized MCP: harnesses (Pi, OpenCode, Claude Code, Cursor) point
+		// their MCP client at this single endpoint instead of configuring each
+		// upstream server separately. It is an MCP JSON-RPC surface, so it does
+		// not share budget/rate middleware semantics with /v1 — see the
+		// dedicated group below.
 	})
+
+	// Unified MCP endpoint. Auth accepts x-litellm-api-key (the LiteLLM
+	// convention) in addition to Bearer/x-api-key, because MCP clients reserve
+	// Authorization for upstream OAuth. Rate limiting and budgets still apply.
+	// The unified MCP surface carries the SAME policy chain a /v1 call does:
+	// authentication (x-litellm-api-key / Bearer / x-api-key), budget and rate
+	// limits. It is a private router mounted on the tree because /mcp also
+	// serves the dashboard SPA on a browser navigation (see r.Get("/mcp")).
+	mcpRoutes := chi.NewRouter()
+	mcpRoutes.Handle("/mcp", mcpEndpoint)
+	// LiteLLM-style single- and multi-server selection. LiteLLM names the path
+	// segment /mcp/<server>, so both shapes are served:
+	//   /<server>/mcp              (natural REST reading)
+	//   /mcp/<a>  /mcp/<a,b>       (LiteLLM's own grammar)
+	// The segment(s) only NARROW access; the key's grants still decide.
+	mcpRoutes.Handle("/{server}/mcp", mcpEndpoint)
+	mcpRoutes.Handle("/mcp/{server}", mcpEndpoint)
+	mcpRoutes.Handle("/mcp/{servers}", mcpEndpoint)
+	// LiteLLM-compatible REST helpers for scripted use without an MCP client
+	// (no LLM in the loop).
+	mcpRoutes.Get("/v1/mcp/server", mcpEndpoint.ListServersREST)
+	mcpRoutes.Get("/mcp-rest/tools/list", mcpEndpoint.ListToolsREST)
+	mcpRoutes.Post("/mcp-rest/tools/call", mcpEndpoint.CallToolREST)
+
+	// mcpPlane is the policy chain every MCP path shares: authentication
+	// (x-litellm-api-key / Bearer / x-api-key), budget and rate limits — the
+	// same policy a /v1 call gets, so a key cannot bypass spend controls by
+	// speaking MCP instead of HTTP.
+	mcpPlane := mcpEndpoint.Auth(
+		budget.Middleware(limiter)(
+			middleware.GatewayRateLimitWithLimits(rl, gatewayRateLimits)(mcpRoutes)))
 
 	// The bare GET /models alias (for SDK baseURLs without /v1) collides with
 	// the dashboard's client-side /models screen: a browser refresh there
@@ -485,6 +613,29 @@ func main() {
 		}
 		gatewayModelsAPI.ServeHTTP(w, r)
 	})
+
+	// `/mcp` doubles as the dashboard route: a browser refresh must serve the
+	// SPA, never a 401 JSON-RPC envelope. mcpAPI carries the full auth +
+	// budget + rate-limit chain, so this wrapper is a dispatcher, not a bypass.
+	r.Handle("/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && wantsHTML(r) {
+			serveWeb(database)(w, r)
+			return
+		}
+		mcpPlane.ServeHTTP(w, r)
+	}))
+	// Every other MCP path must be mounted on the ROOT tree: a route that
+	// exists only inside a private sub-router is unreachable, which silently
+	// served the SPA (200 HTML) instead of the API.
+	for _, path := range []string{
+		"/{server}/mcp",
+		"/mcp/{server}",
+		"/v1/mcp/server",
+		"/mcp-rest/tools/list",
+		"/mcp-rest/tools/call",
+	} {
+		r.Handle(path, mcpPlane)
+	}
 
 	// openapi: served from the embedded spec so the binary is self-contained
 	// outside a source checkout (the old filesystem fallbacks included the
@@ -561,6 +712,10 @@ func main() {
 		log.Warn().Err(err).Msg("drain window expired; closing remaining connections")
 		_ = srv.Close()
 	}
+	// Tear down MCP client sessions (their stdio child processes included)
+	// before the process exits so no orphan survives a restart.
+	mcpHealthCancel()
+	mcpManager.Close()
 	// Flush SQLite WAL so the on-disk database is consistent for the next
 	// process even if the machine loses power right after exit.
 	if err := database.Close(); err != nil {
@@ -683,6 +838,37 @@ func runLogRetention(database *sql.DB, days int) {
 	}
 }
 
+// runVideoJobRetention sweeps finished video jobs once at boot and then hourly.
+//
+// Hourly rather than daily because a long-lived process must not accumulate a
+// day's worth of rows, and because expiry is provider-driven: a job can become
+// useless minutes after it completes. The sweep itself is one indexed statement
+// in steady state (db.PruneVideoJobs is bounded and only touches terminal rows),
+// so the cadence is cheap. Runs forever until process exit; best-effort.
+func runVideoJobRetention(database *sql.DB) {
+	if database == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	prune := func() {
+		res, err := db.PruneVideoJobs(context.Background(), database, 500, db.DefaultVideoJobRetention)
+		if err != nil {
+			log.Warn().Err(err).Msg("video job retention sweep failed")
+			return
+		}
+		if res.Total() > 0 {
+			log.Info().Int64("expired", res.Expired).Int64("retention", res.Retention).
+				Dur("retention_window", db.DefaultVideoJobRetention).
+				Msg("video job retention sweep")
+		}
+	}
+	prune()
+	for range ticker.C {
+		prune()
+	}
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -696,8 +882,15 @@ func securityHeaders(next http.Handler) http.Handler {
 		// is fetched with CORS so style-src-elem needs the explicit origin.
 		// Still blocks external script/object/iframe injection paths an XSS
 		// payload relies on.
+		//
+		// media-src is set explicitly to 'self' + blob:. Without a media-src
+		// directive, media falls back to default-src 'self' and the browser
+		// refuses the blob: URL the Playground uses to preview a generated
+		// video (MEDIA_ELEMENT_ERROR "Media load rejected by URL safety
+		// check"). The generated-image path is unaffected: img-src already
+		// allows data:.
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+			"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; style-src-elem 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; media-src 'self' blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -850,4 +1043,12 @@ func serveFallback(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>AI Gateway</title><style>body{font-family:system-ui, sans-serif; max-width:800px; margin:40px auto; padding:20px; background:#0F1311; color:#F8F6F1} a{color:#2CF6B3} code{background:#1a1f1d; padding:2px 6px; border-radius:4px} .card{border:1px solid #2a2f2d; padding:20px; border-radius:12px; margin:20px 0} h1{color:#FFB84D}</style></head><body><h1>⚡ AI Gateway — 1.5</h1><p>Go gateway is running. UI not yet built — use API.</p></body></html>`))
+}
+
+// wantsHTML reports whether a request is a browser navigation rather than an
+// API call. The SPA is served for navigations; everything else falls through
+// to the API handler.
+func wantsHTML(r *http.Request) bool {
+	accept := strings.ToLower(r.Header.Get("Accept"))
+	return strings.Contains(accept, "text/html") && !strings.Contains(accept, "application/json")
 }

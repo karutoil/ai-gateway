@@ -38,21 +38,21 @@ export default function Audit(){
   const [actor, setActor] = useState('')
   const [actorInput, setActorInput] = useState('')
 
-  const load = (opts?: { resetOffset?: boolean })=>{
-    const nextOffset = opts?.resetOffset ? 0 : offset
+  const load = ()=>{
     setLoading(true)
     setLoadError('')
-    api.audit.list({ limit, offset: nextOffset, actor: actor || undefined })
+    api.audit.list({ limit, offset, actor: actor || undefined })
       .then(({ rows, total })=>{
         setRows(rows)
         setTotal(total)
-        if (opts?.resetOffset) setOffset(0)
       })
       .catch((e:any)=> setLoadError(e?.message || String(e)))
       .finally(()=> setLoading(false))
   }
 
-  useEffect(()=>{ load({ resetOffset: true }) }, [limit, actor])
+  // `offset` belongs in the dependencies: Prev/Next only move the cursor, so
+  // leaving it out made the page label change while the rows never reloaded.
+  useEffect(()=>{ load() }, [limit, offset, actor])
 
   const page = Math.floor(offset / limit) + 1
   const totalPages = total != null ? Math.max(1, Math.ceil(total / limit)) : null
@@ -89,16 +89,17 @@ export default function Audit(){
           <Card className="flex flex-col sm:flex-row sm:items-center gap-2">
             <form
               className="relative flex-1 min-w-[180px]"
-              onSubmit={(e)=>{ e.preventDefault(); setActor(actorInput.trim()) }}
+              onSubmit={(e)=>{ e.preventDefault(); setOffset(0); setActor(actorInput.trim()) }}
             >
               <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
-              <Input value={actorInput} onChange={e=>setActorInput(e.target.value)} placeholder="Filter by actor (username)…" className="pl-9"/>
+              <Input value={actorInput} onChange={e=>setActorInput(e.target.value)} placeholder="Filter by actor (username)…" className="pl-9" aria-label="Filter by actor"/>
             </form>
             <label className="flex items-center gap-2 text-xs font-medium text-muted">
               Rows
               <Select
                 value={limit}
-                onChange={e=>setLimit(Number(e.target.value))}
+                onChange={e=>{ setOffset(0); setLimit(Number(e.target.value)) }}
+                aria-label="Rows per page"
               >
                 {PAGE_SIZES.map(n=> <option key={n} value={n}>{n}</option>)}
               </Select>

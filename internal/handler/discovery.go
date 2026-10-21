@@ -79,6 +79,13 @@ func (h *DiscoveryHandler) AddManual(w http.ResponseWriter, r *http.Request) {
 		ReasoningOutputLimits string  `json:"reasoning_output_limits"`
 		ToolCall              bool    `json:"tool_call"`
 		Attachment            bool    `json:"attachment"`
+		Decision              bool    `json:"decision"`
+		Image                 bool    `json:"image"`
+		// Video was missing here while the model already carried it (the
+		// UPDATE path decodes the whole ProviderModel, so it could set video
+		// but POST could not). An operator could therefore never turn a
+		// hand-added row into a video model through the dashboard.
+		Video bool `json:"video"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ProviderID == "" || body.ModelID == "" {
 		http.Error(w, `{"error":"provider_id and model_id required"}`, 400)
@@ -100,6 +107,9 @@ func (h *DiscoveryHandler) AddManual(w http.ResponseWriter, r *http.Request) {
 		ReasoningOutputLimits: body.ReasoningOutputLimits,
 		ToolCall:              body.ToolCall,
 		Attachment:            body.Attachment,
+		Decision:              body.Decision,
+		Image:                 body.Image,
+		Video:                 body.Video,
 	}
 	id, err := h.Service.AddManual(body.ProviderID, body.ModelID, m)
 	if err != nil {

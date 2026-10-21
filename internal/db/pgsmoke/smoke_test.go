@@ -37,8 +37,10 @@ func TestPostgresMigrations(t *testing.T) {
 	if err := database.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if n != 24 {
-		t.Fatalf("migrations = %d, want 24", n)
+	// Derived, not hardcoded: a magic number here went stale twice (it still
+	// said 24 when the schema was already at 26).
+	if want := db.LatestMigrationVersion(); n != want {
+		t.Fatalf("migrations = %d, want %d", n, want)
 	}
 }
 

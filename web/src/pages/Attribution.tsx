@@ -29,6 +29,9 @@ export default function Attribution() {
   const [data, setData] = useState<AttributionReport | null>(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
+  // Bumped by Refresh. Clearing `data` alone (or calling setRange(r => r)) is a
+  // no-op for React and left the button doing nothing at all.
+  const [reload, setReload] = useState(0)
 
   const appsSort = useSort({ key: 'cost', dir: 'desc' })
   const usersSort = useSort({ key: 'cost', dir: 'desc' })
@@ -44,7 +47,7 @@ export default function Attribution() {
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [range, custom?.from, custom?.to])
+  }, [range, custom?.from, custom?.to, reload])
 
   const apps = useMemo(() => sortRows(data?.apps ?? [], appsSort.sort), [data, appsSort.sort])
   const users = useMemo(() => sortRows(data?.end_users ?? [], usersSort.sort), [data, usersSort.sort])
@@ -72,8 +75,8 @@ export default function Attribution() {
         title="Who is using the gateway"
         description="Usage split by application and by end user, so spend maps to a product or a person instead of just a key prefix."
         actions={
-          <Button variant="secondary" size="sm" onClick={() => { setData(null); setRange(r => r) }} title="Reload">
-            <Icon name="refresh" size={14}/> Refresh
+          <Button variant="secondary" size="sm" onClick={() => setReload(n => n + 1)} disabled={loading} title="Reload">
+            <Icon name="refresh" size={14} className={loading ? 'animate-spin' : ''}/> Refresh
           </Button>
         }
       />

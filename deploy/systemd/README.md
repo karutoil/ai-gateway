@@ -23,11 +23,23 @@ errors, and retry storms amplify load right when the service comes back.
    sessions stay valid and provider credentials keep decrypting. Users do
    not need to re-login after a deploy.
 3. **Graceful drain** — on SIGTERM the gateway stops accepting and lets
-   in-flight streams finish within `SHUTDOWN_GRACE_SECONDS` (default 90),
-   then force-closes stragglers and flushes the SQLite WAL.
-   `TimeoutStopSec=95` in the service unit gives systemd the same window.
+   in-flight requests finish within `SHUTDOWN_GRACE_SECONDS`, then
+   force-closes stragglers and flushes the SQLite WAL.
+
+   > **Invariant (P1-16):** `SHUTDOWN_GRACE_SECONDS` must be >= the slowest
+   > request budget, and the slowest budget is `IMAGE_TIMEOUT_SECONDS`
+   > (300s by default). The config default is only 90s, which cancels in-flight
+   > image generations mid-flight: the client gets a 502 and the
+   > `request_logs` billing row is never written (the DB is closed immediately
+   > after the drain) while the provider still bills. Set
+   > `SHUTDOWN_GRACE_SECONDS=330` in `/etc/ai-gateway.env` and keep
+   > `TimeoutStopSec=360` in the unit above it. The gateway logs a boot-time
+   > WARNING when the two disagree. Full rationale: `deploy/README.md` §1.
+
 4. **Readiness probes** — `GET /ready` (503 while the DB is down) and
-   `GET /health` (liveness) let orchestrators gate traffic correctly.
+   `GET /health` (liveness) let orchestrators gate traffic correctly. Neither
+   is affected by long in-flight image requests: they are separate mux routes.
+   Long work is handled by the drain window (item 3), not by probe tuning.
 
 ## Install (systemd host)
 
@@ -44,6 +56,8 @@ ADMIN_PASSWORD=<strong password>
 MASTER_KEY=$(openssl rand -hex 32)
 JWT_SECRET=$(openssl rand -hex 32)
 DATABASE_URL=/var/lib/ai-gateway/gateway.db
+SHUTDOWN_GRACE_SECONDS=330
+IMAGE_TIMEOUT_SECONDS=300
 EOF
 
 sudo systemctl daemon-reload

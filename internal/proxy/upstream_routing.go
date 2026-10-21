@@ -13,6 +13,9 @@ const (
 	UpstreamChat      UpstreamAPI = "chat"
 	UpstreamResponses UpstreamAPI = "responses"
 	UpstreamMessages  UpstreamAPI = "messages"
+	// UpstreamSystemOne is the decision-model endpoint (noul/choice/score
+	// questions, typed probabilistic answers) served at /v1/systemone.
+	UpstreamSystemOne UpstreamAPI = "systemone"
 	UpstreamUnknown   UpstreamAPI = "unknown"
 )
 
@@ -109,6 +112,8 @@ func correctInboundFor(api UpstreamAPI) string {
 		return "/v1/messages"
 	case UpstreamResponses:
 		return "/v1/responses"
+	case UpstreamSystemOne:
+		return "/v1/systemone"
 	default:
 		return ""
 	}

@@ -11,6 +11,23 @@ const (
 	ProviderOpenAICompatible ProviderType = "openai_compatible"
 	ProviderAntigravity      ProviderType = "antigravity"
 	ProviderDevin            ProviderType = "devin"
+	// ProviderSystemOne is a System One / decision-model endpoint
+	// (POST <base>/v1/systemone): TypeSafe Jev, a local Kev server, or
+	// llama.cpp's /v1/systemone.
+	ProviderSystemOne ProviderType = "systemone"
+	// ProviderCloudflare is Cloudflare Workers AI, where decision models are
+	// addressed by name in the path
+	// (/client/v4/accounts/<id>/ai/run/@cf/cloudflare/<model>).
+	ProviderCloudflare ProviderType = "cloudflare"
+	// ProviderGoogle is Google's Gemini API (generativelanguage.googleapis.com).
+	// The gateway speaks its native image endpoints (:generateContent for Nano
+	// Banana, :predict for Imagen). It is image-only here — for Gemini chat use
+	// an openai_compatible provider pointed at the Gemini [OI]-compatibility
+	// base URL (/v1beta/openai/).
+	ProviderGoogle ProviderType = "google"
+	// ProviderXAI is xAI's Grok API (api.x.ai/v1). It is [OI]-compatible for
+	// chat and images, so the gateway passes image requests straight through.
+	ProviderXAI ProviderType = "xai"
 )
 
 type Provider struct {
@@ -139,6 +156,16 @@ type CatalogModel struct {
 	ReasoningType         string    `json:"reasoning_type"`          // effort, toggle, none
 	ReasoningLevels       string    `json:"reasoning_levels"`        // JSON array e.g. ["low","medium","high"]
 	ReasoningOutputLimits string    `json:"reasoning_output_limits"` // JSON map e.g. {"low":10000,"high":50000}
+	// Decision marks a System One / decision model (noul/choice/score
+	// questions, typed probabilistic answers) rather than a text LLM.
+	Decision bool `json:"decision"`
+	// Image marks an image-generation model (gpt-image-*, dall-e-*,
+	// Gemini Nano Banana / Imagen, xAI Grok image) served through
+	// POST /v1/images/generations and /v1/images/edits.
+	Image bool `json:"image"`
+	// Video marks a video-generation model (Sora, Veo, Grok Imagine) served
+	// through the async POST /v1/videos job API.
+	Video bool `json:"video"`
 }
 
 type ModelAlias struct {
@@ -172,9 +199,15 @@ type ProviderModel struct {
 	ReasoningType         string    `json:"reasoning_type"`
 	ReasoningLevels       string    `json:"reasoning_levels"`
 	ReasoningOutputLimits string    `json:"reasoning_output_limits"`
-	AvgTTFTMs             float64   `json:"avg_ttft_ms,omitempty"`
-	AvgTPS                float64   `json:"avg_tps,omitempty"`
-	RequestCount          int       `json:"request_count,omitempty"`
+	// Decision marks a System One / decision model (see CatalogModel).
+	Decision bool `json:"decision"`
+	// Image marks an image-generation model (see CatalogModel).
+	Image bool `json:"image"`
+	// Video marks a video-generation model (see CatalogModel).
+	Video        bool    `json:"video"`
+	AvgTTFTMs    float64 `json:"avg_ttft_ms,omitempty"`
+	AvgTPS       float64 `json:"avg_tps,omitempty"`
+	RequestCount int     `json:"request_count,omitempty"`
 }
 
 // ExcludedModel is a provider model an operator removed. It stays out of

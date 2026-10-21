@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 type Option = string | { value: string; label: string; group?: string }
@@ -21,6 +21,8 @@ type Props = {
   footer?: string
   /** Chip text for a selected value, when the value itself isn't what to show. */
   chipLabel?: (value: string) => string
+  /** Accessible name for the combobox input. Defaults to a generic label. */
+  ariaLabel?: string
 }
 
 function normalizeOptions(options: Option[]): { value: string; label: string; group: string }[] {
@@ -31,9 +33,14 @@ function normalizeOptions(options: Option[]): { value: string; label: string; gr
 
 export default function ModelCombobox({
   value, onChange, options, placeholder = 'Search models...', disabled, loading,
-  mode = 'multi', allowCustom = true, emptyHint, footer, chipLabel,
+  mode = 'multi', allowCustom = true, emptyHint, footer, chipLabel, ariaLabel = 'Model',
 }: Props) {
   const single = mode === 'single'
+  // Stable ids so aria-controls / aria-activedescendant can point at the popup
+  // that is portalled to document.body.
+  const baseId = useId()
+  const listId = `${baseId}-listbox`
+  const optionId = (idx: number) => `${baseId}-opt-${idx}`
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState(false)
   const [highlight, setHighlight] = useState(0)
@@ -142,9 +149,10 @@ export default function ModelCombobox({
     return (
       <div ref={dropdownRef} style={{ position: 'fixed', top, left, width, zIndex: 60 }}
         className="bg-surface border border-stone rounded-lg shadow-pop overflow-hidden">
-        <div className="max-h-[260px] overflow-auto py-1.5">
+        <div className="max-h-[260px] overflow-auto py-1.5" role="listbox" id={listId}
+          aria-label={ariaLabel} aria-multiselectable={single ? undefined : true}>
           {rows.length === 0 ? (
-            <div className="px-3 py-4 text-xs text-muted text-center">
+            <div className="px-3 py-4 text-xs text-muted text-center" role="status">
               {loading ? 'Loading models…' : query ? (allowCustom ? 'No matches — press Enter to add as wildcard' : 'No matches') : (emptyHint || 'No models found')}
             </div>
           ) : (
@@ -155,13 +163,16 @@ export default function ModelCombobox({
               const prev = idx > 0 ? rows[idx - 1] : null
               const showGroup = !isAdd && !!r.group && (!prev || prev.kind === 'add' || prev.group !== r.group)
               return (
-                <div key={`${r.kind}-${r.value}-${idx}`}>
+                <div key={`${r.kind}-${r.value}-${idx}`} role="presentation">
                   {showGroup && (
-                    <div className="px-3 pt-2.5 pb-1 text-[11px] font-semibold uppercase tracking-wider text-muted bg-raised/60 border-y border-stone first:border-t-0">
+                    <div role="presentation" className="px-3 pt-2.5 pb-1 text-[11px] font-semibold uppercase tracking-wider text-muted bg-raised/60 border-y border-stone first:border-t-0">
                       {r.group}
                     </div>
                   )}
-                  <button type="button" onMouseEnter={() => setHighlight(idx)}
+                  <button type="button" id={optionId(idx)} role="option"
+                    aria-selected={isAdd ? false : isSelected}
+                    tabIndex={-1}
+                    onMouseEnter={() => setHighlight(idx)}
                     onMouseDown={e => { e.preventDefault(); if (isAdd) add(r.value); else toggle(r.value) }}
                     className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 transition-colors ${isActive ? 'bg-raised' : ''}`}>
                     <span className="flex items-center gap-2 min-w-0">
@@ -202,7 +213,21 @@ export default function ModelCombobox({
 
   return (
     <div ref={rootRef} className="relative">
-      <div onClick={() => inputRef.current?.focus()}
+      {/* The whole control is a pointer target: clicking the chrome, the chips
+          or the caret must focus the input and open the popup, exactly like a
+          native <select>. Without this the only clickable sliver was the input
+          itself, which collapses to ~20px once a long model id is selected —
+          so in Video mode (long ids like "gemini-omni-1.1-flash") the picker
+          looked completely dead. The wrapper keeps no interactive role: the
+          input is the control and owns the listbox. */}
+      <div
+        onClick={e => {
+          // A chip's remove button handles its own click.
+          if ((e.target as HTMLElement).closest('button')) return
+          inputRef.current?.focus()
+          setOpen(true)
+          updateRect()
+        }}
         className={`flex flex-wrap items-center gap-1.5 min-h-[36px] bg-app border rounded-lg px-2.5 py-1.5 cursor-text transition-colors ${open ? 'border-accent ring-2 ring-accent/20' : 'border-stone hover:border-muted/60'} ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
         {value.map(v => (
           <span key={v} className="inline-flex items-center gap-1 bg-raised border border-accent/25 rounded-full pl-2.5 pr-1 py-0.5 text-xs font-mono text-paper">
@@ -215,13 +240,27 @@ export default function ModelCombobox({
         ))}
         <input ref={inputRef} value={query}
           onChange={e => { setQuery(e.target.value); setOpen(true); setHighlight(0) }}
+          // A pointer click on an already-focused input fires no focus event,
+          // so opening on click as well keeps the popup reachable after Escape.
           onFocus={() => { setOpen(true); updateRect() }}
           onKeyDown={onKeyDown}
+          onClick={() => { setOpen(true); updateRect() }}
+          // Combobox semantics: the input owns the popup, the popup is a
+          // listbox of options, and the highlighted row is the active option.
+          role="combobox"
+          aria-label={ariaLabel}
+          aria-expanded={open}
+          aria-controls={open ? listId : undefined}
+          aria-autocomplete="list"
+          aria-activedescendant={open && rows.length > 0 ? optionId(highlight) : undefined}
+          aria-haspopup="listbox"
           placeholder={value.length === 0 || single ? placeholder : 'Add model...'}
-          className="flex-1 min-w-[140px] bg-transparent outline-none text-sm placeholder:text-muted px-1 py-0.5"
+          // min-w keeps a usable click/type target when a long chip is shown;
+          // flex-1 lets it grow, min-w-0 alone let it collapse to a sliver.
+          className="flex-1 min-w-[72px] bg-transparent outline-none text-sm placeholder:text-muted px-1 py-0.5"
           disabled={disabled} autoComplete="off" spellCheck={false} />
         {loading && <span className="font-mono text-[10px] text-muted px-1">loading…</span>}
-        {!loading && <span className="ml-auto text-muted text-xs px-1 select-none pointer-events-none">{open ? '▴' : '▾'}</span>}
+        {!loading && <span className="ml-auto text-muted text-xs px-1 select-none pointer-events-none" aria-hidden="true">{open ? '▴' : '▾'}</span>}
       </div>
       {dropdown ? createPortal(dropdown, document.body) : null}
     </div>

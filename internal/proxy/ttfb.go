@@ -55,6 +55,37 @@ func newTTFBController(budget time.Duration, start time.Time) *ttfbController {
 	return &ttfbController{budget: budget, start: start, stopCh: make(chan struct{})}
 }
 
+// newDisabledTTFBController returns a controller with NO budget: the
+// client-facing first-byte watchdog is off entirely.
+//
+// This is the explicit IMAGE_TIMEOUT_SECONDS=0 end state (P1-12). A single
+// time.Duration cannot express it — 0 also means "unset, use the endpoint
+// default" — so the disabled case is a distinct constructor rather than a
+// zero value, and proxyCandidatesOpts.ttfbDisable / Handler.ImageTTFBDisabled
+// select it.
+//
+// Every budget-gated method already short-circuits at budget <= 0:
+//   - expired() is always false, so no attempt is ever cancelled and no
+//     honest-504 / keepalive path is reachable;
+//   - remaining() is 0, so armTTFBWatchdog returns nil (no timer, no cancel);
+//   - commitKeepalive() returns immediately, so no heartbeat goroutine starts
+//     and no SSE keepalive frames are fabricated;
+//   - armFirstChunkUmbra() returns a nil channel and a no-op stop.
+//
+// The gateway therefore waits as long as the upstream needs — exactly the
+// pre-TTFB behaviour the docs promise for a disabled budget.
+func newDisabledTTFBController(start time.Time) *ttfbController {
+	return newTTFBController(0, start)
+}
+
+// budgetDisabled reports whether this controller has no first-byte watchdog.
+// Exported-ish for tests and for callers that want to explain the disposition
+// in a log line; nil counts as disabled (a nil controller is a transparent
+// passthrough everywhere).
+func (c *ttfbController) budgetDisabled() bool {
+	return c == nil || c.budget <= 0
+}
+
 // age is time elapsed since the CLIENT request started — shared across the
 // whole candidate/fallback chain, not per upstream attempt.
 func (c *ttfbController) age() time.Duration { return time.Since(c.start) }

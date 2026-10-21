@@ -492,6 +492,29 @@ export const api = {
     setPermissions: (id:string, overrides: Record<string, boolean | null>) =>
       req(`/api/admin/users/${id}/permissions`, { method:'PUT', body: JSON.stringify(overrides)}),
   },
+  /**
+   * Centralized MCP registry: upstream MCP servers the gateway owns and the
+   * single /mcp endpoint harnesses connect to.
+   */
+  mcp: {
+    list: (): Promise<any[]> => req('/api/mcp/servers'),
+    get: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}`),
+    create: (data: Record<string, unknown>) => req('/api/mcp/servers', { method: 'POST', body: JSON.stringify(data) }),
+    update: (id: string, data: Record<string, unknown>) =>
+      req(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(data) }),
+    remove: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    enable: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}/enable`, { method: 'POST' }),
+    disable: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}/disable`, { method: 'POST' }),
+    test: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+    discover: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}/discover`, { method: 'POST' }),
+    tools: (id: string) => req(`/api/mcp/servers/${encodeURIComponent(id)}/tools`),
+    allTools: (): Promise<any[]> => req('/api/mcp/tools'),
+    status: () => req('/api/mcp/status'),
+    calls: () => req('/api/mcp/calls'),
+    keyPermissions: (keyId: string) => req(`/api/keys/${encodeURIComponent(keyId)}/mcp`),
+    setKeyPermissions: (keyId: string, servers: any[]) =>
+      req(`/api/keys/${encodeURIComponent(keyId)}/mcp`, { method: 'PUT', body: JSON.stringify({ servers }) }),
+  },
   /** Admin-only audit trail: GET /api/audit?limit=&offset=&actor= */
   audit: {
     list: async (params: { limit?: number; offset?: number; actor?: string } = {}): Promise<{ rows: any[]; total: number | null }> => {

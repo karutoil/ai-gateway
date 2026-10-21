@@ -78,9 +78,6 @@ export default function Users(){
   }
   useEffect(()=>{ load()},[])
 
-  const isAdmin = me?.role === 'admin' || list.find(u=>u.username==='admin')?.role==='admin' // fallback
-  // Actually check me role, if not loaded, check token? For now allow if me is admin
-  void isAdmin
   const canManage = me?.role === 'admin'
 
   const create = async()=>{

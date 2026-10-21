@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
 import { Card, Button, Badge, Icon, EmptyState, Stat, Eyebrow, PageHeader, CopyButton, type IconName } from '../components/ui'
+import { fmtCompact, fmtInt } from '../components/report'
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -26,11 +27,13 @@ export default function Dashboard() {
   }
 
   const cards = [
-    { label:'Providers', value: stats?.providers ?? '—', sub:'upstream endpoints', icon:'server' as IconName, tone:'warn' as const },
-    { label:'API keys', value: stats?.keys ?? '—', sub:'virtual sk-gw-*', icon:'key' as IconName, tone:'good' as const },
-    { label:'Requests', value: stats?.requests ?? '—', sub:'proxied all-time', icon:'pulse' as IconName, tone:'neutral' as const },
+    { label:'Providers', value: stats?.providers ?? '—', sub:'upstream endpoints', icon:'server' as IconName, tone:'neutral' as const },
+    { label:'API keys', value: stats?.keys ?? '—', sub:'virtual sk-gw-*', icon:'key' as IconName, tone:'neutral' as const },
+    { label:'Requests', value: stats?.requests != null ? fmtInt(stats.requests) : '—', sub:'proxied all-time', icon:'pulse' as IconName, tone:'neutral' as const },
     { label:'Models', value: catalogStatus?.count ?? stats?.catalog ?? '—', sub:'in catalog', icon:'box' as IconName, tone:'neutral' as const },
-    { label:'Tokens', value: stats?.total_tokens ? Number(stats.total_tokens).toLocaleString() : '0', sub:'total processed', icon:'zap' as IconName, tone:'good' as const },
+    // Compact + title: a raw 11,479,540,518 token count was clipped to
+    // "11,446,7…" in the 6-up grid, hiding the number it exists to show.
+    { label:'Tokens', value: stats?.total_tokens ? fmtCompact(stats.total_tokens) : '0', sub:'total processed', valueTitle: stats?.total_tokens ? fmtInt(stats.total_tokens) : '0', icon:'zap' as IconName, tone:'neutral' as const },
     { label:'Spend', value: stats?.total_cost ? `$${Number(stats.total_cost).toFixed(2)}` : '$0.00', sub:'estimated', icon:'wallet' as IconName, tone:'neutral' as const },
   ]
 
@@ -75,12 +78,12 @@ export default function Dashboard() {
           </div>
           <div className="lg:w-[300px] shrink-0 grid grid-cols-2 lg:grid-cols-1 gap-px bg-cream/15 rounded-xl overflow-hidden border border-cream/15">
             {[
-              { k: 'Tokens', v: stats?.total_tokens ? Number(stats.total_tokens).toLocaleString() : '0' },
-              { k: 'Est. spend', v: stats?.total_cost ? `$${Number(stats.total_cost).toFixed(2)}` : '$0.00' },
+              { k: 'Tokens', v: stats?.total_tokens ? fmtCompact(stats.total_tokens) : '0', title: stats?.total_tokens ? fmtInt(stats.total_tokens) : '0' },
+              { k: 'Est. spend', v: stats?.total_cost ? `$${Number(stats.total_cost).toFixed(2)}` : '$0.00', title: undefined as string | undefined },
             ].map(r => (
               <div key={r.k} className="bg-ink px-4 py-3">
                 <div className="text-[11px] uppercase tracking-[0.14em] text-cream/70">{r.k}</div>
-                <div className="font-display text-2xl font-semibold tabular-nums mt-0.5 truncate">{r.v}</div>
+                <div className="font-display text-2xl font-semibold tabular-nums mt-0.5 truncate" title={r.title}>{r.v}</div>
               </div>
             ))}
             <button onClick={()=>navigate('/analytics')} className="bg-ink px-4 py-3 text-left hover:bg-cream/5 transition-colors col-span-2 lg:col-span-1">
@@ -126,7 +129,7 @@ export default function Dashboard() {
           action={<Button variant="secondary" onClick={()=>setReloadKey(k=>k+1)}><Icon name="refresh" size={15}/>Retry</Button>} /></Card>
       ) : (
         <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
-          {cards.map(c => <Stat key={c.label} icon={c.icon} title={c.label} value={c.value} sub={c.sub} tone={c.tone} />)}
+          {cards.map(c => <Stat key={c.label} icon={c.icon} title={c.label} value={c.value} sub={c.sub} tone={c.tone} valueTitle={(c as any).valueTitle} />)}
         </div>
       )}
 

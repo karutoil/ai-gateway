@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Routes, Route, Link, NavLink, useLocation, useNavigate, Navigate } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Providers from './pages/Providers'
 import Routing from './pages/Routing'
+import McpServers from './pages/McpServers'
 import Keys from './pages/Keys'
 import Playground from './pages/Playground'
 import Logs from './pages/Logs'
@@ -19,6 +20,7 @@ import Audit from './pages/Audit'
 import Profile from './pages/Profile'
 import { authenticatePasskey } from './lib/webauthn'
 import { extractApiError } from './lib/api'
+import { requestSearchFocus } from './lib/searchFocus'
 import { setCurrentPermissions, can, type Perm } from './lib/permissions'
 import {
   Icon, Button, Input, Card, ErrorNote, SegmentedControl, Avatar,
@@ -133,6 +135,7 @@ const NAV_GROUPS: { title: string; caption: string; items: NavItem[] }[] = [
       { to: '/providers', label: 'Providers', icon: 'server', hint: 'Endpoints & health', perm: 'providers:read' },
       { to: '/models', label: 'Models', icon: 'box', hint: 'Catalog & pricing', perm: 'catalog:read' },
       { to: '/routing', label: 'Routing', icon: 'route', hint: 'Failover & balancing', perm: 'routing:read' },
+      { to: '/mcp', label: 'MCP Servers', icon: 'layers', hint: 'One endpoint for every harness', perm: 'mcp:read' },
       { to: '/settings', label: 'Settings', icon: 'cog', hint: 'Catalog & pricing' },
     ],
   },
@@ -254,24 +257,47 @@ export default function App() {
     try { return localStorage.getItem('gw_rail') === '1' } catch { return false }
   })
   const [navFilter, setNavFilter] = useState('')
+  const navFilterRef = useRef<HTMLInputElement>(null)
+  const searchTriggerRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     try { localStorage.setItem('gw_rail', railCollapsed ? '1' : '0') } catch {}
   }, [railCollapsed])
   useEffect(() => { setSidebarOpen(false) }, [loc.pathname])
 
-  // ⌘K / Ctrl-K jumps to the request search.
+  // ⌘K / Ctrl-K jumps to the request search. The destination page mounts after
+  // this fires, so hand the focus request across rather than leaving the
+  // keyboard on <body>.
   useEffect(() => {
     if (!isAuthed) return
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         navigate('/logs')
+        requestSearchFocus()
       }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
   }, [isAuthed, navigate])
+
+  // `/` focuses the sidebar jump box — the shortcut the "Jump to…" chip has
+  // advertised since it was added (pressing it previously did nothing).
+  useEffect(() => {
+    if (!isAuthed) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
+      const t = e.target as HTMLElement | null
+      const tag = t?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || t?.isContentEditable) return
+      if (!navFilterRef.current) return
+      e.preventDefault()
+      setRailCollapsed(false)
+      requestAnimationFrame(() => navFilterRef.current?.focus())
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [isAuthed])
 
   if (checking) {
     return (
@@ -309,7 +335,15 @@ export default function App() {
           <div className="px-3 pt-3 shrink-0">
             <div className="relative">
               <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={14} /></span>
-              <input value={navFilter} onChange={e => setNavFilter(e.target.value)} placeholder="Jump to…"
+              <input ref={navFilterRef} value={navFilter} onChange={e => setNavFilter(e.target.value)} placeholder="Jump to…"
+                aria-label="Jump to a page"
+                onKeyDown={e => {
+                  if (e.key === 'Escape') { setNavFilter(''); e.currentTarget.blur() }
+                  if (e.key === 'Enter') {
+                    const first = document.querySelector<HTMLElement>('nav a[href]')
+                    first?.click()
+                  }
+                }}
                 className="w-full bg-app border border-stone rounded-lg pl-8 pr-8 h-8 text-[13px] placeholder:text-muted focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/15" />
               <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-muted border border-stone rounded px-1 py-px">/</span>
             </div>
@@ -377,7 +411,7 @@ export default function App() {
             </div>
           </div>
           <div className="ml-auto flex items-center gap-1.5">
-            <button onClick={() => navigate('/logs')} title="Search requests"
+            <button ref={searchTriggerRef} onClick={() => { navigate('/logs'); requestSearchFocus() }} title="Search requests (⌘K)"
               className="hidden md:flex items-center gap-2 h-9 pl-3 pr-2 rounded-lg border border-stone bg-app text-muted hover:text-paper hover:border-muted/50 text-[13px] transition-colors">
               <Icon name="search" size={14} /><span className="text-muted">Search requests…</span>
               <span className="font-mono text-[10px] border border-stone rounded px-1.5 py-0.5">⌘K</span>
@@ -391,11 +425,15 @@ export default function App() {
           </div>
         </header>
 
-        <main key={loc.pathname} className="max-w-[1380px] mx-auto px-5 lg:px-8 py-6 lg:py-8 animate-page min-h-[calc(100vh-56px)]">
+        {/* The playground is a full-height chat surface: it manages its own
+            width and padding, so the shared max-width/px wrapper would only
+            strand it in dead space on wide screens. */}
+        <main key={loc.pathname} className={`animate-page min-h-[calc(100vh-56px)] ${loc.pathname === '/playground' ? '' : 'max-w-[1380px] mx-auto px-5 lg:px-8 py-6 lg:py-8'}`}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/providers" element={<Providers role={role} />} />
             <Route path="/routing" element={<Routing role={role} />} />
+            <Route path="/mcp" element={<McpServers />} />
             <Route path="/keys" element={<Keys role={role} />} />
             <Route path="/models" element={<Models role={role} />} />
             <Route path="/playground" element={<Playground />} />
@@ -412,11 +450,15 @@ export default function App() {
             <Route path="/profile" element={<Profile onSessionRevoked={() => logout('Password changed — please sign in again')} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
-          <footer className="mt-10 pt-4 border-t border-stone flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-muted">
-            <span className="flex items-center gap-1.5"><span className="w-4 h-4 rounded bg-accent flex items-center justify-center"><Icon name="zap" size={10} className="text-onaccent" /></span> AI Gateway control plane</span>
-            <span className="font-mono">OpenAI · Anthropic · Responses compatible</span>
-            <span className="ml-auto font-mono">Go core · {role || 'session'}</span>
-          </footer>
+          {/* The playground owns the whole viewport (a fixed-height chat), so
+              the shared footer would only push a scrollbar onto it. */}
+          {loc.pathname !== '/playground' && (
+            <footer className="mt-10 pt-4 border-t border-stone flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-muted">
+              <span className="flex items-center gap-1.5"><span className="w-4 h-4 rounded bg-accent flex items-center justify-center"><Icon name="zap" size={10} className="text-onaccent" /></span> AI Gateway control plane</span>
+              <span className="font-mono">OpenAI · Anthropic · Responses compatible</span>
+              <span className="ml-auto font-mono">Go core · {role || 'session'}</span>
+            </footer>
+          )}
         </main>
       </div>
       <Toaster />

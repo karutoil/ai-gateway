@@ -709,14 +709,50 @@ func (s *Store) SetMonthlyBudget(id string, usd float64) error {
 
 // MonthSpendUSD returns the summed cost for a key within the current UTC
 // calendar month. Used for monthly budget enforcement at authentication time.
+//
+// A `gateway_keys.id` match is preferred. Prefix spend is added when the id sums
+// to less than the row's own prefix spend, which happens for the two shapes the
+// id join misses:
+//
+//   - dashboard-session traffic, which carries a VIRTUAL key whose prefix is
+//     "sess"+subject and which has no gateway_keys row at all, so key_id stays
+//     NULL on its request_logs rows. Without the prefix term a logged-in
+//     dashboard user's spend summed to 0 and no per-month cap could ever bind;
+//   - any row written before the key_id backfill UPDATE ran.
+//
+// MAX(id_total, prefix_total) rather than a sum of both keeps a single request
+// from being counted twice while still surfacing spend that only the prefix can
+// attribute.
 func (s *Store) MonthSpendUSD(keyID string) float64 {
+	return s.MonthSpendUSDForPrefix(keyID, "")
+}
+
+// MonthSpendUSDForPrefix is MonthSpendUSD plus the spend attributable to a key
+// PREFIX. Pass the caller's prefix to include dashboard-session traffic (whose
+// key_id is always NULL). An empty prefix reduces this to the id-only query.
+func (s *Store) MonthSpendUSDForPrefix(keyID, prefix string) float64 {
 	var sum sql.NullFloat64
 	monthStart := time.Now().UTC().Format("2006-01") + "-01 00:00:00"
-	s.db.QueryRow(db.Q(
-		`SELECT SUM(cost_usd) FROM request_logs WHERE key_id = ? AND created_at >= ?`),
-		keyID, monthStart).Scan(&sum)
-	if sum.Valid {
-		return sum.Float64
+
+	var byID float64
+	if keyID != "" {
+		s.db.QueryRow(db.Q(
+			`SELECT SUM(cost_usd) FROM request_logs WHERE key_id = ? AND created_at >= ?`),
+			keyID, monthStart).Scan(&sum)
+		if sum.Valid {
+			byID = sum.Float64
+		}
 	}
-	return 0
+	if prefix == "" {
+		return byID
+	}
+
+	var byPrefix sql.NullFloat64
+	s.db.QueryRow(db.Q(
+		`SELECT SUM(cost_usd) FROM request_logs WHERE key_prefix = ? AND created_at >= ?`),
+		prefix, monthStart).Scan(&byPrefix)
+	if byPrefix.Valid && byPrefix.Float64 > byID {
+		return byPrefix.Float64
+	}
+	return byID
 }

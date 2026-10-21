@@ -193,6 +193,9 @@ export default function Keys({ role = 'admin' }: { role?: string }){
 
   const openCreate = () => {
     loadModels()
+    // Reset the name too: reopening after a cancelled attempt kept the old
+    // draft and the submit button looked pre-armed.
+    setName('')
     setCreateForm(EMPTY_CREATE); setCreateError(''); setCreateOpen(true)
   }
 
@@ -461,9 +464,19 @@ export default function Keys({ role = 'admin' }: { role?: string }){
                 <Td>
                   <div className="max-w-[220px]">
                     <div className="flex items-center gap-1.5">
-                      <span className="font-medium truncate" title={k.name}>{k.name}</span>
-                      {canUpdate && !isSelectMode && (
+                      {/* The footer tells operators to "click a name to rename",
+                          so the name itself is the rename affordance (the pencil
+                          next to it is the keyboard-visible twin). */}
+                      {canUpdate && !isSelectMode ? (
                         <button onClick={()=>startEdit(k)} title="Rename"
+                          className="font-medium truncate text-left rounded transition-colors hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50">
+                          {k.name}
+                        </button>
+                      ) : (
+                        <span className="font-medium truncate" title={k.name}>{k.name}</span>
+                      )}
+                      {canUpdate && !isSelectMode && (
+                        <button onClick={()=>startEdit(k)} title="Rename" aria-label={`Rename ${k.name}`}
                           className="shrink-0 text-muted hover:text-paper transition-colors focus-visible:text-paper focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded">
                           <Icon name="pencil" size={13} />
                         </button>

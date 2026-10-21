@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, logsParamsToSearch } from '../lib/api'
-import { useFiltersState, useQueryState } from '../lib/useQueryState'
+import { useFiltersState } from '../lib/useQueryState'
 import { loadSavedViews, saveView, removeSavedView, describeViewParams, type SavedView } from '../lib/savedViews'
+import { copyToClipboard } from '../lib/clipboard'
+import { consumeSearchFocus, onSearchFocusRequest } from '../lib/searchFocus'
 import {
-  Card, Button, Badge, Icon, Input, PageHeader, SegmentedControl,
+  Card, Button, Badge, Icon, Input, PageHeader, SegmentedControl, Select,
   TableShell, Th, Td, TableSkeleton, EmptyState, Modal, CopyButton, Field,
 } from '../components/ui'
 import { SortTh } from '../components/report'
@@ -23,12 +25,14 @@ function statusTone(s:number): 'good'|'warn'|'bad' {
 }
 
 /** Cache disposition of one request — hit / miss / bypass / unknown (legacy rows). */
+// 11px is the design system's micro-label floor; these were 10px, which is
+// under the readable minimum for the 100-row table they annotate.
 function CacheState({ status }: { status?: string }) {
-  if (!status) return <span className="text-[10px] font-mono text-muted/40" title="Cache status not recorded (row predates cache reporting)">cache ·—</span>
-  if (status === 'hit') return <span className="text-[10px] font-mono text-good" title="Answered from the gateway response cache (X-Cache: HIT) — no upstream call">cache·hit</span>
-  if (status === 'miss') return <span className="text-[10px] font-mono text-muted" title="Cache-eligible but not cached (X-Cache: MISS) — identical requests within the TTL replay from cache">cache·miss</span>
-  if (status === 'bypass') return <span className="text-[10px] font-mono text-muted/40" title="Not cache-eligible (X-Cache: BYPASS): streaming with the stream cache off, oversize body, or a non-cached endpoint">cache·bypass</span>
-  return <span className="text-[10px] font-mono text-muted/40">cache ·—</span>
+  if (!status) return <span className="text-[11px] font-mono text-muted" title="Cache status not recorded (row predates cache reporting)">cache ·—</span>
+  if (status === 'hit') return <span className="text-[11px] font-mono text-good" title="Answered from the gateway response cache (X-Cache: HIT) — no upstream call">cache·hit</span>
+  if (status === 'miss') return <span className="text-[11px] font-mono text-muted" title="Cache-eligible but not cached (X-Cache: MISS) — identical requests within the TTL replay from cache">cache·miss</span>
+  if (status === 'bypass') return <span className="text-[11px] font-mono text-muted" title="Not cache-eligible (X-Cache: BYPASS): streaming with the stream cache off, oversize body, or a non-cached endpoint">cache·bypass</span>
+  return <span className="text-[11px] font-mono text-muted">cache ·—</span>
 }
 
 /* ---------------- Structured message parsing ---------------- */
@@ -443,11 +447,17 @@ export default function Logs(){
   const [showAdvanced, setShowAdvanced] = useState(false)
   // Sort is URL state but deliberately not a LogFilters field: it must not
   // appear as an active-filter chip or count toward "clear all filters".
-  const [sortKey, setSortKey] = useQueryState('order', 'created_at')
-  const [sortDir, setSortDir] = useQueryState('dir', 'desc')
+  //
+  // Both keys are written in ONE URL update. Two separate useQueryState setters
+  // in the same handler each build their next URL from the same pre-render
+  // snapshot, so the second silently discarded the first and clicking a column
+  // header appeared to do nothing at all.
+  const [{ order: sortKey, dir: sortDir }, setSort] = useFiltersState({ order: 'created_at', dir: 'desc' })
   const toggleSort = (k: string) => {
-    if (sortKey === k) setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
-    else { setSortKey(k); setSortDir('desc') }
+    if (sortKey === k) setSort({ dir: sortDir === 'asc' ? 'desc' : 'asc' })
+    else setSort({ order: k, dir: 'desc' })
+    // Re-ordering invalidates "page 4 of the old order".
+    setOffset(0)
   }
   const [showReports, setShowReports] = useState(false)
   const [showSaveView, setShowSaveView] = useState(false)
@@ -511,21 +521,32 @@ export default function Logs(){
     return p
   }
 
-  const loadLogs = (opts?: { resetOffset?: boolean })=>{
-    const nextOffset = opts?.resetOffset ? 0 : offset
+  const searchRef = useRef<HTMLInputElement>(null)
+  // ⌘K / the header search button route here; take focus once mounted.
+  useEffect(() => {
+    const focus = () => searchRef.current?.focus()
+    const off = onSearchFocusRequest(focus)
+    if (consumeSearchFocus()) requestAnimationFrame(focus)
+    return off
+  }, [])
+
+  const loadLogs = ()=>{
     setLoading(true)
     setLoadError('')
-    api.logsQuery({ ...apiParams(), offset: nextOffset } as any)
+    api.logsQuery({ ...apiParams(), offset } as any)
       .then(({ rows, total })=>{
         setLogs(rows)
         setTotal(total)
-        if (opts?.resetOffset) setOffset(0)
       })
       .catch((e:any)=> setLoadError(e?.message || String(e)))
       .finally(()=> setLoading(false))
   }
 
-  useEffect(()=>{ loadLogs({ resetOffset: true }) }, [limit, JSON.stringify(filters)])
+  // `offset`, `sortKey` and `sortDir` are dependencies: Prev/Next only move the
+  // cursor and a column click only rewrites the URL, so without them the
+  // footer advanced to "rows 101–200" while the table kept rendering page 1,
+  // and the sort indicator moved while the rows stayed in their old order.
+  useEffect(()=>{ loadLogs() }, [limit, offset, JSON.stringify(filters), sortKey, sortDir])
 
   useEffect(()=>{
     api.keys.list().then(keys=>{
@@ -560,6 +581,13 @@ export default function Logs(){
     } catch (e:any) { setExportNoteKind('error'); setExportNote(e?.message || 'export failed') }
   }
 
+  const shareView = async () => {
+    const ok = await copyToClipboard(window.location.href)
+    setExportNoteKind(ok ? 'ok' : 'error')
+    setExportNote(ok ? 'View link copied' : 'Could not copy — copy the address bar instead')
+    if (ok) setTimeout(() => setExportNote(''), 5000)
+  }
+
   const fetchDetail = async (id:string)=>{
     try{
       const res = await fetch(`/api/logs/${id}`, { credentials: 'same-origin' })
@@ -578,7 +606,11 @@ export default function Logs(){
   }
 
   // Click-through helpers: navigate to this view filtered on a dimension value.
+  // Every filter change rewinds to the first page — a filter applied while on
+  // page 4 otherwise lands on an empty page.
   const applyFilter = (patch: Partial<LogFilters>) => { setFilters(patch); setOffset(0) }
+  const clearFilters = () => { setFilters({ ...FILTER_DEFAULTS }); setOffset(0) }
+  const changeLimit = (n: number) => { setOffset(0); setLimit(n) }
 
   const activeFilters = (Object.keys(FILTER_DEFAULTS) as (keyof LogFilters)[])
     .filter(k => filterActive(filters, k))
@@ -598,6 +630,7 @@ export default function Logs(){
     }
     // since/range aliases: saved views store the range under `since`
     setFilters(patch)
+    setOffset(0)
   }
 
   const rawJson = detail ? JSON.stringify(detail || selected, null, 2) : ''
@@ -658,28 +691,30 @@ export default function Logs(){
 
       {/* Filter bar — every control is server-side and URL-synced */}
       <Card className="space-y-3">
-        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-          <div className="relative flex-1 min-w-[180px]">
+        {/* Two columns on phones: four stacked full-width selects pushed the
+            table itself below the fold. */}
+        <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-row sm:items-center">
+          <div className="relative col-span-2 min-w-[180px] sm:flex-1">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={15}/></span>
-            <Input value={qInput} onChange={e=>setQInput(e.target.value)} placeholder="Search model, endpoint, error text…" className="pl-9"/>
+            <Input ref={searchRef} value={qInput} onChange={e=>setQInput(e.target.value)} placeholder="Search model, endpoint, error text…" className="pl-9" aria-label="Search requests"/>
           </div>
-          <select value={filters.status} onChange={e=>applyFilter({ status: e.target.value })}
-            className="w-auto bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
+          <select value={filters.status} onChange={e=>applyFilter({ status: e.target.value })} aria-label="Filter by status"
+            className="w-full min-w-0 bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors sm:w-auto">
             <option value="">Any status</option>
             <option value="failed">Failed only</option>
           </select>
-          <select value={filters.key_id} onChange={e=>applyFilter({ key_id: e.target.value })}
-            className="w-auto max-w-[150px] bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
+          <select value={filters.key_id} onChange={e=>applyFilter({ key_id: e.target.value })} aria-label="Filter by API key"
+            className="w-full min-w-0 bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors sm:w-auto sm:max-w-[150px]">
             <option value="">Any key</option>
             {Object.entries(keyIdMap).map(([id,name]) => <option key={id} value={id}>{name}</option>)}
           </select>
-          <select value={filters.provider_id} onChange={e=>applyFilter({ provider_id: e.target.value })}
-            className="w-auto max-w-[150px] bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
+          <select value={filters.provider_id} onChange={e=>applyFilter({ provider_id: e.target.value })} aria-label="Filter by provider"
+            className="w-full min-w-0 bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors sm:w-auto sm:max-w-[150px]">
             <option value="">Any provider</option>
             {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
-          <select value={filters.since} onChange={e=>applyFilter({ since: e.target.value })}
-            className="w-auto bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors">
+          <select value={filters.since} onChange={e=>applyFilter({ since: e.target.value })} aria-label="Time window"
+            className="w-full min-w-0 bg-app border border-stone rounded-lg px-2.5 h-9 text-sm focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/20 hover:border-muted/60 transition-colors sm:w-auto">
             {SINCE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
         </div>
@@ -703,9 +738,7 @@ export default function Logs(){
             More filters {activeFilters.some(k=>ADVANCED_FIELDS.includes(k)) ? '•' : ''}
           </button>
           <Button variant="secondary" size="sm" className="ml-auto" onClick={()=>setShowSaveView(true)}><Icon name="plus" size={13}/>Save view</Button>
-          <Button variant="secondary" size="sm" onClick={()=>{
-            navigator.clipboard?.writeText(window.location.href).then(()=>{ setExportNoteKind('ok'); setExportNote('View link copied') }, ()=>{})
-          }}><Icon name="key" size={13}/>Share</Button>
+          <Button variant="secondary" size="sm" onClick={shareView}><Icon name="key" size={13}/>Share</Button>
         </div>
         {showAdvanced && (
           <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-stone">
@@ -731,7 +764,7 @@ export default function Logs(){
               <button onClick={()=>applyFilter({ [k]: FILTER_DEFAULTS[k] } as any)} className="ml-1 hover:text-danger focus:outline-none"><Icon name="x" size={10}/></button>
             </Badge>
           ))}
-          <button onClick={()=>setFilters({...FILTER_DEFAULTS})} className="text-xs text-muted hover:text-paper focus:outline-none">Clear all</button>
+          <button onClick={clearFilters} className="text-xs text-muted hover:text-paper focus:outline-none">Clear all</button>
         </div>
       )}
 
@@ -776,7 +809,8 @@ export default function Logs(){
                         onClick={()=>{
                           // Click-through: filter the log list on this group's dimension.
                           if (groupBy === 'model') applyFilter({ model: g.group })
-                          else if (groupBy === 'key') { const k = Object.entries(keyMap).find(([,n])=>n===g.name||true); applyFilter({ key_id: g.name ? (Object.entries(keyIdMap).find(([,n])=>n===g.name)?.[0] ?? '') : '' }) }
+                          // key groups are labelled by name; map back to the id the API filters on.
+                          else if (groupBy === 'key') applyFilter({ key_id: Object.entries(keyIdMap).find(([,n])=>n===g.name)?.[0] ?? '' })
                           else if (groupBy === 'provider') applyFilter({ provider_id: g.group === '(none)' ? '' : g.group })
                           else if (groupBy === 'status') applyFilter({ status: g.group === '(none)' ? '' : g.group })
                           // finish_reason passes '(none)' through rather than
@@ -825,21 +859,27 @@ export default function Logs(){
               {([
                 { key: 'created_at', label: 'Time', align: 'left' },
                 { key: 'model', label: 'Model', align: 'left' },
+                // Provider is not a server-sortable column; rendering it through
+                // SortTh made it look clickable while doing nothing.
                 { key: null, label: 'Provider', align: 'left' },
                 { key: 'status', label: 'Status', align: 'center' },
                 { key: 'latency_ms', label: 'Latency', align: 'right' },
                 { key: 'total_tokens', label: 'Tokens', align: 'right' },
                 { key: 'cost_usd', label: 'Cost', align: 'right' },
               ] as const).map(col => (
-                <SortTh
-                  key={col.label}
-                  label={col.label}
-                  sortKey={col.key ?? ''}
-                  sort={{ key: sortKey, dir: sortDir as 'asc' | 'desc' }}
-                  onSort={() => col.key && toggleSort(col.key)}
-                  align={col.align === 'right' ? 'right' : 'left'}
-                  className={col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : ''}
-                />
+                col.key === null ? (
+                  <Th key={col.label} className="bg-raised/60 border-b border-stone">{col.label}</Th>
+                ) : (
+                  <SortTh
+                    key={col.label}
+                    label={col.label}
+                    sortKey={col.key}
+                    sort={{ key: sortKey, dir: sortDir as 'asc' | 'desc' }}
+                    onSort={() => toggleSort(col.key)}
+                    align={col.align === 'right' ? 'right' : 'left'}
+                    className={col.align === 'center' ? 'text-center' : col.align === 'right' ? 'text-right' : ''}
+                  />
+                )
               ))}
             </tr>
           </thead>
@@ -861,7 +901,7 @@ export default function Logs(){
                         {widerTotal != null && widerTotal > 0 && (
                           <Button variant="primary" onClick={()=>applyFilter({ since: '30d' })}>Show last 30 days</Button>
                         )}
-                        <Button variant="secondary" onClick={()=>setFilters({...FILTER_DEFAULTS})}>Clear filters</Button>
+                        <Button variant="secondary" onClick={clearFilters}>Clear filters</Button>
                       </div>
                     : undefined}
                 />
@@ -871,6 +911,9 @@ export default function Logs(){
             <tbody>
               {logs.map(l=>(
                 <tr key={l.id} onClick={()=>handleRowClick(l)}
+                    tabIndex={0}
+                    onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleRowClick(l) } }}
+                    aria-label={`Request ${String(l.id).slice(0,8)} — ${l.model}, status ${l.status}`}
                     className="hover:bg-raised/60 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/60">
                   <Td className="whitespace-nowrap text-xs font-mono text-muted tabular-nums">{new Date(l.created_at).toLocaleString()}</Td>
                   <Td><span className="block font-mono text-xs truncate max-w-[160px]" title={`${l.model}${l.endpoint?` · ${l.endpoint}${l.is_stream?' · stream':''}`:''}`}>{l.model}</span></Td>
@@ -897,12 +940,21 @@ export default function Logs(){
 
       {/* Server-side pagination controls */}
       {!loadError && (
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-xs text-muted tabular-nums">
             {total != null ? `${total.toLocaleString()} request(s) matching` : ''}
-            {' '}· rows {offset + 1}–{offset + logs.length}
+            {logs.length > 0
+              ? ` · rows ${(offset + 1).toLocaleString()}–${(offset + logs.length).toLocaleString()}`
+              : ' · no rows'}
           </span>
           <div className="flex items-center gap-1.5">
+            <label className="flex items-center gap-1.5 text-xs text-muted mr-1">
+              Rows
+              <Select value={limit} onChange={e => changeLimit(Number(e.target.value))}
+                aria-label="Rows per page" className="!w-auto !h-8 !text-xs !px-2">
+                {LIMIT_OPTIONS.map(n => <option key={n} value={n}>{n}</option>)}
+              </Select>
+            </label>
             <Button variant="secondary" size="sm" disabled={offset === 0 || loading}
               onClick={()=>setOffset(Math.max(0, offset - limit))}>
               <Icon name="chevronLeft" size={13}/>Prev

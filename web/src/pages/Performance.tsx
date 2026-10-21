@@ -193,7 +193,12 @@ export default function Performance() {
                 {rows.map(r => (
                   <tr key={r.name}
                     onClick={() => go(tab === 'models' ? r.name : undefined)}
-                    className="border-b border-stone/60 hover:bg-raised/60 cursor-pointer transition-colors">
+                    onKeyDown={tab === 'models' ? (e) => {
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(r.name) }
+                    } : undefined}
+                    tabIndex={tab === 'models' ? 0 : undefined}
+                    aria-label={tab === 'models' ? `${r.name} — open its requests` : undefined}
+                    className="border-b border-stone/60 hover:bg-raised/60 cursor-pointer transition-colors focus-visible:outline-none focus-visible:bg-raised/60">
                     <td className="px-4 py-2.5 max-w-[260px]">
                       <div className="flex items-center gap-2">
                         {tab === 'providers' && r.health && <HealthDot health={r.health} />}

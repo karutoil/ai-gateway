@@ -316,13 +316,13 @@ func (s *Store) CreateWithOrg(name string, typ models.ProviderType, baseURL stri
 	}
 	// validate type
 	switch typ {
-	case models.ProviderOpenAI, models.ProviderAnthropic, models.ProviderAzure, models.ProviderOpenAICompatible, models.ProviderAntigravity, models.ProviderDevin:
+	case models.ProviderOpenAI, models.ProviderAnthropic, models.ProviderAzure, models.ProviderOpenAICompatible, models.ProviderAntigravity, models.ProviderDevin, models.ProviderSystemOne, models.ProviderCloudflare, models.ProviderGoogle, models.ProviderXAI:
 	default:
 		return nil, fmt.Errorf("invalid provider type %s", typ)
 	}
 	// OAuth-backed providers (antigravity, devin) authenticate via browser flow,
 	// not a pasted key — api_key stays empty until OAuth connects.
-	if apiKey == "" && typ != models.ProviderAntigravity && typ != models.ProviderDevin {
+	if apiKey == "" && typ != models.ProviderAntigravity && typ != models.ProviderDevin && typ != models.ProviderSystemOne {
 		return nil, fmt.Errorf("api_key required")
 	}
 	id := uuid.NewString()
@@ -341,6 +341,14 @@ func (s *Store) CreateWithOrg(name string, typ models.ProviderType, baseURL stri
 			baseURL = "https://daily-cloudcode-pa.googleapis.com"
 		case models.ProviderDevin:
 			baseURL = "https://server.codeium.com"
+		case models.ProviderSystemOne:
+			baseURL = "https://api.typesafe.ai"
+		case models.ProviderCloudflare:
+			baseURL = "https://api.cloudflare.com/client/v4/accounts/CHANGE_ME/ai/run"
+		case models.ProviderGoogle:
+			baseURL = "https://generativelanguage.googleapis.com"
+		case models.ProviderXAI:
+			baseURL = "https://api.x.ai/v1"
 		case models.ProviderAzure:
 			return nil, fmt.Errorf("base_url required for azure provider")
 		}

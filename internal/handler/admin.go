@@ -64,7 +64,7 @@ func (h *AdminHandler) auditLogin(username string) {
 //
 // Source builds fall back to "dev" (+ short commit when available via the
 // make target). The install.sh updater also reads this through `gateway version`.
-var GatewayVersion = "1.7.0"
+var GatewayVersion = "1.8.0"
 
 // GatewayCommit is injected at build time with the release's git SHA
 // (-ldflags "-X ai-gateway/internal/handler.GatewayCommit=<sha>").
@@ -419,7 +419,8 @@ func (h *AdminHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// OAuth-backed providers (antigravity, devin) connect via browser flow — no key at create time.
-	if body.Type != string(models.ProviderAntigravity) && body.Type != string(models.ProviderDevin) && body.APIKey == "" {
+	// A local systemone provider (Kev / llama.cpp) may also legitimately need no key.
+	if body.Type != string(models.ProviderAntigravity) && body.Type != string(models.ProviderDevin) && body.Type != string(models.ProviderSystemOne) && body.APIKey == "" {
 		httperr.Invalid(w, "name, type, api_key required")
 		return
 	}

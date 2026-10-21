@@ -9,10 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/decision"
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/imagegen"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/resilience"
+	"ai-gateway/internal/videogen"
 
 	"github.com/rs/zerolog/log"
 )
@@ -285,7 +289,7 @@ func quotaRuleMemberKey(m lb.Member) string {
 	return strings.ToLower(strings.TrimSpace(m.ProviderID)) + "\x00" + strings.ToLower(strings.TrimSpace(m.ModelOverride))
 }
 
-type prepareFn func(p *models.Provider, body []byte) (target, apiKey string, outBody []byte, isAnth bool, err error)
+type prepareFn func(p *models.Provider, body []byte) (target, apiKey string, outBody []byte, isAnth bool, contentType string, err error)
 
 // shouldFailoverFrom reports whether a status justifies trying the next
 // candidate provider. The old rule stopped at ANY <500 — including 429 quota
@@ -300,7 +304,184 @@ func shouldFailoverFrom(status int) bool {
 	return status >= 500
 }
 
+// shouldFailoverFromOpts is shouldFailoverFrom with the per-endpoint opt-in
+// escape hatch: a noFailover request (billable, non-idempotent creates) never
+// advances to another candidate, whatever the failure status. Failing over a
+// create to a SECOND provider bills twice for one client request and, worse,
+// makes the two bills independent (provider A generated an asset the client
+// never saw).
+func shouldFailoverFromOpts(status int, extra proxyCandidatesOpts, endpoint string) bool {
+	if extra.noFailover {
+		// Count the declined failover: on a billable create this is a SECOND
+		// provider invoice the gateway just refused to incur.
+		resilience.IncBillableRetrySkip(endpoint, status)
+		return false
+	}
+	return shouldFailoverFrom(status)
+}
+
+// DefaultMaxProxyResponseBytes is the default cap on a buffered upstream
+// RESPONSE body. It exists because the buffered success path used to call
+// io.ReadAll on an unbounded body: a 64 MiB b64_json image response cost
+// ~245 MB of peak RSS per in-flight request (measured), which OOMs a 1 GiB
+// container at four concurrent 4K images. 64 MiB matches the request-side
+// MAX_PROXY_BODY_MB default and leaves generous head-room for a 4K PNG
+// (~16 MiB raw, ~22 MiB base64) plus a multi-image batch.
+const DefaultMaxProxyResponseBytes int64 = 64 << 20
+
+// proxyCandidatesOpts carries optional per-endpoint behavior for
+// proxyCandidatesWithOpts (image dialect translation, provider-specific auth,
+// a longer first-byte budget, exactly-once semantics for billable creates).
+type proxyCandidatesOpts struct {
+	// transformResponse rewrites a successful buffered upstream body (image
+	// dialect normalization). The serving provider is supplied so the
+	// transform can pick the right dialect; a nil out leaves the body
+	// unchanged and hasCost overrides the billed cost.
+	transformResponse func(p *models.Provider, body []byte, status int) (out []byte, costUSD float64, hasCost bool)
+	// contentType overrides the upstream request Content-Type (multipart for
+	// image-edit passthrough).
+	contentType string
+	// ttfb overrides the client-facing first-byte budget (image generation is
+	// legitimately slower than a chat first token). Zero = "no override": the
+	// handler/endpoint default applies (see resolveTTFBBudget). Use
+	// ttfbDisable to express DISABLED explicitly — zero alone cannot mean
+	// "disabled" because it is indistinguishable from "unset".
+	ttfb time.Duration
+	// ttfbDisable removes the client-facing first-byte watchdog entirely for
+	// this endpoint: the gateway waits as long as the upstream needs, exactly
+	// like the pre-TTFB gateway. It maps the documented
+	// IMAGE_TIMEOUT_SECONDS=0 ("disabled") setting, which previously applied
+	// the 300s default anyway (P1-12). Streaming keepalive frames are not
+	// emitted either (there is no budget to expire), so a client relying on
+	// them must not set this.
+	//
+	// Precedence: ttfbDisable wins over ttfb; ttfb (when > 0) wins over the
+	// endpoint default; otherwise the endpoint default applies.
+	ttfbDisable bool
+	// maxResponseBytes caps the buffered upstream response body for this
+	// endpoint. Zero = Handler.MaxResponseBytes, then
+	// DefaultMaxProxyResponseBytes. Over-limit responses answer a clean 502
+	// that names the limit instead of buffering without bound (P1-9).
+	maxResponseBytes int64
+	// noRetry disables same-provider retries. Set it — with noFailover — for
+	// BILLABLE, NON-IDEMPOTENT creates: /v1/images/generations and
+	// /v1/images/edits (internal/proxy/images.go). The upstream charges per
+	// generated asset, so a retry after an ambiguous 5xx/timeout generates and
+	// bills a second asset for one client request (P0-2). Not even 429 is
+	// retried: a metered provider that rate-limits after generation has
+	// already charged. See resilience.NonRetryable.
+	noRetry bool
+	// noFailover stops the candidate chain at the first provider. Used for the
+	// same callers as noRetry: pre-fix, an image create that failed over ran on
+	// TWO providers and was billed twice. Contrast /v1/videos (videos.go),
+	// which never used proxyCandidates for its create path at all — the
+	// correct behaviour for a non-idempotent POST.
+	noFailover bool
+	// noCache bypasses the exact-match response cache for this endpoint, in
+	// both directions (no lookup, no store). Generated media must never be
+	// replayed: a cached image is stale the moment it is served (a re-roll
+	// returns yesterday's picture) and the cached replay logs cost_usd=0, so
+	// the spend also disappears from budgets (P2-2). Set by the image
+	// endpoints in internal/proxy/images.go.
+	noCache bool
+	// requestTotal overrides the overall request budget (Timeouts.RequestTotal)
+	// for this endpoint. Zero = handler default. Used by the decision and image
+	// endpoints, which had none and therefore relied on the unbounded default
+	// (P2-14).
+	requestTotal time.Duration
+}
+
+// resolveTTFBBudget resolves the client-facing first-byte budget for one
+// endpoint, as a (budget, disabled) pair.
+//
+// The tri-state is the P1-12 fix. IMAGE_TIMEOUT_SECONDS has three documented
+// values and they must be distinguishable:
+//
+//	unset / -1  => DefaultImageTTFB (300s) applied by the endpoint default
+//	0           => DISABLED: no first-byte watchdog at all
+//	N (> 0)     => N seconds
+//
+// A single time.Duration cannot express that, because 0 means both "unset,
+// use the default" and "disabled". Hence the explicit disabled flag; a
+// zero-value proxyCandidatesOpts (the chat callers) still means "no override".
+//
+// Resolution order:
+//  1. extra.ttfbDisable                            => disabled
+//  2. image endpoint && Handler.ImageTTFBDisabled  => disabled
+//  3. extra.ttfb > 0                               => that budget
+//  4. image endpoint && Handler.ImageTTFB > 0      => that budget
+//  5. image endpoint                               => DefaultImageTTFB
+//  6. otherwise                                    => h.Timeouts.TTFB
+//
+// Step 2 is deliberately ahead of step 3: ImageTTFBDisabled is the operator's
+// explicit IMAGE_TIMEOUT_SECONDS=0 switch, so an endpoint that passes a
+// caller-side default (images.go passes h.imageTTFB(), which is 300s whenever
+// ImageTTFB==0) cannot resurrect a watchdog the operator turned off. That also
+// means main.go only has to set ImageTTFBDisabled for the disabled case — the
+// image endpoints need no change at all.
+func (h *Handler) resolveTTFBBudget(endpoint string, extra proxyCandidatesOpts) (time.Duration, bool) {
+	if extra.ttfbDisable {
+		return 0, true
+	}
+	image := isImageEndpoint(endpoint)
+	if image && h.ImageTTFBDisabled {
+		return 0, true
+	}
+	if extra.ttfb > 0 {
+		return extra.ttfb, false
+	}
+	if image {
+		if h.ImageTTFB > 0 {
+			return h.ImageTTFB, false
+		}
+		return DefaultImageTTFB, false
+	}
+	return h.Timeouts.TTFB, false
+}
+
+// isImageEndpoint reports whether an internal endpoint name belongs to the
+// image surfaces (the only endpoints with their own first-byte default).
+func isImageEndpoint(endpoint string) bool {
+	switch endpoint {
+	case "images.generations", "images.edits":
+		return true
+	}
+	return false
+}
+
+// responseByteLimit resolves the effective buffered-response cap.
+func (h *Handler) responseByteLimit(extra proxyCandidatesOpts) int64 {
+	if extra.maxResponseBytes > 0 {
+		return extra.maxResponseBytes
+	}
+	if h.MaxResponseBytes > 0 {
+		return h.MaxResponseBytes
+	}
+	return DefaultMaxProxyResponseBytes
+}
+
+// effectiveRetry resolves the retry policy for one proxied call: the handler
+// default, wrapped in a never-retry policy when the endpoint declares
+// noRetry (billable non-idempotent creates).
+func (h *Handler) effectiveRetry(extra proxyCandidatesOpts) resilience.RetryPolicy {
+	r := h.retryOrDefault()
+	if extra.noRetry {
+		return resilience.NoRetry(r)
+	}
+	return r
+}
+
+// mcpRound reports whether this request is one iteration of the gateway-side
+// MCP tool loop (see proxy/mcp.go). Such rounds bypass the response cache.
+func mcpRound(r *http.Request) bool {
+	return r.Header.Get("X-Gateway-MCP-Round") == "1"
+}
+
 func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []lb.Candidate, rule *lb.Rule, prepare prepareFn) {
+	h.proxyCandidatesWithOpts(w, r, body, isStream, model, endpoint, keyPrefix, start, candidates, rule, prepare, proxyCandidatesOpts{})
+}
+
+func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []lb.Candidate, rule *lb.Rule, prepare prepareFn, extra proxyCandidatesOpts) {
 	if len(candidates) == 0 {
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
 		return
@@ -313,7 +494,17 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 	// an edge proxy (Cloudflare ~100s) can 524 the client. Streams that run
 	// out of budget get SSE keepalive headers + frames; buffered requests
 	// get an honest 504.
-	ttfb := newTTFBController(h.Timeouts.TTFB, start)
+	ttfbBudget, ttfbDisabled := h.resolveTTFBBudget(endpoint, extra)
+	var ttfb *ttfbController
+	if ttfbDisabled {
+		// Explicit "no watchdog" (IMAGE_TIMEOUT_SECONDS=0): every budget-gated
+		// method on this controller short-circuits, so the gateway waits as
+		// long as the upstream needs and never fabricates a 504 or keepalive
+		// frames. See newDisabledTTFBController.
+		ttfb = newDisabledTTFBController(start)
+	} else {
+		ttfb = newTTFBController(ttfbBudget, start)
+	}
 	defer ttfb.stop()
 	w = &keepaliveSafeWriter{ResponseWriter: w, c: ttfb}
 	// In-band terminal error once keepalive headers have flowed (a second
@@ -356,7 +547,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			candBody = replaceModelInBody(body, override)
 			candModel = override
 		}
-		target, apiKey, outBody, isAnth, err := prepare(p, candBody)
+		target, apiKey, outBody, isAnth, candContentType, err := prepare(p, candBody)
 		if err != nil {
 			continue
 		}
@@ -366,7 +557,36 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 		if p.ID != primaryID && idx > 0 && candidates[0].Provider != nil {
 			fallbackName = p.Name
 		}
-		callOpts := proxyOpts{fallbackFrom: fallbackName, attempts: chain, rule: rule, ttfb: ttfb}
+		ct := extra.contentType
+		if candContentType != "" {
+			ct = candContentType
+		}
+		// MCP tool rounds always run buffered and must bypass the response
+		// cache: replaying a cached pre-tool answer inside the loop would
+		// feed the model its own previous output as if it were new.
+		if mcpRound(r) {
+			extra.noCache = true
+			extra.noRetry = false
+			isStream = false
+		}
+		callOpts := proxyOpts{
+			fallbackFrom:     fallbackName,
+			attempts:         chain,
+			rule:             rule,
+			ttfb:             ttfb,
+			contentType:      ct,
+			noRetry:          extra.noRetry,
+			noCache:          extra.noCache,
+			maxResponseBytes: h.responseByteLimit(extra),
+			requestTotal:     extra.requestTotal,
+			provider:         p,
+		}
+		if extra.transformResponse != nil {
+			provider := p
+			callOpts.transformResponse = func(b []byte, s int) ([]byte, float64, bool) {
+				return extra.transformResponse(provider, b, s)
+			}
+		}
 
 		if isStream {
 			outcome := h.proxyWithMetricsOpts(w, r, target, apiKey, outBody, true, candModel, p.ID, keyPrefix, endpoint, start, isAnth, callOpts)
@@ -383,6 +603,14 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			}
 			if outcome.committed || !outcome.retriable {
 				return // headers already flowed (or hard client-side stop)
+			}
+			if extra.noFailover {
+				// Billable non-idempotent create: the first candidate is the
+				// only candidate. Relaying its failure is strictly cheaper
+				// than a second generation on another provider.
+				log.Warn().Str("candidate", p.Name).Str("model", model).Int("status", outcome.status).Msg("noFailover set; not advancing to another candidate")
+				lastFailStatus = outcome.status
+				break
 			}
 			log.Info().Str("candidate", p.Name).Str("model", model).Int("status", outcome.status).Str("detail", truncateDetail(lastDetail)).Msg("stream candidate failed pre-commit, failing over")
 			lastFailStatus = outcome.status
@@ -407,7 +635,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 				return
 			}
 			lastFailStatus = outcome.status
-			if shouldFailoverFrom(outcome.status) {
+			if shouldFailoverFromOpts(outcome.status, extra, endpoint) {
 				chain = append(chain, providerAttempt{ProviderID: p.ID, Name: p.Name, Status: outcome.status})
 				continue
 			}
@@ -423,7 +651,7 @@ func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body [
 			return
 		}
 		lastBW, lastProvider = bw, p
-		if shouldFailoverFrom(bw.code) {
+		if shouldFailoverFromOpts(bw.code, extra, endpoint) {
 			chain = append(chain, providerAttempt{ProviderID: p.ID, Name: p.Name, Status: bw.code})
 			continue
 		}
@@ -479,6 +707,18 @@ func outboundStatus(s int) int {
 // The message is actionable — qualified IDs always work without a rule.
 func noRouteFor(w http.ResponseWriter, model string) {
 	msg := fmt.Sprintf("model %q is not routed: create a routing rule for it, or use provider-qualified IDs like provider/%s (or an X-Provider header)", model, shortModelID(model))
+	// A model with a distinctive capability that is unrouted deserves a message
+	// that names the right endpoint. Without this, sending a decision or image
+	// model to a text endpoint (or a chat model to /v1/systemone) answered a
+	// generic "not routed", which reads like a config problem rather than a
+	// wrong-endpoint call. The capability checks are cheap and purely local.
+	if decision.IsDecisionModel(model) {
+		msg = fmt.Sprintf("model %q is a System One / decision model (typed noul/choice/score questions, no text generation) and has no route on this endpoint; POST /v1/systemone is the decision endpoint", model)
+	} else if videogen.IsVideoModel(model) {
+		msg = fmt.Sprintf("model %q is a video-generation model and has no route on this endpoint; video models are served at POST /v1/videos", model)
+	} else if imagegen.IsImageModel(model) {
+		msg = fmt.Sprintf("model %q is an image-generation model and has no route on this endpoint; image models are served at POST /v1/images/generations", model)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{

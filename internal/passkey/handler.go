@@ -386,7 +386,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		role = string(u.Role)
-		_ = h.PassStore.UpdateCounter(credential.ID, credential.Authenticator.SignCount)
+		_ = h.PassStore.UpdateCounter(credential.ID, credential.Authenticator.SignCount, credential.Flags.BackupState)
 		// Update last login for discovered user
 		if ownerID != "" {
 			_ = h.UserStore.UpdateLastLogin(ownerID)
@@ -419,7 +419,7 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"auth failed"}`, http.StatusUnauthorized)
 		return
 	}
-	_ = h.PassStore.UpdateCounter(cred.ID, cred.Authenticator.SignCount)
+	_ = h.PassStore.UpdateCounter(cred.ID, cred.Authenticator.SignCount, cred.Flags.BackupState)
 	_ = h.UserStore.UpdateLastLogin(waUser.ID)
 	tv, _ := h.UserStore.TokenVersionFor(waUser.Username)
 	token, err := auth.MakeTokenFull(h.Config.JWTSecret, waUser.Username, h.orgForID(waUser.ID), string(waUser.Role), tv)

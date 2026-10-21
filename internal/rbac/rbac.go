@@ -55,6 +55,10 @@ const (
 	PermUsersRead  = "users:read"
 	PermUsersWrite = "users:write" // create/update/disable/delete users
 
+	// Centralized MCP servers (upstream MCP registry + unified /mcp endpoint)
+	PermMCPRead  = "mcp:read"  // view servers, tools, health, call log
+	PermMCPWrite = "mcp:write" // create/edit/delete/enable/disable/test/discover
+
 	// Audit trail
 	PermAuditRead = "audit:read"
 
@@ -71,6 +75,7 @@ var All = []string{
 	PermCatalogRead, PermCatalogWrite,
 	PermOrgsRead, PermOrgsWrite,
 	PermUsersRead, PermUsersWrite,
+	PermMCPRead, PermMCPWrite,
 	PermAuditRead,
 	PermSettingsWrite,
 }
@@ -113,6 +118,7 @@ var roleDefaults = map[string]map[string]bool{
 		PermProvidersRead, PermProvidersWrite, PermProvidersTest, PermProvidersDelete,
 		PermLogsRead, PermLogsReadBodies, PermAnalyticsRead,
 		PermCatalogRead, PermOrgsRead,
+		PermMCPRead, PermMCPWrite,
 	),
 
 	RoleMember: set(
@@ -120,12 +126,13 @@ var roleDefaults = map[string]map[string]bool{
 		PermProvidersRead, PermProvidersWrite, PermProvidersTest,
 		PermLogsRead, PermLogsReadBodies, PermAnalyticsRead,
 		PermCatalogRead, PermOrgsRead,
+		PermMCPRead, PermMCPWrite,
 	),
 
 	RoleReadonly: set(
 		PermKeysReadOwn, // own keys only (includes rotating them) — keys:read (all keys) is NOT default
 		PermProvidersRead, PermProvidersTest,
-		PermCatalogRead, PermOrgsRead,
+		PermCatalogRead, PermOrgsRead, PermMCPRead,
 		// logs:read / analytics:read are deliberately NOT defaults: readonly
 		// users see only their own keys' traffic. Grant these explicitly (or
 		// via the Perms editor) for ops-style read-only auditors.

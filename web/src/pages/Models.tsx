@@ -32,6 +32,7 @@ function fmtMs(ms: number): string {
   if(ms < 60000) return (ms/1000).toFixed(1) + 's'
   return Math.round(ms/1000) + 's'
 }
+const fmtInt = (n: number) => Number(n || 0).toLocaleString()
 
 type PendingDelete =
   | { kind:'bulk' }
@@ -68,6 +69,11 @@ export default function Models({ role = 'admin' }: { role?: string }){
 
   // Presentation-only: initial skeleton grid + destructive confirm modal.
   const [loading, setLoading] = useState(true)
+  // The page can return ~500 provider models; rendering every card at once
+  // produced ~23k DOM nodes and a 50,000px document on a full catalog. Render
+  // a window of cards and extend it on demand.
+  const PAGE_SIZE = 60
+  const [shown, setShown] = useState(PAGE_SIZE)
   const [loadError, setLoadError] = useState('')
   const [pendingDelete, setPendingDelete] = useState<PendingDelete|null>(null)
   const [excluded, setExcluded] = useState<any[]>([])
@@ -92,7 +98,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
     setLoading(false)
   }
   useEffect(()=>{ load()},[])
-  useEffect(()=>{ const t=setTimeout(load, 300); return ()=>clearTimeout(t)},[q, provider])
+  useEffect(()=>{ setShown(PAGE_SIZE); const t=setTimeout(load, 300); return ()=>clearTimeout(t)},[q, provider])
 
   const syncCatalog = async()=>{
     setSyncing(true)
@@ -195,13 +201,13 @@ export default function Models({ role = 'admin' }: { role?: string }){
             All
           </label>
         )}
-        <Select value={provider} onChange={e=>setProvider(e.target.value)} className="sm:w-48">
+        <Select value={provider} onChange={e=>setProvider(e.target.value)} className="sm:w-48" aria-label="Filter by provider">
           <option value="">All providers</option>
           {providers.map((p:any)=> <option key={p.id} value={p.id}>{p.name}</option>)}
         </Select>
         <div className="relative flex-1 min-w-[180px]">
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none"><Icon name="search" size={14}/></span>
-          <Input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search model" className="pl-9"/>
+          <Input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search model" className="pl-9" aria-label="Search models"/>
         </div>
         <span className="font-mono text-xs text-muted self-center px-1">{list.length}</span>
         {isAdmin && (
@@ -245,7 +251,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
         {loading && Array.from({ length: 6 }).map((_, i)=>(
           <Skeleton key={i} className="h-44" />
         ))}
-        {!loading && list.map((m:any)=> {
+        {!loading && list.slice(0, shown).map((m:any)=> {
           const levels = parseLevels(m.reasoning_levels)
           const limits = parseLimits(m.reasoning_output_limits)
           const isEdit = editId===m.id
@@ -278,6 +284,7 @@ export default function Models({ role = 'admin' }: { role?: string }){
                 const hidden = levels.length - shown.length
                 return (
                   <div className="mt-2.5 flex flex-wrap gap-1">
+                    {m.decision ? <Badge tone="info">decision</Badge> : null}
                     {m.reasoning ? (
                       <>
                         <Badge tone="info">reasoning: {m.reasoning_type||'effort'}</Badge>
@@ -285,6 +292,8 @@ export default function Models({ role = 'admin' }: { role?: string }){
                         {hidden > 0 && <span title={levels.join(', ')} className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-raised text-muted border border-stone">+{hidden}</span>}
                       </>
                     ) : null}
+                    {(m.image === true || m.kind === 'image') ? <Badge tone="info">{m.image_only === true ? 'image-only' : 'image'}</Badge> : null}
+                    {(m.video === true || m.kind === 'video') ? <Badge tone="info">{m.video_only === true ? 'video-only' : 'video'}</Badge> : null}
                     {m.tool_call ? <Badge tone="neutral">tools</Badge> : null}
                     {inputMods.includes('image') ? <Badge tone="neutral">vision</Badge> : null}
                     {inputMods.includes('audio') ? <Badge tone="neutral">audio</Badge> : null}
@@ -302,6 +311,9 @@ export default function Models({ role = 'admin' }: { role?: string }){
                     <Field label="Cost in"><Input value={edit.input_cost} inputMode="decimal" onChange={e=>setEdit({...edit, input_cost: parseFloat(e.target.value)||0})}/></Field>
                     <Field label="Cost out"><Input value={edit.output_cost} inputMode="decimal" onChange={e=>setEdit({...edit, output_cost: parseFloat(e.target.value)||0})}/></Field>
                   </div>
+                  <label className="flex items-center gap-2 text-xs text-paper">
+                    <input type="checkbox" checked={!!edit.decision} onChange={e=>setEdit({...edit, decision: e.target.checked})} className="accent-accent rounded"/> decision model (System One)
+                  </label>
                   <label className="flex items-center gap-2 text-xs text-paper">
                     <input type="checkbox" checked={!!edit.reasoning} onChange={e=>setEdit({...edit, reasoning: e.target.checked})} className="accent-accent rounded"/> reasoning
                   </label>
@@ -386,6 +398,13 @@ export default function Models({ role = 'admin' }: { role?: string }){
             </div>
           )
         })}
+        {!loading && list.length > shown && (
+          <div className="col-span-full flex justify-center">
+            <Button variant="secondary" onClick={() => setShown(n => n + PAGE_SIZE)}>
+              Show {Math.min(PAGE_SIZE, list.length - shown)} more · {fmtInt(list.length - shown)} remaining
+            </Button>
+          </div>
+        )}
         {!loading && !loadError && list.length===0 && (
           <div className="col-span-full">
             <Card><EmptyState icon="box" title="No models." hint={isAdmin ? 'Discover from a provider or add a model manually above. Removed models sit in the recycling bin and stay out of discovery until restored.' : 'No models have been discovered yet — an admin can run discovery from the Providers page.'}/></Card>

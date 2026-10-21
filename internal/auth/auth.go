@@ -398,6 +398,13 @@ func WithRole(ctx context.Context, role string) context.Context {
 
 // WithSubject returns a context carrying the dashboard subject (username),
 // as AdminMiddleware would set it. For tests and middleware composition.
+// WithOrgID returns a context carrying the caller's VERIFIED org scope, as
+// AdminMiddleware sets it after validating the JWT claim. For tests and
+// internal middleware composition; never seed it from a request header.
+func WithOrgID(ctx context.Context, orgID string) context.Context {
+	return context.WithValue(ctx, contextKeyOrgID, orgID)
+}
+
 func WithSubject(ctx context.Context, subject string) context.Context {
 	return context.WithValue(ctx, contextKeySubject, subject)
 }

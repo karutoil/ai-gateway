@@ -8,6 +8,16 @@
 # Stop:    podman compose -f podman-compose.prod.yml down
 # Logs:    podman logs -f ai-gateway-prod
 #
+# ── Deployment invariant: SHUTDOWN_GRACE_SECONDS >= IMAGE_TIMEOUT_SECONDS ────
+# Image generation is allowed up to 300s (IMAGE_TIMEOUT_SECONDS, unset/-1 = 300,
+# 0 = disabled, N = N seconds). The gateway's built-in drain window is only 90s,
+# so a deploy/restart would cancel in-flight image generations: the client gets a
+# 502 and the request_logs billing row is never written (the DB is closed right
+# after the drain) while the provider still bills. The values below keep the
+# drain window (330s) above the image budget and give the supervisor (360s) more
+# than the drain window. Full rationale: deploy/README.md §1.
+# cmd/gateway/main.go also logs a boot WARNING if these two env values disagree.
+#
 # Auto-start on reboot: install and enable deploy/systemd/ai-gateway-podman.service
 # as a user service (lingering is already on for this host). It runs
 # `compose up -d --build` at boot; `restart: unless-stopped` below is the
@@ -35,6 +45,13 @@ services:
       # Flip from SQLite by setting DATABASE_URL in .env to the postgres DSN.
       DATABASE_URL: ${DATABASE_URL:-/data/gateway.db}
       REDIS_URL: ${REDIS_URL:-}
+
+      # ── Slow-endpoint knobs (invariant above) ──────────────────────────────
+      # Image first-byte budget. Unset in .env -> 300s default stands; set it
+      # explicitly here so `compose config` shows the effective value.
+      IMAGE_TIMEOUT_SECONDS: ${IMAGE_TIMEOUT_SECONDS:-300}
+      # Drain window: must be >= IMAGE_TIMEOUT_SECONDS (300 + 30s slack).
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-330}
     volumes:
       # Migrated copy of the dev database + auto-generated key files live here.
       - ./data:/data
@@ -43,8 +60,25 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    # No built-in healthcheck: the image ships without curl/wget. Probe
-    # GET /health or /ready from your orchestrator/monitoring instead.
+    # Explicit healthcheck (not the Dockerfile's HEALTHCHECK, which podman's
+    # default OCI output format drops). /bin/bash's /dev/tcp needs no curl/wget.
+    healthcheck:
+      # Single CMD-SHELL string that re-invokes bash explicitly — do NOT use the
+      # exec-form list (["CMD", "/bin/bash", "-c", ...]). podman-compose rewrites
+      # a list-form `test:` into `/bin/sh -c <args joined with shell quoting>`,
+      # which produced literally
+      #   /bin/sh -c /bin/bash' '-c' 'exec 3<>/dev/tcp/...'
+      # dash has no /dev/tcp, so the probe always failed and a perfectly healthy
+      # gateway was reported (unhealthy) with FailingStreak climbing. The string
+      # form below yields `/bin/sh -c "/bin/bash -c '...'"`, which works under
+      # both podman-compose and docker compose.
+      test: ["CMD-SHELL", "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090; printf \"GET /health HTTP/1.0\\r\\n\\r\\n\" >&3; head -1 <&3 | grep -q \" 200 \"'"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    # Must exceed SHUTDOWN_GRACE_SECONDS or podman SIGKILLs mid-drain.
+    stop_grace_period: 360s
     restart: unless-stopped
 
   # Postgres primary for production + failover replica source.

@@ -271,13 +271,22 @@ export function SortTh({ label, sortKey, sort, onSort, align = 'left', className
 }) {
   const active = sort.key === sortKey
   return (
+    // The click target is a real <button> covering the cell: a bare `th` with
+    // onClick is unreachable by keyboard and announced as a plain header.
+    // `aria-sort` on the th is what screen readers use to report the order.
     <th
-      onClick={() => onSort(sortKey)}
-      title={`Sort by ${label}`}
-      className={`px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider border-b border-stone bg-raised/60 cursor-pointer select-none whitespace-nowrap hover:text-paper transition-colors ${
+      aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+      className={`relative px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider border-b border-stone bg-raised/60 whitespace-nowrap ${
         align === 'right' ? 'text-right' : 'text-left'
       } ${active ? 'text-accent' : 'text-muted'} ${className}`}>
-      <span className="inline-flex items-center gap-1">
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        title={`Sort by ${label}`}
+        aria-label={`Sort by ${label}${active ? ` (${sort.dir === 'asc' ? 'ascending' : 'descending'})` : ''}`}
+        className="absolute inset-0 w-full cursor-pointer transition-colors hover:bg-raised/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/60"
+      />
+      <span className="pointer-events-none inline-flex items-center gap-1">
         {align === 'right' && active && <SortArrow dir={sort.dir} />}
         {label}
         {align === 'left' && active && <SortArrow dir={sort.dir} />}
@@ -339,7 +348,11 @@ export function BreakdownTable({
           {shown.map((r, i) => (
             <tr key={`${r.name}-${i}`}
               onClick={onRowClick ? () => onRowClick(r) : undefined}
-              className={`${onRowClick ? 'cursor-pointer hover:bg-raised/60' : ''} transition-colors`}>
+              onKeyDown={onRowClick ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onRowClick(r) }
+              } : undefined}
+              tabIndex={onRowClick ? 0 : undefined}
+              className={`${onRowClick ? 'cursor-pointer hover:bg-raised/60 focus-visible:outline-none focus-visible:bg-raised/60' : ''} transition-colors`}>
               <td className="px-4 py-2.5 border-b border-stone/60 max-w-[280px]">
                 <div className="truncate font-mono text-xs" title={r.name}>{r.name}</div>
                 <div className="h-1 mt-1 rounded-full bg-raised overflow-hidden">
@@ -392,7 +405,11 @@ export function Panel({ title, hint, right, children }: {
   children: ReactNode
 }) {
   return (
-    <Card>
+    // min-w-0: panels are grid items, and a grid item defaults to
+    // `min-width: auto`, so the whitespace-nowrap numeric cells inside a
+    // BreakdownTable stretched the item past its track and pushed the whole
+    // page into horizontal scroll on phones.
+    <Card className="min-w-0">
       <div className="flex items-start justify-between gap-3 mb-3">
         <div>
           <h3 className="text-[15px] font-semibold -tracking-tight">{title}</h3>

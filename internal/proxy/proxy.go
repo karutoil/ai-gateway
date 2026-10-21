@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"ai-gateway/internal/apikey"
 	"ai-gateway/internal/cache"
@@ -23,13 +24,16 @@ import (
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/devin"
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/imagegen"
 	"ai-gateway/internal/lb"
+	"ai-gateway/internal/mcp"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/otel"
 	"ai-gateway/internal/provider"
 	"ai-gateway/internal/resilience"
 	"ai-gateway/internal/translate"
+	"ai-gateway/internal/videogen"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -87,6 +91,43 @@ type Handler struct {
 	// buffers (413 beyond). Zero/negative = DefaultMaxProxyRequestBodyBytes.
 	MaxBodyBytes int64
 
+	// MaxResponseBytes bounds how much of an upstream RESPONSE body the
+	// buffered (non-streaming) success path will buffer before answering a
+	// clean 502. Zero/negative = DefaultMaxProxyResponseBytes (64 MiB). The
+	// buffered path buffers the WHOLE body before the client sees anything, so
+	// an uncapped read meant a 64 MiB b64_json response cost ~245 MB peak RSS
+	// per in-flight request (measured) — four concurrent 4K images OOM a 1 GiB
+	// container. Streaming requests are unaffected (they are bounded by the
+	// stream idle budget, not by this cap).
+	MaxResponseBytes int64
+
+	// ImageTTFB is the client-facing first-byte budget for the image endpoints
+	// (/v1/images/generations, /v1/images/edits). Image generation is slow and
+	// must not inherit the 85s chat budget.
+	//
+	// Tri-state (P1-12): < 0 = DefaultImageTTFB (unset / -1),
+	// == 0 = DISABLED, > 0 = that budget. See ImageTTFBDisabled for the
+	// equivalent explicit switch.
+	//
+	// To DISABLE the image watchdog use ImageTTFBDisabled, not ImageTTFB=0:
+	// the zero value must keep meaning "unset, use the 300s default".
+	ImageTTFB time.Duration
+
+	// ImageTTFBDisabled removes the image first-byte watchdog entirely, the
+	// documented meaning of IMAGE_TIMEOUT_SECONDS=0. It exists because a single
+	// duration cannot distinguish "unset" from "disabled" — the defect behind
+	// P1-12, where 0 was documented as disabled but resolved to the 300s
+	// default. main.go sets this for IMAGE_TIMEOUT_SECONDS=0.
+	//
+	// Chat is unaffected: the chat watchdog is Timeouts.TTFB.
+	ImageTTFBDisabled bool
+
+	// MCP is the centralized Model Context Protocol bridge. When set,
+	// LiteLLM-compatible mcp reference blocks in chat/messages/responses
+	// requests are expanded into real function tools and (for
+	// require_approval:"never") executed gateway-side in a bounded loop.
+	MCP *mcp.Bridge
+
 	// keyIDCache maps gateway-key prefix → gateway_keys.id for per-key
 	// analytics attribution on request_logs. Warmed on demand; entries are
 	// immutable in practice (a prefix maps to one key), so the empty-string
@@ -98,14 +139,15 @@ type Handler struct {
 func New(ps *provider.Store, db *sql.DB) *Handler {
 	tc := DefaultTimeouts()
 	return &Handler{
-		ProviderStore:   ps,
-		DB:              db,
-		Client:          GatewayHTTPClient(NewGatewayTransport(tc.UpstreamHeader, true)),
-		Timeouts:        tc,
-		CacheTTLSeconds: 10,
-		BodyLogMaxBytes: 8192,
-		MaxBodyBytes:    DefaultMaxProxyRequestBodyBytes,
-		quotaCache:      newQuotaCache(),
+		ProviderStore:    ps,
+		DB:               db,
+		Client:           GatewayHTTPClient(NewGatewayTransport(tc.UpstreamHeader, true)),
+		Timeouts:         tc,
+		CacheTTLSeconds:  10,
+		BodyLogMaxBytes:  8192,
+		MaxBodyBytes:     DefaultMaxProxyRequestBodyBytes,
+		MaxResponseBytes: DefaultMaxProxyResponseBytes,
+		quotaCache:       newQuotaCache(),
 	}
 }
 
@@ -170,6 +212,21 @@ func (h *Handler) readProxyBody(w http.ResponseWriter, r *http.Request) ([]byte,
 	return body, true
 }
 
+// readBoundedBody reads at most limit bytes from body and reports whether the
+// stream carried MORE than limit (probed with one extra byte, so an exactly-
+// at-limit body is still accepted).
+func readBoundedBody(body io.Reader, limit int64) ([]byte, bool, error) {
+	if limit <= 0 {
+		b, err := io.ReadAll(body)
+		return b, false, err
+	}
+	b, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if int64(len(b)) > limit {
+		return b[:limit], true, nil
+	}
+	return b, false, err
+}
+
 func estimateTokens(body []byte) int {
 	if len(body) == 0 {
 		return 0
@@ -178,7 +235,157 @@ func estimateTokens(body []byte) int {
 	// Base64 payloads (inline images, audio, files) are excluded BEFORE
 	// counting — a 900KB data-URL previously registered ~225K "tokens" and
 	// spurious 429'd multimodal clients long before the upstream saw bytes.
-	return (len(stripBase64Blobs(body)) + 3) / 4
+	// Multipart bodies get the same treatment (P2-15): the raw binary of an
+	// image-edit part is not text and must not be charged, or one 8 MB edit
+	// registered ~2M "tokens" and 429'd the key on TPM before the upstream
+	// ever saw the request.
+	return (len(stripBase64Blobs(stripMultipartBinary(body))) + 3) / 4
+}
+
+// stripMultipartBinary removes the binary parts of a multipart/form-data body
+// so estimateTokens measures only the text a model actually reads.
+//
+// A multipart edit body looks like:
+//
+//	--boundary
+//	Content-Disposition: form-data; name="image"; filename="a.png"
+//	Content-Type: image/png
+//
+//	<raw PNG bytes>
+//	--boundary
+//	Content-Disposition: form-data; name="prompt"
+//
+//	make it blue
+//	--boundary--
+//
+// The text fields are tiny; the file parts are megabytes of non-UTF-8. Rather
+// than parse the multipart framing, this scans for part headers within the
+// first bytes of each "--" delimiter run and keeps only text-ish field bodies.
+// Everything that is not a recognizably-textual part is dropped, which is the
+// safe direction for a rate limit: under-counting a file never fabricates a
+// 429, and the text fields (prompt, model, size, n, …) are still charged.
+//
+// Non-multipart bodies are returned unchanged, so the JSON/data-URL path keeps
+// its existing behaviour exactly.
+func stripMultipartBinary(body []byte) []byte {
+	// Only multipart bodies carry the framing this understands. A cheap probe
+	// keeps the JSON hot path allocation-free.
+	if !bytes.Contains(body[:min(len(body), 256)], []byte("Content-Disposition: form-data")) &&
+		!bytes.Contains(body[:min(len(body), 256)], []byte("content-disposition: form-data")) {
+		return body
+	}
+	var out []byte
+	pos := 0
+	for pos < len(body) {
+		// Find the next part header. The scan is case-insensitive WITHOUT
+		// copying/lowercasing the body: a 64 MiB edit body would otherwise be
+		// duplicated on the TPM pre-check path.
+		idx := indexFold(body[pos:], multipartCDNeedle)
+		if idx < 0 {
+			break
+		}
+		hdrStart := pos + idx
+		// The part's content starts after the blank line ending the headers.
+		sep := bytes.Index(body[hdrStart:], []byte("\r\n\r\n"))
+		sepLen := 4
+		if sep < 0 {
+			sep = bytes.Index(body[hdrStart:], []byte("\n\n"))
+			sepLen = 2
+		}
+		if sep < 0 {
+			break
+		}
+		contentStart := hdrStart + sep + sepLen
+		// The content ends at the next boundary delimiter line.
+		next := bytes.Index(body[contentStart:], []byte("\n--"))
+		contentEnd := len(body)
+		if next >= 0 {
+			contentEnd = contentStart + next
+		}
+		if isBinaryPart(body[hdrStart:contentStart], body[contentStart:contentEnd]) {
+			out = append(out, ' ')
+		} else {
+			out = append(out, body[hdrStart:contentEnd]...)
+			out = append(out, '\n')
+		}
+		if next < 0 {
+			break
+		}
+		pos = contentStart + next + 1
+	}
+	if len(out) == 0 {
+		return body
+	}
+	return out
+}
+
+// multipartCDNeedle is the part-header prefix the multipart token scan looks
+// for, in lower case.
+var multipartCDNeedle = []byte("content-disposition:")
+
+// indexFold is bytes.Index for an ASCII needle, ignoring case, without
+// allocating a lowercased copy of the haystack.
+func indexFold(haystack, needle []byte) int {
+	if len(needle) == 0 {
+		return 0
+	}
+	lower := func(c byte) byte {
+		if 'A' <= c && c <= 'Z' {
+			return c + ('a' - 'A')
+		}
+		return c
+	}
+	last := len(haystack) - len(needle)
+	for i := 0; i <= last; i++ {
+		if lower(haystack[i]) != needle[0] {
+			continue
+		}
+		match := true
+		for j := 1; j < len(needle); j++ {
+			if lower(haystack[i+j]) != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// isBinaryPart reports whether a multipart part's content is binary (a file
+// upload) rather than a text form field.
+func isBinaryPart(headers, content []byte) bool {
+	lh := bytes.ToLower(headers)
+	// A filename= attribute means a file upload (the OpenAI Images edits API
+	// sends fields with filenames). Binary by definition for TPM purposes.
+	if bytes.Contains(lh, []byte("filename=")) {
+		return true
+	}
+	// Any image/audio/video/octet-stream content type is binary.
+	for _, ct := range [][]byte{
+		[]byte("content-type: image/"), []byte("content-type: audio/"),
+		[]byte("content-type: video/"), []byte("content-type: application/octet-stream"),
+		[]byte("content-type: application/pdf"), []byte("content-type: application/zip"),
+	} {
+		if bytes.Contains(lh, ct) {
+			return true
+		}
+	}
+	// Fall back to the content itself: a NUL byte or invalid UTF-8 head is
+	// never a text field.
+	if len(content) == 0 {
+		return false
+	}
+	head := content
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	if bytes.IndexByte(head, 0) >= 0 {
+		return true
+	}
+	return !utf8.Valid(head)
 }
 
 // stripBase64Blobs removes embedded base64 runs (>=256 chars) from a payload.
@@ -209,6 +416,107 @@ func stripBase64Blobs(body []byte) []byte {
 		i++
 	}
 	return out
+}
+
+// responseClass is the coarse shape of an upstream RESPONSE body, sniffed once
+// per response (P1-10).
+//
+// Image responses used to be walked by six independent full-body JSON parses:
+// mergeFragmentedToolCalls (a chat-only repair), extractUsage,
+// extractAnthropicUsageFromSSEChunk, cacheSplitFromBody, extractUsageDetail and
+// imagegen.ImageCount. On a 1.4 MB b64_json body that was ~57% of the request
+// CPU and the bulk of the allocations (each map[string]interface{} parse
+// materializes the payload as a Go string). Classifying the body once with a
+// bounded byte sniff lets the bookkeeping run only the parsers the shape can
+// actually satisfy, and lets billing/cache/detail share ONE parse.
+type responseClass int
+
+const (
+	// classOther is anything unrecognized, non-JSON, or a plain-text error.
+	classOther responseClass = iota
+	// classMedia is an image/video generation payload (OpenAI Images data[],
+	// Gemini candidates[], Imagen predictions[]) — it carries no chat usage
+	// and no finish reason unless it also has a "usage" object.
+	classMedia
+	// classChat is an OpenAI chat/completions or legacy completions envelope.
+	classChat
+	// classAnthropic is an anthropic messages envelope.
+	classAnthropic
+	// classResponses is an OpenAI Responses API envelope.
+	classResponses
+	// classSSE is a data:-framed stream chunk (buffered relay of SSE bytes).
+	classSSE
+)
+
+// mediaBodyMarkers identify a generated-media payload within the sniff window.
+// They are dialect keys, not model names, so this stays provider-agnostic.
+var mediaBodyMarkers = [][]byte{
+	[]byte(`"b64_json"`),
+	[]byte(`"revised_prompt"`),
+	[]byte(`"predictions"`),
+	[]byte(`"candidates"`),
+	[]byte(`"inlineData"`),
+	[]byte(`"usageMetadata"`),
+	[]byte(`"generatedSamples"`),
+	[]byte(`"raiFilteredReason"`),
+}
+
+// contentClass sniffs the body shape. It deliberately does NOT unmarshal: it
+// inspects a bounded prefix with substring probes, so it stays cheap even for
+// a 64 MiB image body (the caller's bounded read guarantees the size).
+func contentClass(body []byte) responseClass {
+	if len(body) == 0 {
+		return classOther
+	}
+	// Sniff window: everything a shape marker can realistically live in.
+	const sniffWindow = 4096
+	window := body
+	if len(window) > sniffWindow {
+		window = window[:sniffWindow]
+	}
+	trimmed := bytes.TrimLeft(window, " \t\r\n")
+	if len(trimmed) == 0 {
+		return classOther
+	}
+	if trimmed[0] != '{' && trimmed[0] != '[' {
+		if bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:")) {
+			return classSSE
+		}
+		return classOther
+	}
+	// STRUCTURAL text markers win over media markers. A chat body whose
+	// assistant text happens to contain the word "candidates" (or a JSON
+	// example with "predictions") must still be treated as chat — skipping its
+	// usage parse would under-bill it. Generated-media payloads never carry
+	// `choices` / `stop_reason` / a Responses `output` array.
+	switch {
+	case bytes.Contains(window, []byte(`"choices"`)):
+		return classChat
+	case bytes.Contains(window, []byte(`"stop_reason"`)),
+		bytes.Contains(window, []byte(`"stop_sequence"`)):
+		return classAnthropic
+	case bytes.Contains(window, []byte(`"output"`)),
+		bytes.Contains(window, []byte(`"response"`)):
+		return classResponses
+	}
+	for _, m := range mediaBodyMarkers {
+		if bytes.Contains(window, m) {
+			return classMedia
+		}
+	}
+	return classOther
+}
+
+// carriesUsage reports whether the body can carry a usage object at all. Only
+// consulted for classMedia bodies (text shapes are always parsed exactly like
+// before); a media body with no usage-ish key cannot contribute tokens or a
+// cache split, and the billed cost for image models arrives via the
+// per-endpoint cost override, not from token pricing.
+//
+// The probe is a prefix match on `"usage` so it covers both the [OI]
+// `"usage":{…}` object and Gemini's `"usageMetadata":{…}`.
+func carriesUsage(body []byte) bool {
+	return bytes.Contains(body, []byte(`"usage`))
 }
 
 func (h *Handler) checkTPM(w http.ResponseWriter, r *http.Request, body []byte) bool {
@@ -698,6 +1006,17 @@ const azureAPIVersion = "2024-06-01"
 // Azure providers need deployment-shaped paths plus an api-version query;
 // the request builder detects that shape and switches the auth header from
 // "Authorization: Bearer" to "api-key" accordingly.
+// isAzureTarget reports whether a target URL is an Azure OpenAI deployment
+// path, which authenticates with an `api-key` header rather than Bearer.
+//
+// Centralised because three call sites need the same answer (the shared
+// newUpstreamRequest and the two video helpers that build their own requests);
+// an inline strings.Contains at each site is how the video paths ended up
+// omitting the Azure scheme entirely.
+func isAzureTarget(targetURL string) bool {
+	return strings.Contains(targetURL, "/openai/deployments/")
+}
+
 func upstreamTarget(baseURL, action, model string, isAzure bool) string {
 	base := strings.TrimRight(baseURL, "/")
 	if !isAzure {
@@ -709,7 +1028,11 @@ func upstreamTarget(baseURL, action, model string, isAzure bool) string {
 	return base + "/openai/deployments/" + url.PathEscape(model) + action + "?api-version=" + azureAPIVersion
 }
 
-func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, targetURL, apiKey string, body []byte, isStream, isAnthropicUpstream bool) (*http.Request, error) {
+// newUpstreamRequest builds the outbound request, including the provider's
+// auth scheme. `provider` may be nil (callers that have no provider row in
+// scope); when it is set, the Google-native decision is taken from the
+// provider TYPE instead of a URL substring (P3-3).
+func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, provider *models.Provider, targetURL, apiKey string, body []byte, isStream, isAnthropicUpstream bool, contentType string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -741,25 +1064,70 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, targe
 		// gateway default when the client sent none (see opencodeSessionForRequest).
 		req.Header.Set("x-opencode-session", opencodeSessionForRequest(r))
 	}
-	if isAnthropicUpstream {
+	if isGoogleNativeForProvider(provider, targetURL) {
+		// Google's generativelanguage endpoints authenticate with
+		// x-goog-api-key, never a Bearer token.
+		req.Header.Set("x-goog-api-key", apiKey)
+	} else if isAnthropicUpstream {
 		req.Header.Set("x-api-key", apiKey)
 		// Honor a client-pinned version; default only when absent.
 		if req.Header.Get("anthropic-version") == "" {
 			req.Header.Set("anthropic-version", "2023-06-01")
 		}
-	} else if strings.Contains(targetURL, "/openai/deployments/") {
+	} else if isAzureTarget(targetURL) {
 		// Azure: api-key header, no Bearer.
 		req.Header.Set("api-key", apiKey)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if isStream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
 	return req, nil
+}
+
+// isGoogleNativeAPI reports whether targetURL is one of Google's native
+// generativelanguage endpoints, which authenticate with x-goog-api-key rather
+// than a Bearer token. The gateway only ever builds these for `google`
+// providers (Gemini image generation via :generateContent, Imagen via
+// :predict), so the URL is a LAST-RESORT signal only.
+//
+// Prefer isGoogleNativeForProvider whenever the provider is known (P3-3): a
+// substring sniff over the whole URL also matches an operator's proxy or
+// reseller whose base URL happens to contain ":predict", and it changes the
+// AUTH SCHEME — a wrong match sends x-goog-api-key to a provider expecting a
+// Bearer token, which surfaces as an opaque 401. The substring form survives
+// only for the paths where no provider is in scope (an upstream content URL
+// captured from a poll response, a Google file URI).
+func isGoogleNativeAPI(targetURL string) bool {
+	l := strings.ToLower(targetURL)
+	return strings.Contains(l, "generativelanguage.googleapis.com") ||
+		strings.Contains(l, ":generatecontent") ||
+		strings.Contains(l, ":predict")
+}
+
+// isGoogleNativeForProvider decides the Google-native auth scheme from the
+// PROVIDER TYPE when one is available, falling back to the URL sniff only when
+// it is not (P3-3). A Google-typed provider always uses x-goog-api-key; any
+// other provider type never does, whatever its URL looks like.
+func isGoogleNativeForProvider(p *models.Provider, targetURL string) bool {
+	if p != nil {
+		if p.Type != "" {
+			return p.Type == models.ProviderGoogle
+		}
+		// A provider row with no type: the base URL is the only evidence left.
+		if p.BaseURL != "" {
+			return isGoogleNativeAPI(p.BaseURL)
+		}
+	}
+	return isGoogleNativeAPI(targetURL)
 }
 
 // sleepCtx sleeps for d but wakes immediately on ctx cancellation.
@@ -798,6 +1166,32 @@ type proxyOpts struct {
 	// predecessor so the completed turn can extend the chain. Empty for
 	// first turns and non-responses endpoints.
 	prevResponseID string
+	// transformResponse, when non-nil, rewrites a successful buffered upstream
+	// response before it is written to the client (e.g. Gemini/Imagen Images →
+	// [OI] Images shape). A nil out leaves the body unchanged; hasCost=true
+	// overrides the catalog-computed cost (image models bill per generated
+	// image, not per token).
+	transformResponse func(body []byte, status int) (out []byte, costUSD float64, hasCost bool)
+	// contentType overrides the upstream request Content-Type
+	// (multipart/form-data for image-edit passthrough). Empty = application/json.
+	contentType string
+	// noRetry disables same-provider retries for this call (billable,
+	// non-idempotent creates; see proxyCandidatesOpts.noRetry).
+	noRetry bool
+	// noCache bypasses the exact-match response cache (lookup AND store) for
+	// this call; generated media must never be replayed. See
+	// proxyCandidatesOpts.noCache.
+	noCache bool
+	// maxResponseBytes caps the buffered response body. Zero = handler
+	// default (MaxResponseBytes), then DefaultMaxProxyResponseBytes.
+	maxResponseBytes int64
+	// requestTotal overrides Timeouts.RequestTotal for this call. Zero =
+	// handler default.
+	requestTotal time.Duration
+	// provider is the provider row serving this attempt, when the caller knows
+	// it. It lets auth-scheme decisions use the provider TYPE instead of
+	// sniffing the URL (P3-3). Nil for callers with no provider in scope.
+	provider *models.Provider
 }
 
 // providerAttempt is one tried-and-failed-over provider in a fallback chain.
@@ -910,7 +1304,12 @@ func (h *Handler) proxyWithMetrics(w http.ResponseWriter, r *http.Request, targe
 
 func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, body []byte, isStream bool, model, providerID, keyPrefix, endpoint string, start time.Time, isAnthropicUpstream bool, opts proxyOpts) attemptOutcome {
 	c := h.cacheOrNoop()
-	retry := h.retryOrDefault()
+	// Billable, non-idempotent creates execute exactly ONCE: no same-provider
+	// retry (a retry after an ambiguous 5xx/timeout is a second generation and
+	// a second charge) and no failover (proxyCandidates honours noFailover).
+	// /v1/images/generations and /v1/images/edits set opts.noRetry from
+	// internal/proxy/images.go; see proxyCandidatesOpts.noRetry.
+	retry := h.effectiveRetry(proxyCandidatesOpts{noRetry: opts.noRetry})
 
 	cacheTTL := h.CacheTTLSeconds
 	if cacheTTL <= 0 {
@@ -926,16 +1325,17 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	// cacheStatus records this request's disposition against the response
 	// cache on every log row: 'hit', 'miss' (eligible, consulted, absent) or
 	// 'bypass' (not eligible: oversize body, streaming with the stream cache
-	// off). The X-Cache response header mirrors it.
+	// off, or a noCache endpoint such as image generation/edits). The X-Cache
+	// response header mirrors it.
 	cacheStatus := "bypass"
-	if len(body) <= cacheMaxBodyBytes {
+	if !opts.noCache && len(body) <= cacheMaxBodyBytes {
 		if !isStream || h.CacheStreams {
 			cacheStatus = "miss"
 		}
 	}
 
 	cacheKey := ""
-	if !isStream && len(body) <= cacheMaxBodyBytes {
+	if !opts.noCache && !isStream && len(body) <= cacheMaxBodyBytes {
 		cacheKey = cacheKeyFor(endpoint, model, body, cacheScopeFor(r, providerID))
 		if cached, status, headers, ok := c.Get(cacheKey); ok && status >= 200 && status < 400 {
 			h.serveCacheHit(w, cached, status, headers)
@@ -955,7 +1355,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	// the stream marker so a cached stream can never be served to a
 	// non-streaming client and vice versa.
 	var streamCache *streamCacheCollector
-	if isStream && h.CacheStreams && len(body) <= cacheMaxBodyBytes {
+	if !opts.noCache && isStream && h.CacheStreams && len(body) <= cacheMaxBodyBytes {
 		sKey := cacheKeyFor(endpoint+"|stream", model, body, cacheScopeFor(r, providerID))
 		if cached, status, headers, ok := c.Get(sKey); ok && status >= 200 && status < 400 {
 			h.serveCacheHit(w, cached, status, headers)
@@ -973,8 +1373,12 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 
 	ctx := r.Context()
 	var cancelFn context.CancelFunc
-	if h.Timeouts.RequestTotal > 0 {
-		ctx, cancelFn = context.WithTimeout(ctx, h.Timeouts.RequestTotal)
+	// Per-endpoint request budget: opts.requestTotal wins (decision/image
+	// endpoints pin a sane overall ceiling instead of relying on the unbounded
+	// default), else the handler default. Chat passes neither and is unchanged.
+	requestTotal := h.effectiveRequestTotal(endpoint, opts)
+	if requestTotal > 0 {
+		ctx, cancelFn = context.WithTimeout(ctx, requestTotal)
 		defer cancelFn()
 	}
 
@@ -1026,7 +1430,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, http.StatusGatewayTimeout, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: cacheStatus})
 			return attemptOutcome{committed: true, status: http.StatusGatewayTimeout}
 		}
-		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, body, isStream, isAnthropicUpstream)
+		req, err := h.newUpstreamRequest(ctx, r, opts.provider, targetURL, apiKey, body, isStream, isAnthropicUpstream, opts.contentType)
 		if err != nil {
 			if ttfb.headersCommitted() {
 				writeSSEUpstreamError(w, sseClientDialect(endpoint, isAnthropicUpstream), "failed to create upstream request")
@@ -1058,7 +1462,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					// Keepalive umbra already flowing (earlier attempt hit
 					// the budget; this one died too). A real status line is
 					// impossible — retry under the umbra or end in-band.
-					if retry.ShouldRetry(attempt, retryableCode(0)) {
+					if h.shouldRetryAttempt(retry, attempt, retryableCode(0), opts, endpoint) {
 						sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
 						continue
 					}
@@ -1070,7 +1474,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					// (and any edge proxy) see bytes, then restart a fresh
 					// upstream attempt under the keepalive umbra.
 					ttfb.commitKeepalive(w, applyFallbackHeader)
-					if retry.ShouldRetry(attempt, retryableCode(0)) {
+					if h.shouldRetryAttempt(retry, attempt, retryableCode(0), opts, endpoint) {
 						sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
 						continue
 					}
@@ -1122,7 +1526,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				// after pointless backoff.
 				return attemptOutcome{committed: false, status: status, retriable: false, errSnippet: string(lastErrSnippet), clientCaused: true}
 			}
-			if retry.ShouldRetry(attempt, retryableCode(status)) {
+			if h.shouldRetryAttempt(retry, attempt, retryableCode(status), opts, endpoint) {
 				sleepCtx(ctx, retryAfterDelay(retryHdr, retry.Backoff(attempt)))
 				continue
 			}
@@ -1177,10 +1581,30 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			return attemptOutcome{committed: true, status: lastStatus}
 		}
 
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+		// Bounded buffered read (P1-9). The buffered path buffers the WHOLE
+		// body before the client sees a byte, so an uncapped io.ReadAll here
+		// turned a large b64_json image response into unbounded RSS. The cap
+		// is per-endpoint (Handler.MaxResponseBytes, overridable via
+		// proxyCandidatesOpts.maxResponseBytes) and over-limit answers a clean
+		// 502 naming the limit instead of buffering without bound.
+		bodyLimit := opts.maxResponseBytes
+		if bodyLimit <= 0 {
+			bodyLimit = h.responseByteLimit(proxyCandidatesOpts{})
+		}
+		bodyBytes, overLimit, readErr := readBoundedBody(resp.Body, bodyLimit)
 		resp.Body.Close()
 		if ttfbTimer != nil {
 			ttfbTimer.Stop() // body read is finished with the first-byte deadline
+		}
+		if overLimit {
+			msg := fmt.Sprintf("upstream response exceeds the %d-byte limit for endpoint %q (MAX_PROXY_BODY_MB / Handler.MaxResponseBytes)", bodyLimit, endpoint)
+			log.Error().Str("model", model).Str("provider", providerID).Str("endpoint", endpoint).Int64("limit_bytes", bodyLimit).Msg("upstream response exceeded the buffered-response cap")
+			// Clean 502 in the unified envelope; the message names the limit so
+			// the operator knows which knob to raise. A stream cannot be in
+			// flight here: this branch is reached on the buffered path only.
+			httperr.Proxy(w, http.StatusBadGateway, msg)
+			h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, false, nil, nil, &logMeta{CacheStatus: cacheStatus})
+			return attemptOutcome{committed: true, status: http.StatusBadGateway}
 		}
 		lastBody = bodyBytes
 		// A buffered response reaches the client only when COMPLETE, so the
@@ -1194,7 +1618,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		}
 		if readErr != nil && len(bodyBytes) == 0 {
 			lastErr, lastStatus = readErr, 0
-			if retry.ShouldRetry(attempt, 0) {
+			if h.shouldRetryAttempt(retry, attempt, 0, opts, endpoint) {
 				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
 				continue
 			}
@@ -1207,13 +1631,13 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		if lastStatus == 200 && len(bodyBytes) == 0 {
 			lastErr, lastStatus = errEmptyUpstreamBody, 0
 			lastBody = nil
-			if retry.ShouldRetry(attempt, 0) {
+			if h.shouldRetryAttempt(retry, attempt, 0, opts, endpoint) {
 				sleepCtx(ctx, retryAfterDelay(nil, retry.Backoff(attempt)))
 				continue
 			}
 			return attemptOutcome{committed: false, status: 0, retriable: true, errText: errEmptyUpstreamBody.Error()}
 		}
-		if retry.ShouldRetry(attempt, resp.StatusCode) {
+		if h.shouldRetryAttempt(retry, attempt, resp.StatusCode, opts, endpoint) {
 			sleepCtx(r.Context(), retryAfterDelay(resp.Header, retry.Backoff(attempt)))
 			continue
 		}
@@ -1222,7 +1646,14 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		// ids, and standard harnesses parse each entry and die on the
 		// fragments. Streaming deltas are legitimately fragmented and
 		// stay verbatim for the client to accumulate.
-		if !isStream && lastStatus == 200 && len(bodyBytes) > 0 {
+		//
+		// Gated on the CLASSIFIED response kind (P1-10) plus a cheap byte
+		// probe: this is a chat-repair routine and running it on an image
+		// response was a wasted full-body json.Unmarshal (the single largest
+		// CPU consumer in the image profile).
+		if !isStream && lastStatus == 200 && len(bodyBytes) > 0 &&
+			contentClass(bodyBytes) == classChat &&
+			bytes.Contains(bodyBytes, []byte("tool_calls")) {
 			if fixed, did := mergeFragmentedToolCalls(bodyBytes); did {
 				bodyBytes = fixed
 				lastBody = fixed
@@ -1240,13 +1671,56 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 	}
 
 	{
-		pt, ct := extractUsage(lastBody)
-		if pt == 0 && ct == 0 {
-			pt, ct = extractAnthropicUsageFromSSEChunk(lastBody)
+		// Classify the response ONCE (P1-10). Everything below uses this to
+		// skip parsers the shape cannot satisfy; text shapes keep byte-for-byte
+		// the old behaviour.
+		kind := contentClass(lastBody)
+		// Non-chat media payloads are parsed at most once, and only when they
+		// can carry a usage object at all. A b64_json image body that mentions
+		// no "usage" contributes no tokens and no cache split, and its billed
+		// cost comes from the per-endpoint cost override (imageCost), not from
+		// token pricing — so the six historical full-body parses bought nothing.
+		mediaBody := kind == classMedia && !carriesUsage(lastBody)
+
+		// ONE lazily-parsed envelope feeds billing AND the cache split AND
+		// (when the body is not rewritten below) the usage detail. These three
+		// used to be three independent full-body json.Unmarshal calls into
+		// map[string]interface{}, each of which materializes every large string
+		// in the document — on a b64_json response that was three copies of the
+		// payload. The helpers are the pre-existing FromMap variants, written
+		// for exactly this reuse.
+		var envelope map[string]interface{}
+		envelopeParsed := false
+		parseEnvelope := func() map[string]interface{} {
+			if !envelopeParsed {
+				envelopeParsed = true
+				if len(lastBody) > 0 && lastBody[0] == '{' {
+					_ = json.Unmarshal(lastBody, &envelope)
+				}
+			}
+			return envelope
 		}
-		split := splitOrFallback(cacheSplitFromBody(lastBody), pt, ct)
+
+		pt, ct := 0, 0
+		split := catalog.CacheSplit{}
+		if !mediaBody {
+			pt, ct = extractUsageFromMap(parseEnvelope())
+			if pt == 0 && ct == 0 && isAnthropicUpstream {
+				// The anthropic SSE usage probe only applies to Anthropic
+				// upstreams; on an image body it split the whole payload on
+				// newlines into a [][]byte slice and parsed every line.
+				pt, ct = extractAnthropicUsageFromSSEChunk(lastBody)
+			}
+			split = splitOrFallback(cacheSplitFromMap(parseEnvelope()), pt, ct)
+		}
 		cost := h.costForModel(model, split)
 		outBody := lastBody
+		// bodyRewritten records that outBody is no longer the byte sequence the
+		// envelope above was parsed from. Every branch that substitutes a body
+		// MUST set it: the cached envelope is invalid afterwards for both the
+		// Content-Length decision and the finish-reason extraction (readers of
+		// the cached envelope would silently report the pre-rewrite reason).
+		bodyRewritten := false
 
 		needsChatShape := endpoint == "chat.completions" && isAnthropicUpstream && lastStatus == 200
 		if needsChatShape {
@@ -1259,6 +1733,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					cost = h.costForModel(model, split)
 				}
 				outBody = translated
+				bodyRewritten = true
 			}
 		}
 
@@ -1271,6 +1746,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if isAnthropicUpstream {
 				if chatShape := anthropicToOpenAIChatResponse(outBody, model); chatShape != nil {
 					outBody = chatShape
+					bodyRewritten = true
 				}
 			}
 			if converted := chatToResponsesJSON(outBody, model); converted != nil {
@@ -1280,6 +1756,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					cost = h.costForModel(model, split)
 				}
 				outBody = converted
+				bodyRewritten = true
 				// Chain support for the next turn: remember this turn's
 				// full chat history under the issued response id.
 				// Anthropic-shaped request bodies are skipped (different
@@ -1310,6 +1787,36 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 					cost = h.costForModel(model, split)
 				}
 				outBody = converted
+				bodyRewritten = true
+			}
+		}
+
+		// Per-endpoint response rewriting (Gemini/Imagen Images → [OI] Images).
+		// Runs last so a dialect transform wins over the built-in conversions;
+		// a nil out leaves the body untouched. hasCost overrides the
+		// catalog-computed cost (image models bill per generated image).
+		transformedResponse := false
+		if opts.transformResponse != nil && lastStatus >= 200 && lastStatus < 400 {
+			transformed, costOverride, hasCost := opts.transformResponse(lastBody, lastStatus)
+			if transformed != nil {
+				outBody = transformed
+				transformedResponse = true
+				bodyRewritten = true
+				// A dialect transform can carry usage (Gemini usageMetadata is
+				// projected into the [OI] usage object); a plain passthrough
+				// image body cannot. Probing with one byte check avoids two
+				// full-body parses of the regenerated payload when there is
+				// nothing to find.
+				if carriesUsage(outBody) {
+					if pt2, ct2 := extractUsage(outBody); pt2 != 0 || ct2 != 0 {
+						pt, ct = pt2, ct2
+						split = splitOrFallback(cacheSplitFromBody(outBody), pt, ct)
+						cost = h.costForModel(model, split)
+					}
+				}
+			}
+			if hasCost {
+				cost = costOverride
 			}
 		}
 
@@ -1318,7 +1825,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		// Body-rewriting paths (anthropic→openai conversions, responses
 		// translation) change payload size; a copied stale Content-Length makes
 		// clients hang or truncate ("unexpected EOF"). Drop it when rewritten.
-		if len(outBody) != len(lastBody) {
+		if bodyRewritten || transformedResponse || len(outBody) != len(lastBody) {
 			w.Header().Del("Content-Length")
 		}
 		if cacheStatus == "bypass" {
@@ -1326,7 +1833,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 		} else {
 			w.Header().Set("X-Cache", "MISS")
 		}
-		if (needsChatShape || needsResponsesShape) && lastStatus == 200 {
+		if (needsChatShape || needsResponsesShape || transformedResponse) && lastStatus == 200 {
 			w.Header().Set("Content-Type", "application/json")
 		}
 		// Client bytes FIRST, bookkeeping after. The old order ran
@@ -1346,7 +1853,25 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			hdr.Set("Content-Type", "application/json")
 			c.Set(cacheKey, outBody, lastStatus, hdr, cacheTTL)
 		}
-		_, _, nd := extractUsageDetail(outBody)
+		// Finish reason / cache detail. The FromMap variant is only valid when
+		// outBody is still the body the envelope was parsed from: every
+		// rewriting path above (anthropic→openai, responses translation, image
+		// dialect transform) can CHANGE the terminal reason, and reusing the
+		// stale envelope silently dropped finish_reason (two tests pin this).
+		var nd usageDetail
+		switch {
+		case bodyRewritten || transformedResponse || len(outBody) != len(lastBody):
+			// outBody was substituted, so the cached envelope describes the
+			// PRE-rewrite body: re-parse the bytes the client actually got or
+			// finish_reason is silently lost.
+			_, _, nd = extractUsageDetail(outBody)
+		case mediaBody:
+			// Media payload with no usage object: there is no finish reason and
+			// no cache split to record, and parsing the body a fifth time finds
+			// nothing.
+		default:
+			_, _, nd = extractUsageDetailFromMap(parseEnvelope())
+		}
 		meta := &logMeta{CacheStatus: cacheStatus, FinishReason: nd.FinishReason, CacheRead: nd.CacheRead, CacheWrite: nd.CacheWrite, Reasoning: nd.Reasoning, FallbackChain: marshalAttemptChain(opts.attempts)}
 		h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, endpoint, lastStatus, time.Since(start).Milliseconds(), pt, ct, cost, false, body, outBody, meta)
 		return attemptOutcome{committed: true, status: lastStatus}
@@ -1356,6 +1881,41 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 // errEmptyUpstreamBody marks an upstream 200 that carried no body — a
 // channel-death signature on new-api style upstreams, not a real completion.
 var errEmptyUpstreamBody = errors.New("upstream returned 200 with empty body")
+
+// shouldRetryAttempt is the single retry decision point for one upstream
+// attempt. Besides delegating to the configured policy it makes the
+// over-billing of billable, non-idempotent creates OBSERVABLE: a noRetry call
+// (image generations/edits) that would otherwise have retried counts a
+// billable_retry_skipped event, so an operator can see how much duplicate
+// upstream work the old behaviour was buying. The retry is always skipped
+// (P0-2); only the metric is conditional.
+func (h *Handler) shouldRetryAttempt(retry resilience.RetryPolicy, attempt, status int, opts proxyOpts, endpoint string) bool {
+	if opts.noRetry {
+		// Evaluate the HANDLER policy purely for observability: what the old
+		// behaviour would have retried is exactly the duplicate upstream work
+		// this mode exists to prevent. The retry itself never happens.
+		if h.retryOrDefault().ShouldRetry(attempt, status) {
+			h.incBillableRetry(endpoint, status)
+		}
+		return false
+	}
+	return retry.ShouldRetry(attempt, status)
+}
+
+// effectiveRequestTotal resolves the overall request budget for one call:
+// per-call override, then the endpoint's default (image/decision endpoints are
+// bounded even when the operator left REQUEST_TOTAL_TIMEOUT_SECONDS unset),
+// then the handler's configured RequestTotal. Chat and the text endpoints keep
+// their old behaviour exactly (0 = unbounded; TTFB/StreamIdle bound them).
+func (h *Handler) effectiveRequestTotal(endpoint string, opts proxyOpts) time.Duration {
+	if opts.requestTotal > 0 {
+		return opts.requestTotal
+	}
+	if perEndpoint := h.Timeouts.defaultRequestTotalForEndpoint(endpoint); perEndpoint > 0 {
+		return perEndpoint
+	}
+	return h.Timeouts.RequestTotal
+}
 
 // retryableCode maps transport failures to a synthetic retry-polling code.
 func retryableCode(status int) int {
@@ -2500,11 +3060,23 @@ func (h *Handler) logRequestExtendedBodies(ctx context.Context, keyPrefix, provi
 			reqBodyStr = ScrubSecrets(string(b))
 		}
 		if len(responseBody) > 0 {
-			b := responseBody
-			if len(b) > cap_ {
-				b = b[:cap_]
+			// Generated media is not logged verbatim. An image/video body is
+			// either a multi-hundred-KB b64_json blob or a provider URL, so a
+			// truncated prefix is both useless for debugging and ~8 kB of
+			// pure noise in EVERY request_logs row — it inflated the OLTP DB
+			// by 8 kB per image request and widened every export. Record a
+			// redacted summary instead; the token/cost/latency columns and the
+			// prompt (in requestBody, which IS text) carry the diagnostic
+			// value.
+			if isGeneratedMediaEndpoint(endpoint) {
+				respBodyStr = mediaBodySummary(responseBody, cap_)
+			} else {
+				b := responseBody
+				if len(b) > cap_ {
+					b = b[:cap_]
+				}
+				respBodyStr = ScrubSecrets(string(b))
 			}
-			respBodyStr = ScrubSecrets(string(b))
 		}
 	}
 	// cache_hit is an INTEGER column on both dialects: bind an int, never a
@@ -2954,6 +3526,16 @@ func (h *Handler) incZeroCost(reason string) {
 	}
 }
 
+// incBillableRetry records a retry/failover the gateway DECLINED because the
+// request was a billable, non-idempotent create (see proxyOpts.noRetry /
+// proxyCandidatesOpts.noRetry) — i.e. a duplicate generation and charge the
+// old behaviour would have bought. Exposed on the shared Prometheus registry
+// rather than through Handler.Metrics so it is observable even in slim builds
+// and tests where Metrics is nil.
+func (h *Handler) incBillableRetry(endpoint string, status int) {
+	resilience.IncBillableRetrySkip(endpoint, status)
+}
+
 // settingFloat reads a numeric system_config key ("" / unparseable → 0).
 func (h *Handler) settingFloat(key string) float64 {
 	if h.DB == nil {
@@ -3131,6 +3713,15 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !h.checkTPM(w, r, body) {
 		return
 	}
+	if h.rejectImageModelOnText(w, model, "/v1/chat/completions") {
+		return
+	}
+	if rejectDecisionModelOnText(w, model, "/v1/chat/completions") {
+		return
+	}
+	if h.rejectVideoModelOnText(w, model, "/v1/chat/completions") {
+		return
+	}
 	if !chatMessagesPresent(body) {
 		httperr.Invalid(w, "messages: required non-empty array of chat messages")
 		return
@@ -3144,13 +3735,26 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, err.Error())
 		return
 	}
+	// LiteLLM-compatible MCP references: expand `{"type":"mcp"}` tools into
+	// real function tools, and hand require_approval:"never" requests to the
+	// gateway-side execution loop.
+	if expanded, plan, outcome := h.prepareMCP(w, r, body, mcp.ProtocolChat, "/v1/chat/completions"); outcome != mcpNoReferences {
+		if outcome == mcpRejected {
+			return
+		}
+		if plan.AutoExecute {
+			h.runMCPLoop(w, r, expanded, plan, mcp.ProtocolChat, "/v1/chat/completions")
+			return
+		}
+		body = expanded
+	}
 	isStream := translate.IsStreaming(body)
 	if model != rawModel {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
 	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
-		return p.Type != models.ProviderAnthropic
+		return p.Type != models.ProviderAnthropic && !isDecisionProvider(p) && !isImageOnlyProvider(p)
 	})
 	if len(candidates) == 0 {
 		if rule != nil {
@@ -3163,6 +3767,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if p, err := h.ProviderStore.Resolve(model, providerHint); err == nil && p != nil && p.Type == models.ProviderAnthropic {
 			httperr.Invalid(w, "model '"+model+"' is an anthropic model; use POST /v1/messages instead of /v1/chat/completions")
+			return
+		}
+		if p, err := h.ProviderStore.Resolve(model, providerHint); err == nil && isImageOnlyProvider(p) {
+			httperr.Invalid(w, "provider '"+p.Name+"' is image-only; the gateway serves its image models at POST /v1/images/generations. For Gemini chat, add an openai_compatible provider pointed at Google's [OI]-compatibility base URL (https://generativelanguage.googleapis.com/v1beta/openai/)")
 			return
 		}
 		httperr.Proxy(w, http.StatusServiceUnavailable, "no provider configured")
@@ -3193,10 +3801,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.proxyDevin(w, r, body, isStream, model, "chat.completions", keyPrefix, start, p0)
 		return
 	}
-	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
+	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, string, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
-			return "", "", nil, false, err
+			return "", "", nil, false, "", err
 		}
 		// The body may already carry a rule member's model override; derive
 		// the upstream id from it so the override survives prefix stripping.
@@ -3220,7 +3828,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		target := upstreamTarget(p.BaseURL, "/chat/completions", model, p.Type == models.ProviderAzure)
-		return target, apiKey, out, false, nil
+		return target, apiKey, out, false, "", nil
 	})
 }
 
@@ -3248,8 +3856,21 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	isStream := translate.IsStreaming(body)
+	// Endpoint-vs-model validity is checked BEFORE routing: a decision or
+	// image-only model sent here deserves an actionable 400 naming the right
+	// endpoint, not the generic 404 model_not_routed that candidate resolution
+	// produces when no rule matches.
+	if h.rejectImageModelOnText(w, model, "/v1/completions") {
+		return
+	}
+	if rejectDecisionModelOnText(w, model, "/v1/completions") {
+		return
+	}
+	if h.rejectVideoModelOnText(w, model, "/v1/completions") {
+		return
+	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool { return !isDecisionProvider(p) && !isImageOnlyProvider(p) })
 	if len(candidates) == 0 {
 		if rule != nil {
 			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
@@ -3397,7 +4018,7 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	start := time.Now()
-	out := h.proxyWithMetrics(w, r, target, apiKey, body, isStream, model, p.ID, r.Header.Get("X-Gateway-Key-Prefix"), "completions", start, isAnthropic)
+	out := h.proxyWithMetricsOpts(w, r, target, apiKey, body, isStream, model, p.ID, r.Header.Get("X-Gateway-Key-Prefix"), "completions", start, isAnthropic, proxyOpts{provider: p})
 	if !out.committed {
 		// Client-caused upstream 5xx: relay the upstream's verdict (the
 		// generic "upstream unavailable" envelope would misclassify a
@@ -3434,9 +4055,21 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if model != rawModel {
 		body = replaceModelInBody(body, model)
 	}
+	// Endpoint-vs-model validity before routing (see Completions): a decision
+	// or image-only model sent to /v1/embeddings gets an actionable 400 rather
+	// than the generic 404 model_not_routed.
+	if h.rejectImageModelOnText(w, model, "/v1/embeddings") {
+		return
+	}
+	if rejectDecisionModelOnText(w, model, "/v1/embeddings") {
+		return
+	}
+	if h.rejectVideoModelOnText(w, model, "/v1/embeddings") {
+		return
+	}
 	providerHint := r.Header.Get("X-Provider")
 	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool {
-		return p.Type != models.ProviderAnthropic
+		return p.Type != models.ProviderAnthropic && !isDecisionProvider(p) && !isImageOnlyProvider(p)
 	})
 	if len(candidates) == 0 {
 		if rule != nil {
@@ -3451,10 +4084,10 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	h.proxyCandidates(w, r, body, false, model, "embeddings", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
+	h.proxyCandidates(w, r, body, false, model, "embeddings", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, string, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
-			return "", "", nil, false, err
+			return "", "", nil, false, "", err
 		}
 		// The body may already carry a rule member's model override; derive
 		// the upstream id from it so the override survives prefix stripping.
@@ -3465,7 +4098,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			out = replaceModelInBody(body, upstream)
 		}
 		target := upstreamTarget(p.BaseURL, "/embeddings", model, p.Type == models.ProviderAzure)
-		return target, apiKey, out, false, nil
+		return target, apiKey, out, false, "", nil
 	})
 }
 
@@ -3554,7 +4187,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.ProviderStore.List()
 	// Try provider_models first - this is the dynamic per-provider list user wants
 	if h.DB != nil {
-		rows, err := h.DB.Query(db.Q(`SELECT pm.model_id, pm.display_name, pm.owned_by, pm.context_window, pm.max_output, pm.input_cost, pm.output_cost, pm.reasoning, pm.tool_call, pm.attachment, p.name, pm.reasoning_type, pm.reasoning_levels, pm.reasoning_output_limits FROM provider_models pm JOIN providers p ON p.id = pm.provider_id ORDER BY p.name, pm.model_id LIMIT 500`))
+		rows, err := h.DB.Query(db.Q(`SELECT pm.model_id, pm.display_name, pm.owned_by, pm.context_window, pm.max_output, pm.input_cost, pm.output_cost, pm.reasoning, pm.tool_call, pm.attachment, p.name, pm.reasoning_type, pm.reasoning_levels, pm.reasoning_output_limits, pm.decision, pm.image, pm.video, pm.modalities FROM provider_models pm JOIN providers p ON p.id = pm.provider_id ORDER BY p.name, pm.model_id LIMIT 500`))
 		if err == nil {
 			defer rows.Close()
 			var pmModels []map[string]interface{}
@@ -3564,7 +4197,9 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 				var inCost, outCost sql.NullFloat64
 				var reasoning, toolCall, attachment sql.NullBool
 				var rType, rLevels, rLimits sql.NullString
-				if err := rows.Scan(&modelID, &displayName, &ownedBy, &ctx, &maxOut, &inCost, &outCost, &reasoning, &toolCall, &attachment, &providerName, &rType, &rLevels, &rLimits); err == nil {
+				var decisionFlag, imageFlag, videoFlag sql.NullInt64
+				var modalities sql.NullString
+				if err := rows.Scan(&modelID, &displayName, &ownedBy, &ctx, &maxOut, &inCost, &outCost, &reasoning, &toolCall, &attachment, &providerName, &rType, &rLevels, &rLimits, &decisionFlag, &imageFlag, &videoFlag, &modalities); err == nil {
 					qid := qualifiedModelID(providerName, modelID)
 					m := map[string]interface{}{
 						"id":       qid,
@@ -3605,6 +4240,47 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 					}
 					if rLimits.Valid {
 						m["reasoning_output_limits"] = rLimits.String
+					}
+					if decisionFlag.Int64 != 0 {
+						m["decision"] = true
+						m["kind"] = "decision"
+					}
+					if videoFlag.Int64 != 0 {
+						m["video"] = true
+						m["kind"] = "video"
+						if perSec, ok := videogen.Lookup(modelID); ok && perSec.CostPerSecond > 0 {
+							m["video_cost"] = perSec.CostPerSecond
+						}
+						only := false
+						if modalities.Valid && modalities.String != "" {
+							only = videogen.VideoOnlyFromModalities(modalities.String)
+						} else {
+							only = videogen.IsVideoOnlyModel(modelID)
+						}
+						m["video_only"] = only
+						if modalities.Valid && modalities.String != "" {
+							m["modalities"] = modalities.String
+						}
+					}
+					if imageFlag.Int64 != 0 {
+						m["image"] = true
+						m["kind"] = "image"
+						if perImage, ok := imagegen.CostPerImage(modelID); ok {
+							m["image_cost"] = perImage
+						}
+						// image_only separates a pure generator (barred from the
+						// text endpoints) from a model that also chats, so
+						// clients can offer the right models per mode.
+						only := false
+						if modalities.Valid && modalities.String != "" {
+							only = imagegen.ImageOnlyFromModalities(modalities.String)
+						} else {
+							only = imagegen.IsImageOnlyModel(modelID)
+						}
+						m["image_only"] = only
+						if modalities.Valid && modalities.String != "" {
+							m["modalities"] = modalities.String
+						}
 					}
 					pmModels = append(pmModels, m)
 				}
@@ -3655,7 +4331,36 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 				"reasoning":      cm.Reasoning,
 				"tool_call":      cm.ToolCall,
 				"attachment":     cm.Attachment,
+				"decision":       cm.Decision,
+				"image":          cm.Image,
+				"video":          cm.Video,
 			})
+			if cm.Video {
+				entry := catalogModels[len(catalogModels)-1]
+				entry["kind"] = "video"
+				if vm, ok := videogen.Lookup(cm.ID); ok && vm.CostPerSecond > 0 {
+					entry["video_cost"] = vm.CostPerSecond
+				}
+				if cm.Modalities != "" {
+					entry["modalities"] = cm.Modalities
+					entry["video_only"] = videogen.VideoOnlyFromModalities(cm.Modalities)
+				} else {
+					entry["video_only"] = videogen.IsVideoOnlyModel(cm.ID)
+				}
+			}
+			if cm.Image {
+				entry := catalogModels[len(catalogModels)-1]
+				entry["kind"] = "image"
+				if perImage, ok := imagegen.CostPerImage(cm.ID); ok {
+					entry["image_cost"] = perImage
+				}
+				if cm.Modalities != "" {
+					entry["modalities"] = cm.Modalities
+					entry["image_only"] = imagegen.ImageOnlyFromModalities(cm.Modalities)
+				} else {
+					entry["image_only"] = imagegen.IsImageOnlyModel(cm.ID)
+				}
+			}
 		}
 	}
 	if err != nil || len(providers) == 0 {
@@ -3730,12 +4435,66 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 						entry["input_cost"] = cm.InputCost
 						entry["output_cost"] = cm.OutputCost
 						entry["reasoning"] = cm.Reasoning
+						entry["decision"] = cm.Decision
+						entry["video"] = cm.Video
+						if cm.Video {
+							entry["kind"] = "video"
+							if vm, ok := videogen.Lookup(cm.ID); ok && vm.CostPerSecond > 0 {
+								entry["video_cost"] = vm.CostPerSecond
+							}
+							if cm.Modalities != "" {
+								entry["modalities"] = cm.Modalities
+								entry["video_only"] = videogen.VideoOnlyFromModalities(cm.Modalities)
+							} else {
+								entry["video_only"] = videogen.IsVideoOnlyModel(cm.ID)
+							}
+						}
+						entry["image"] = cm.Image
+						if cm.Image {
+							entry["kind"] = "image"
+							if perImage, ok := imagegen.CostPerImage(cm.ID); ok {
+								entry["image_cost"] = perImage
+							}
+							if cm.Modalities != "" {
+								entry["modalities"] = cm.Modalities
+								entry["image_only"] = imagegen.ImageOnlyFromModalities(cm.Modalities)
+							} else {
+								entry["image_only"] = imagegen.IsImageOnlyModel(cm.ID)
+							}
+						}
 					} else if cm, err := h.CatalogStore.GetByShortID(m.ID); err == nil {
 						entry["context_window"] = cm.ContextWindow
 						entry["max_output"] = cm.MaxOutput
 						entry["input_cost"] = cm.InputCost
 						entry["output_cost"] = cm.OutputCost
 						entry["reasoning"] = cm.Reasoning
+						entry["decision"] = cm.Decision
+						entry["video"] = cm.Video
+						if cm.Video {
+							entry["kind"] = "video"
+							if vm, ok := videogen.Lookup(cm.ID); ok && vm.CostPerSecond > 0 {
+								entry["video_cost"] = vm.CostPerSecond
+							}
+							if cm.Modalities != "" {
+								entry["modalities"] = cm.Modalities
+								entry["video_only"] = videogen.VideoOnlyFromModalities(cm.Modalities)
+							} else {
+								entry["video_only"] = videogen.IsVideoOnlyModel(cm.ID)
+							}
+						}
+						entry["image"] = cm.Image
+						if cm.Image {
+							entry["kind"] = "image"
+							if perImage, ok := imagegen.CostPerImage(cm.ID); ok {
+								entry["image_cost"] = perImage
+							}
+							if cm.Modalities != "" {
+								entry["modalities"] = cm.Modalities
+								entry["image_only"] = imagegen.ImageOnlyFromModalities(cm.Modalities)
+							} else {
+								entry["image_only"] = imagegen.IsImageOnlyModel(cm.ID)
+							}
+						}
 					}
 				}
 				all = append(all, entry)
@@ -3819,6 +4578,26 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !h.checkTPM(w, r, body) {
 		return
 	}
+	if h.rejectImageModelOnText(w, model, "/v1/messages") {
+		return
+	}
+	if rejectDecisionModelOnText(w, model, "/v1/messages") {
+		return
+	}
+	if h.rejectVideoModelOnText(w, model, "/v1/messages") {
+		return
+	}
+	// LiteLLM-compatible MCP references (see ChatCompletions).
+	if expanded, plan, outcome := h.prepareMCP(w, r, body, mcp.ProtocolAnthropic, "/v1/messages"); outcome != mcpNoReferences {
+		if outcome == mcpRejected {
+			return
+		}
+		if plan.AutoExecute {
+			h.runMCPLoop(w, r, expanded, plan, mcp.ProtocolAnthropic, "/v1/messages")
+			return
+		}
+		body = expanded
+	}
 	if model != rawModel {
 		body = replaceModelInBody(body, model)
 	}
@@ -3901,10 +4680,10 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, error) {
+	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, string, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
-			return "", "", nil, false, err
+			return "", "", nil, false, "", err
 		}
 		// The body may already carry a rule member's model override; derive
 		// the upstream id from it so the override survives prefix stripping.
@@ -3920,7 +4699,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(p.BaseURL, "anthropic.com") && !strings.Contains(target, "/v1/messages") {
 			target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
 		}
-		return target, apiKey, out, true, nil
+		return target, apiKey, out, true, "", nil
 	})
 }
 
@@ -3956,6 +4735,26 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	if !h.checkTPM(w, r, body) {
 		return
 	}
+	if h.rejectImageModelOnText(w, model, "/v1/responses") {
+		return
+	}
+	if rejectDecisionModelOnText(w, model, "/v1/responses") {
+		return
+	}
+	if h.rejectVideoModelOnText(w, model, "/v1/responses") {
+		return
+	}
+	// LiteLLM-compatible MCP references (see ChatCompletions).
+	if expanded, plan, outcome := h.prepareMCP(w, r, body, mcp.ProtocolResponses, "/v1/responses"); outcome != mcpNoReferences {
+		if outcome == mcpRejected {
+			return
+		}
+		if plan.AutoExecute {
+			h.runMCPLoop(w, r, expanded, plan, mcp.ProtocolResponses, "/v1/responses")
+			return
+		}
+		body = expanded
+	}
 	if model != rawModel {
 		body = replaceModelInBody(body, model)
 	}
@@ -3975,7 +4774,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	isStream := translate.IsStreaming(body)
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), nil)
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), func(p *models.Provider) bool { return !isDecisionProvider(p) && !isImageOnlyProvider(p) })
 	if len(candidates) == 0 {
 		if rule != nil {
 			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
@@ -4130,8 +4929,19 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					}
 					log.Info().Str("model", model).Str("provider", p.ID).Msg("native responses attempt unusable before commit; falling through to translated path")
 				} else {
-					bodyBytes, _ := io.ReadAll(resp.Body)
+					// Bounded like every other buffered success path (P1-9):
+					// an over-limit native /responses body answers a clean 502
+					// naming the limit rather than buffering without bound.
+					limit := h.responseByteLimit(proxyCandidatesOpts{})
+					bodyBytes, over, _ := readBoundedBody(resp.Body, limit)
 					resp.Body.Close()
+					if over {
+						msg := fmt.Sprintf("upstream response exceeds the %d-byte limit for endpoint %q (MAX_PROXY_BODY_MB / Handler.MaxResponseBytes)", limit, "responses")
+						log.Error().Str("model", model).Str("provider", p.ID).Int64("limit_bytes", limit).Msg("upstream response exceeded the buffered-response cap")
+						h.logRequestExtended(r.Context(), keyPrefix, p.ID, model, "responses", http.StatusBadGateway, time.Since(start).Milliseconds(), 0, 0, 0, false)
+						httperr.Proxy(w, http.StatusBadGateway, msg)
+						return
+					}
 					nativeSSE := resp.StatusCode == 200 &&
 						(strings.HasPrefix(ct, "text/event-stream") || bytes.Contains(bodyBytes, []byte("\ndata: ")) || bytes.Contains(bodyBytes, []byte("data: ")))
 					jsonOK := json.Valid(bodyBytes)
@@ -4272,10 +5082,10 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				upstreamBody = b2
 			}
 		}
-		h.streamTranslatedResponses(w, r, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream, ttfb, prevID)
+		h.streamTranslatedResponses(w, r, p, target, apiKey, upstreamBody, model, keyPrefix, p.ID, start, isAnthropicUpstream, ttfb, prevID)
 		return
 	}
-	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true, ttfb: ttfb, prevResponseID: prevID})
+	out := h.proxyWithMetricsOpts(w, r, target, apiKey, upstreamBody, false, model, p.ID, keyPrefix, "responses", start, isAnthropicUpstream, proxyOpts{translatedResponses: true, ttfb: ttfb, prevResponseID: prevID, provider: p})
 	if !out.committed {
 		// Client-caused upstream 5xx (invalid_request / convert_request_failed
 		// semantics): relay the upstream's verdict instead of the generic

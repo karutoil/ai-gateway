@@ -226,8 +226,10 @@ func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker
 				}
 				// Monthly spend cap: calendar-month spend for this key must stay
 				// under the configured budget before admitting another request.
+				// The prefix is passed too so spend that never got a key_id
+				// stamped (pre-backfill rows) still counts.
 				if key.MonthlyBudgetUSD > 0 {
-					if spent := store.MonthSpendUSD(key.ID); spent >= key.MonthlyBudgetUSD {
+					if spent := store.MonthSpendUSDForPrefix(key.ID, key.Prefix); spent >= key.MonthlyBudgetUSD {
 						log.Warn().Str("key_prefix", key.Prefix).Float64("spent", spent).Float64("budget", key.MonthlyBudgetUSD).Msg("gateway key: monthly budget exceeded")
 						w.Header().Set("Retry-After", secondsUntilNextMonthUTC())
 						http.Error(w, `{"error":{"message":"monthly spend budget exceeded for this key","type":"budget_exceeded"}}`, http.StatusTooManyRequests)
@@ -269,6 +271,24 @@ func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker
 			http.Error(w, `{"error":{"message":"invalid api key","type":"authentication_error"}}`, http.StatusUnauthorized)
 		})
 	}
+}
+
+// SetGatewayKey attaches an already-verified gateway key to the request
+// context and headers. Alternate authentication surfaces (the unified /mcp
+// endpoint accepts x-litellm-api-key in addition to Bearer/x-api-key) verify
+// the secret themselves and then hand the key to the shared rate-limit and
+// budget middleware through this helper.
+func SetGatewayKey(r *http.Request, key *models.GatewayKey) *http.Request {
+	if key == nil {
+		return r
+	}
+	ctx := context.WithValue(r.Context(), gatewayKeyCtxKey{}, key)
+	r = r.WithContext(ctx)
+	r.Header.Set("X-Gateway-Key-Prefix", key.Prefix)
+	if key.OrgID != nil && *key.OrgID != "" {
+		r.Header.Set("X-Gateway-Org", *key.OrgID)
+	}
+	return r
 }
 
 func attachGatewayKey(next http.Handler, w http.ResponseWriter, r *http.Request, key *models.GatewayKey) {

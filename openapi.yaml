@@ -1,14 +1,17 @@
 openapi: 3.0.3
 info:
   title: AI Gateway
-  version: 1.7.0
+  version: 1.8.0
   description: |
     Unified AI Gateway — OpenAI / Anthropic / Responses under one domain.
     Gateway auth (/v1/* and the bare convenience aliases): `Authorization: Bearer sk-gw-…`
     or `x-api-key: sk-gw-…`. Admin (/api/*): `Authorization: Bearer <JWT>` from
     /api/auth/login, or the HttpOnly `gw_token` session cookie set by the login flows
     for dashboard-origin calls (same-origin; cross-site mutations pass CSRF origin checks).
-    Errors: {error:{message,type}}.
+    Errors: {error:{message,type}}. A non-2xx upstream create response on
+    POST /v1/videos is re-wrapped into this envelope as
+    {error:{message,type:"upstream_error",code}} after scrubbing credentials and
+    bounding the length; the provider's own message is preserved.
 servers:
   - url: http://localhost:8080
     description: local
@@ -463,9 +466,161 @@ paths:
       security: [{ gatewayKey: [] }]
       responses:
         '200': { description: response }
+  /v1/systemone:
+    post:
+      summary: System One decision-model endpoint (noul / choice / score)
+      description: |
+        Decision models (TypeSafe Jev, Cloudflare Clef, open-weight Kev,
+        llama.cpp) read a `state` plus a map of typed `questions` and return a
+        calibrated probability for every allowed answer — no text generation,
+        no streaming. Routed only to decision-capable providers (types
+        `systemone` / `cloudflare`, or any base URL containing `systemone` or
+        `/ai/run`).
+
+        This is a **gateway-defined** endpoint speaking the System One wire
+        protocol; it is not an OpenAI API and there is no OpenAI SDK mode for it.
+
+        Requests are validated locally before routing, so a malformed question
+        fails fast with `400 invalid_request_error` naming the offending field
+        (e.g. `questions.team.criteria: required map of option to description`).
+        Rules enforced by the gateway:
+
+        * `model` — required non-empty string; must resolve to a decision model.
+        * `state` — required and not `null`; any other JSON value is accepted.
+        * `questions` — required object, 1–64 entries. Each id must be 1–100 chars
+          of `[A-Za-z0-9_.-]`; any other id is a 400 naming the id.
+        * `instructions` (per question) — required, and must be a non-empty
+          string, object or array. `""`, `{}` and `[]` are rejected.
+        * `criteria` — **required** for `choice` (object of 2–255 non-empty
+          option keys → description) and for `score` (ordered array of 2–10
+          level descriptions). Optional for `noul`, where the only permitted keys
+          are the literal strings `"true"` and `"false"` (a JSON object cannot
+          have boolean keys).
+        * `images` — optional array, at most 4 entries, each an inline data URL,
+          bare base64 string or `{url,b64_json,data,mime_type}` object. Remote
+          http(s) URLs are rejected. `audio` / `videos` (Clef-omni) are forwarded
+          unchecked.
+
+        Billing: input tokens only — `usage.output_tokens` is reported for shape
+        compatibility and is not billed.
+
+        **Caching:** this endpoint uses the gateway's exact-match response cache
+        (default TTL `CACHE_TTL_SECONDS=10`), unlike the image endpoints. Two
+        byte-identical requests within the TTL are answered from cache
+        (`X-Cache: HIT`, `cost_usd=0` in the request log) with no upstream call.
+        Deterministic evaluation makes this safe, but if you need a fresh
+        evaluation for identical input, vary the body or the key.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, state, questions]
+              properties:
+                model:
+                  type: string
+                  example: clef
+                  description: "Decision model selector (clef, clef-flash, clef-omni, kev-0.8b, kev-4b, kev-9b, kev-27b, jev-latest, laya, …). Prefer provider/model to pin a route; a model that is not a decision model is rejected with 400."
+                state:
+                  description: "Content to evaluate: string, object or array (records, chat logs, app state). Must be present and non-null."
+                questions:
+                  type: object
+                  minProperties: 1
+                  maxProperties: 64
+                  description: "Map of question id → typed question. Ids must be 1-100 chars of [A-Za-z0-9_.-]; any other id is rejected with a 400 naming it."
+                  additionalProperties:
+                    type: object
+                    required: [type, instructions]
+                    properties:
+                      type:
+                        type: string
+                        enum: [noul, choice, score]
+                        description: "noul = yes/no (returns P(yes) in [0,1]); choice = one of N options (returns the distribution); score = ordered rubric (returns a probability-weighted score). Any other value is a 400 (unknown question type)."
+                      instructions:
+                        description: "Instructions for this question. String, object or array — but not empty: '', {} and [] are all rejected with 400."
+                      criteria:
+                        description: |
+                          Per-type, and the shape differs per type. Criterion
+                          *values* are not inspected by the gateway (any JSON value
+                          is forwarded) — only the keys/count are validated:
+
+                          * `choice` (REQUIRED): object mapping each option label
+                            (non-empty string key) to its description, with 2–255
+                            options.
+                          * `score` (REQUIRED): ordered array of 2–10 levels,
+                            lowest first. Levels may be strings or structured
+                            objects.
+                          * `noul` (optional): object whose only permitted keys are
+                            the strings "true" and "false" — e.g.
+                            `{"true": "it is urgent", "false": "no rush"}`.
+                images:
+                  type: array
+                  maxItems: 4
+                  items: {}
+                  description: "Clef extension: at most 4 inline images. Each entry is a data URL, a bare base64 string, or an object with url/b64_json/data (+ optional mime_type/media_type). Remote http(s) URLs are rejected because the gateway does not fetch user URLs server-side."
+                audio:
+                  type: array
+                  items: {}
+                  description: "Clef-omni extension: inline audio (data URL / base64 / object). Forwarded to the provider unchecked — not validated, not counted, no gateway-side limit."
+                videos:
+                  type: array
+                  items: {}
+                  description: "Clef-omni extension: inline video (data URL / base64 / object). Forwarded to the provider unchecked — not validated, not counted, no gateway-side limit."
+      responses:
+        '200':
+          description: Typed answers, one per question id, plus usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [answers, usage]
+                properties:
+                  model: { type: string }
+                  answers:
+                    type: object
+                    description: One entry per question id from the request.
+                    additionalProperties:
+                      type: object
+                      properties:
+                        type: { type: string, enum: [noul, choice, score] }
+                        noul: { type: number, minimum: 0, maximum: 1, description: 'P(yes), present for noul questions.' }
+                        choice: { type: string, description: 'The chosen option label; present for choice questions.' }
+                        score: { type: number, description: 'Probability-weighted score; present for score questions.' }
+                        legend: { type: object, additionalProperties: { type: string } }
+                        probabilities: { type: object, additionalProperties: { type: number } }
+                        confidence: { type: number, minimum: 0, maximum: 1 }
+                  usage:
+                    type: object
+                    description: 'Always present. Decision models bill input tokens only; output_tokens is reported for shape compatibility and is not billed.'
+                    properties:
+                      input_tokens: { type: integer }
+                      output_tokens: { type: integer }
+        '400': { description: 'invalid_request_error — malformed question schema (missing/empty criteria, bad question id, empty instructions), or a model that is not a decision model' }
+        '401': { description: authentication_error }
+        '429': { description: rate_limit_error }
+        '502': { description: proxy_error (upstream failed on every attempt) }
+        '503': { description: proxy_error (no decision-capable provider configured for this model)' }
   /v1/models:
     get:
       summary: Models with id=provider/model (aliases remain bare)
+      description: |
+        Rows come from per-provider discovery (`provider_models`) when available,
+        otherwise from the catalog. Capability fields are emitted per row:
+
+        * `image` / `image_only` — image generation (see the images section).
+        * `video` / `video_only` — video generation served by `/v1/videos`.
+        * `decision` — System One decision model served by `/v1/systemone`.
+        * `kind` — the capability class as a single string. A row with several
+          capabilities carries the LAST one applied in the order
+          `decision` → `video` → `image`, so `kind` is a label, not a list; use
+          the individual booleans to test each capability.
+
+        `image_cost` is USD per generated image and `video_cost` is USD per
+        generated second; both are omitted when the curated registry has no
+        price for the model.
       tags: [gateway]
       security: [{ gatewayKey: [] }]
       responses:
@@ -483,10 +638,324 @@ paths:
                     type: array
                     items:
                       type: object
+                      required: [id, object]
                       properties:
                         id: { type: string, example: openai/gpt-4o-mini }
                         model_id: { type: string, example: gpt-4o-mini }
+                        object: { type: string, example: model }
+                        created: { type: integer }
                         owned_by: { type: string, example: openai }
+                        display_name: { type: string }
+                        context_window: { type: integer }
+                        max_output: { type: integer }
+                        input_cost: { type: number, description: USD per 1M input tokens }
+                        output_cost: { type: number, description: USD per 1M output tokens }
+                        reasoning: { type: boolean }
+                        tool_call: { type: boolean }
+                        attachment: { type: boolean }
+                        reasoning_type: { type: string }
+                        reasoning_levels: { type: string }
+                        reasoning_output_limits: { type: string }
+                        alias_target: { type: string, description: 'Set on alias rows (owned_by=gateway-alias) — the model id the alias resolves to.' }
+                        decision: { type: boolean, description: 'true for System One / decision models (POST /v1/systemone).' }
+                        image: { type: boolean, description: 'true for image-generation models (kind: image)' }
+                        image_only: { type: boolean, description: 'true when the model generates ONLY images (no text output) — such models are refused on the chat/completions/messages/responses endpoints. false for models that also chat (e.g. Gemini image models). Derived from models.dev modalities.output.' }
+                        video: { type: boolean, description: 'true for video-generation models (kind: video), served through the async /v1/videos job API' }
+                        video_only: { type: boolean, description: 'true when the model generates ONLY video (no text output) — such models are refused on the chat/completions/messages/responses endpoints' }
+                        video_cost: { type: number, description: 'USD per generated second of video (omitted when the curated registry has no price)' }
+                        image_cost: { type: number, description: 'USD per generated image (omitted when the curated registry has no price)' }
+                        modalities: { type: string, description: 'models.dev modalities JSON, e.g. {"input":["text","image"],"output":["image"]}. Emitted on rows that carry an image or video capability.' }
+                        kind: { type: string, enum: [image, video, decision], description: 'Capability class; absent for a plain text model. A model with several capabilities takes the last flag applied — decision < video < image. Use the per-capability booleans to test a capability.' }
+        '401': { description: authentication_error }
+  /v1/models/{id}:
+    get:
+      summary: Retrieve one model (object/id/owned_by/created)
+      description: |
+        Looks the id up in `provider_models` first (bare or provider-qualified),
+        then in the catalog, and returns the minimal model object. The per-key
+        `allowed_models` allowlist is enforced here, so a model the key may not
+        use answers **404** exactly like an unknown id.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: model object
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, example: model }
+                  id: { type: string, example: openai/gpt-4o-mini }
+                  owned_by: { type: string, example: openai }
+                  created: { type: integer }
+        '400': { description: invalid_request_error (model id required) }
+        '401': { description: authentication_error }
+        '404': { description: 'not_found_error (unknown id, or the key''s allowed_models excludes it)' }
+  /v1/images/generations:
+    post:
+      summary: Image generation (OpenAI-compatible Images API, gateway auth)
+      description: |
+        Text-to-image generation. The routed provider's dialect is detected
+        automatically — OpenAI/azure/openai_compatible passthrough, xAI Grok,
+        Google Gemini (Nano Banana) generateContent and Imagen :predict are all
+        normalized to the OpenAI Images response shape. Reference images may be
+        supplied via `image` or `images` for image-to-image models.
+
+        **Not cached.** Every request reaches the provider (a re-roll is never
+        served a stale cached image), and every response is billed per generated
+        image. The client-facing first-byte budget is 300s by default rather than
+        the 85s chat budget (`IMAGE_TIMEOUT_SECONDS`).
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImageGenerationRequest' }
+      responses:
+        '200':
+          description: generated image(s)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImagesResponse' }
+        '400': { description: 'invalid_request_error (bad body, unsupported size, or a model that is not an image model)' }
+        '401': { description: authentication_error }
+        '429': { description: rate_limit_error }
+        '502': { description: 'proxy_error (upstream failed, or returned no usable image body)' }
+        '503': { description: proxy_error (no image-capable provider configured for this model) }
+        '504': { description: proxy_error (the image first-byte budget expired before the provider answered) }
+  /v1/images/edits:
+    post:
+      summary: Image edits (multipart/form-data, OpenAI-compatible)
+      description: |
+        Multipart image editing: one or more source files (`image`, repeatable,
+        or `images`) plus an optional `mask` — at most 4 source files.
+        Translated to the routed provider's edit dialect and returned in the
+        OpenAI Images shape.
+
+        **Not cached.** Every request reaches the provider, and every response is
+        billed per generated image.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/ImageEditRequest' }
+      responses:
+        '200':
+          description: edited image(s)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImagesResponse' }
+        '400': { description: 'invalid_request_error (not multipart, missing model/prompt, no image part, or more than 4 source files)' }
+        '401': { description: authentication_error }
+        '429': { description: rate_limit_error }
+        '502': { description: 'proxy_error (upstream failed, or returned no usable image body)' }
+        '503': { description: proxy_error (no image-capable provider configured for this model) }
+        '504': { description: proxy_error (the image first-byte budget expired before the provider answered) }
+  /v1/videos:
+    get:
+      summary: List video jobs (OpenAI-compatible Videos API, gateway auth)
+      description: |
+        Returns the jobs created by the calling gateway key, newest first.
+        Served purely from the `video_jobs` table — it never calls the provider,
+        so a live job's status in the list can lag the provider until that job is
+        polled via `GET /v1/videos/{id}`.
+
+        **Pagination** follows the OpenAI list convention. `limit` defaults to 20
+        and is clamped to 100; pass the returned `last_id` as `after` to fetch the
+        next (older) page. `has_more` is truthful — the gateway reads one row past
+        the page to decide it rather than running a separate COUNT.
+
+        Dashboard sessions (`gw_token` / JWT) see every job; gateway keys see only
+        their own. A job whose owning provider key has been removed is not visible
+        to any key. Expired jobs are eventually removed by the gateway's retention
+        sweep; until then they are reported with `error.code: "expired"` once the
+        expiry has been observed.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Page size, 1..100. Values above 100 are clamped; a value below 1 or a non-integer is a 400.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: after
+          in: query
+          required: false
+          description: |
+            Cursor: the `id` of the last job on the previous page. Returns jobs
+            older than that one. Must be a job owned by the calling key — anything
+            else is a 400 (a foreign id is not accepted, so job ids cannot be
+            probed).
+          schema: { type: string }
+      responses:
+        '200':
+          description: video job list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VideoList' }
+        '400': { description: 'invalid_request_error (bad limit, or an `after` cursor not owned by this key)' }
+        '401': { description: authentication_error }
+        '500': { description: proxy_error (the job rows could not be read) }
+    post:
+      summary: Create a video generation job (OpenAI-compatible, async)
+      description: |
+        **Async lifecycle: create → poll → content.**
+
+        1. `POST /v1/videos` enqueues the work upstream and returns immediately
+           with a job in status `queued`. It never waits for the render.
+        2. Poll `GET /v1/videos/{id}` until `status` is `completed` or `failed`.
+           Each poll of a live job is exactly one upstream poll — the gateway runs
+           no background poller, so a client that stops polling costs nothing. A
+           transient upstream failure while polling serves the last known state
+           with `200` rather than an error. A terminal job is served from storage
+           without touching the provider.
+        3. Fetch the bytes from `GET /v1/videos/{id}/content` (`video/mp4`).
+
+        The routed provider's dialect is detected automatically — OpenAI-compatible
+        `/v1/videos` passthrough, xAI Grok Imagine (`/v1/videos/generations` →
+        `request_id`) and Google Veo (`:predictLongRunning` → operation polling) are
+        all normalized to the OpenAI Videos shape (xAI's `done` becomes `completed`).
+
+        **Billing** happens once, at enqueue, priced per generated second from the
+        requested duration — the provider has already been asked to render, so a
+        job that is never polled or that later fails is still billed.
+
+        **Generated media is not cached.** Nothing from this surface enters the
+        response cache, and the content route streams straight from the provider on
+        every call; the only state the gateway keeps is the `video_jobs` row.
+
+        **Upstream create errors** are re-wrapped into the standard gateway
+        envelope: a non-2xx create response is bounded, credential-scrubbed and
+        returned as `{error:{message,type:"upstream_error",code}}` so the
+        provider's own message still reaches the caller.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VideoCreateRequest' }
+      responses:
+        '200':
+          description: video job created (status queued)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Video' }
+        '400': { description: 'invalid_request_error (bad body, unsupported seconds/size, or a model that is an image/decision model rather than a video model)' }
+        '401': { description: authentication_error }
+        '429': { description: rate_limit_error }
+        '500': { description: proxy_error (the job could not be persisted) }
+        '502': { description: 'proxy_error (upstream create failed, or returned no job handle). A non-2xx create response is re-wrapped as an upstream_error envelope — see the description.' }
+        '503': { description: 'proxy_error (no video-capable provider configured for this model, or no routing member below its OAuth quota threshold)' }
+        '504': { description: proxy_error (the provider did not acknowledge the create within the video first-byte budget) }
+  /v1/videos/{id}:
+    get:
+      summary: Retrieve a video job (OpenAI-compatible; poll until completed|failed)
+      description: |
+        Poll a job. A **terminal** job (`completed` / `failed`) is served from the
+        `video_jobs` row without calling the provider. A **live** job triggers one
+        upstream poll (bounded by the normal first-byte budget), is normalized, and
+        updates the row — so repeated polls stop hitting the provider once the job
+        finishes.
+
+        A transient upstream poll failure is not surfaced: the last known state is
+        returned with `200`.
+
+        **Expiry answers `410 Gone`, and it is sticky.** Once the provider's
+        advertised `expires_at` has passed — or the provider answers `404`/`410`
+        for the job — the row is rewritten to `failed` with
+        `error.code: "expired"` and every later poll answers `410` with the same
+        message, without re-contacting the provider.
+
+        Ownership: a dashboard session sees every job; a gateway key sees only its
+        own. Anything else answers `404` (never `403`, so the endpoint does not
+        confirm that an id exists).
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: current video job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Video' }
+        '401': { description: authentication_error }
+        '404': { description: 'not_found_error (unknown id, a job owned by another gateway key, or a provider the key''s org may not use)' }
+        '410': { description: 'gone — the generated video expired: the provider''s retention window passed or the provider no longer knows the job. The row is marked failed/expired and stays 410.' }
+        '502': { description: 'proxy_error (the provider that owns this job no longer exists, or its credential is unavailable)' }
+    delete:
+      summary: Delete a video job (OpenAI-compatible)
+      description: |
+        Forgets the job locally. The provider's own copy (and its expiry) is left
+        alone, because not every dialect exposes a cancel — deleting a job does
+        **not** refund the charge, which was taken at enqueue. Ownership matches
+        the poll route; a foreign or unknown id answers `404`.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: deletion confirmation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VideoDeleted' }
+        '401': { description: authentication_error }
+        '404': { description: not_found_error }
+        '500': { description: proxy_error (the row could not be deleted) }
+  /v1/videos/{id}/content:
+    get:
+      summary: Download generated video bytes (video/mp4)
+      description: |
+        Final step of the async lifecycle: create → poll → **content**. Streams the
+        finished bytes with `Content-Disposition: inline` and the provider's
+        `Content-Type` (defaulting to `video/mp4`).
+
+        Only a terminal job can be downloaded. A job that is still `queued` /
+        `in_progress` answers `409` naming the current status, and a `failed` job
+        answers `409` carrying the provider's error message — poll
+        `GET /v1/videos/{id}` first.
+
+        **`410 Gone` when the artefact expired.** The gateway enforces the
+        provider's `expires_at` (for a `completed` job) and also treats a provider
+        `404`/`410` for the bytes as a terminal expiry: the row is marked
+        `failed`/`expired` and every later poll and content request answers `410`
+        with the same message. Nothing is retried upstream afterwards.
+
+        **Generated media is not cached and never stored gateway-side.** Every call
+        re-proxies from the provider, so availability ultimately depends on the
+        provider's retention window.
+
+        **Foreign-origin content URLs answer `302`.** If the provider hands back a
+        URL not on its own origin, the gateway refuses to fetch it (it will not
+        attach the provider credential to a third-party host) and redirects the
+        client to that URL instead — `302` with `Location` and
+        `Cache-Control: no-store`.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: generated video
+          content:
+            video/mp4:
+              schema: { type: string, format: binary }
+        '302': { description: 'redirect — the content URL is on a different origin than the provider, so the client must fetch it directly. Location carries the URL; no provider credential is attached to it.' }
+        '401': { description: authentication_error }
+        '404': { description: 'not_found_error (unknown id, or a job owned by another gateway key)' }
+        '409': { description: 'invalid_request_error — the video is not ready yet, or the job failed (the message names the current status or the provider error). Poll GET /v1/videos/{id} until completed.' }
+        '410': { description: 'gone — the generated video expired (provider retention window passed, or the provider no longer retains the artefact). The job is marked failed/expired and stays 410.' }
+        '502': { description: 'proxy_error (owning provider removed, credential unavailable, content URL unresolvable, or the upstream could not serve the bytes)' }
+        '504': { description: 'proxy_error (the provider sent no first byte within the content first-byte budget, or the download stalled past the idle watchdog)' }
+
   /chat/completions:
     post:
       summary: Convenience alias — same handler as /v1/chat/completions
@@ -523,6 +992,13 @@ paths:
       security: [{ gatewayKey: [] }]
       responses:
         '200': { description: response }
+  /systemone:
+    post:
+      summary: Convenience alias — same handler as /v1/systemone
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: decision answers }
   /models:
     get:
       summary: Convenience alias — same handler as /v1/models
@@ -530,6 +1006,65 @@ paths:
       security: [{ gatewayKey: [] }]
       responses:
         '200': { description: models }
+  /images/generations:
+    post:
+      summary: Convenience alias — same handler as /v1/images/generations
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: generated image(s) }
+  /images/edits:
+    post:
+      summary: Convenience alias — same handler as /v1/images/edits
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: edited image(s) }
+  /videos:
+    get:
+      summary: Convenience alias — same handler as /v1/videos
+      description: See `GET /v1/videos` for the listing semantics (gateway-key scoped, newest first, max 100, never purged).
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: video job list }
+    post:
+      summary: Convenience alias — same handler as /v1/videos
+      description: See `POST /v1/videos` for the async create → poll → content lifecycle, billing at enqueue, and how a failed upstream create is re-wrapped into the gateway error envelope.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: video job created }
+  /videos/{id}:
+    get:
+      summary: Convenience alias — same handler as /v1/videos/{id}
+      description: See `GET /v1/videos/{id}` for polling semantics and the `expires_at` caveat.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: current video job }
+    delete:
+      summary: Convenience alias — same handler as /v1/videos/{id}
+      description: Forgets the job locally; the provider's copy is left alone, so deleting does not refund.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: deletion confirmation }
+  /videos/{id}/content:
+    get:
+      summary: Convenience alias — same handler as /v1/videos/{id}/content
+      description: See `GET /v1/videos/{id}/content` — 409 while the job is not terminal, 410/404 relayed from the provider once the artefact expires, and media is never cached.
+      tags: [gateway]
+      security: [{ gatewayKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: generated video bytes }
+        '409': { description: 'invalid_request_error — the video is not ready yet, or the job failed; poll /videos/{id} first' }
   /api/orgs:
     get:
       summary: List organizations
@@ -976,6 +1511,8 @@ paths:
       summary: OAuth connection status for a provider
       tags: [admin]
       security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         '200': { description: connected + email + project }
   /api/providers/{id}/oauth/refresh:
@@ -983,6 +1520,8 @@ paths:
       summary: Force OAuth token refresh
       tags: [admin]
       security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         '200': { description: refreshed }
   /api/providers/{id}/oauth/usage:
@@ -1006,6 +1545,8 @@ paths:
       summary: Disconnect OAuth (clears stored tokens)
       tags: [admin]
       security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         '204': { description: disconnected }
   /api/discover-all:
@@ -1146,7 +1687,7 @@ paths:
   /api/logs/export:
     get:
       summary: Download the filtered log set as CSV
-      description: Streams text/csv with the same filters as /api/logs; capped at 50,000 rows (X-Truncated: true when hit).
+      description: 'Streams text/csv with the same filters as /api/logs; capped at 50,000 rows (X-Truncated: true when hit).'
       tags: [admin]
       security: [{ bearerAuth: [] }]
       parameters:
@@ -1331,7 +1872,7 @@ paths:
                   description: 'Legacy form: provider IDs in order (round_robin, no overrides)'
       responses:
         '201': { $ref: '#/components/responses/LBRuleSaved' }
-        '400': { description: Unknown provider, duplicate (provider, model) option, or invalid body }
+        '400': { description: 'Unknown provider, duplicate (provider, model) option, or invalid body' }
         '403': { description: Org-scoped caller referencing another org's provider }
     delete:
       summary: Delete the routing rule for a model (admin)
@@ -1344,6 +1885,184 @@ paths:
           schema: { type: string }
       responses:
         '204': { description: Deleted }
+  # ── Centralized MCP ───────────────────────────────────────────────────────
+  /mcp:
+    post:
+      summary: Unified MCP endpoint — one MCP server for every harness
+      description: |
+        Streamable HTTP MCP transport (JSON-RPC 2.0). Register MCP servers once in
+        the dashboard (Connect → MCP Servers); harnesses (Pi, OpenCode, Claude
+        Code, Cursor) point their MCP client here instead of configuring each
+        upstream server separately.
+
+        The gateway owns the upstream connections (Streamable HTTP, legacy SSE or
+        a locally launched stdio process), discovers their tools and exposes them
+        namespaced as `<server-slug>-<tool-name>` so tools from different servers
+        never collide. Tool calls are routed back to the owning server.
+
+        **Authentication.** A gateway key is required. Because MCP clients reserve
+        `Authorization` for upstream OAuth, the preferred header is
+        `x-litellm-api-key: Bearer sk-gw-…`; `Authorization: Bearer sk-gw-…` and
+        `x-api-key` are also accepted. The same budget and rate-limit middleware
+        as `/v1` applies, so a key cannot bypass spend controls here.
+
+        **Authorization.** Only servers and tools granted to the key appear. A key
+        with no grants sees every enabled server; granting at least one switches
+        it to an explicit allowlist (`GET`/`PUT /api/keys/{id}/mcp`).
+
+        **Browser navigations** (`Accept: text/html`) to this path serve the
+        dashboard's MCP Servers screen; API and MCP requests get the protocol.
+
+        See [docs/mcp.md](https://github.com/karutoil/ai-gateway/blob/main/docs/mcp.md).
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: A JSON-RPC 2.0 request (initialize, tools/list, tools/call, …).
+              additionalProperties: true
+      responses:
+        '200':
+          description: JSON-RPC response, or an SSE stream when the client accepts text/event-stream
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+            text/event-stream:
+              schema: { type: string }
+        '401': { description: 'Missing or invalid gateway key (JSON-RPC error envelope)' }
+    get:
+      summary: Standalone server→client SSE stream (Streamable HTTP)
+      description: |
+        With `Accept: text/html` (a browser navigation) this path serves the
+        dashboard instead of the protocol.
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      responses:
+        '200': { description: SSE stream, or the dashboard HTML for a navigation }
+    delete:
+      summary: Terminate an MCP session
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      parameters:
+        - name: Mcp-Session-Id
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Session closed }
+  /{server}/mcp:
+    post:
+      summary: MCP endpoint scoped to one server (path selection)
+      description: |
+        Same protocol as `/mcp`, restricted to the named server. Path selection
+        only NARROWS access — it can never grant a tool the key was not already
+        given. Naming a server the key cannot use answers `404` with a JSON-RPC
+        error rather than an empty tool list.
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      parameters:
+        - name: server
+          in: path
+          required: true
+          schema: { type: string }
+          description: Server slug (or display name). A comma-separated list selects several.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: JSON-RPC response or SSE stream }
+        '404': { description: 'Server is not registered or not authorized for this key' }
+  /v1/mcp/server:
+    get:
+      summary: List the MCP servers a key may use
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      responses:
+        '200':
+          description: Authorized servers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    server_id: { type: string }
+                    server_name: { type: string, description: Tool namespace prefix }
+                    name: { type: string }
+                    transport: { type: string, enum: [http, sse, stdio] }
+                    health_status: { type: string, enum: [up, down, unknown] }
+                    tool_count: { type: integer }
+  /mcp-rest/tools/list:
+    get:
+      summary: List the namespaced MCP tools a key may call
+      description: Scripted access without an MCP client and without an LLM in the loop.
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      parameters:
+        - name: server_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Filter to one server (id or slug).
+      responses:
+        '200':
+          description: Tool catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tools:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        namespaced_name: { type: string }
+                        server_id: { type: string }
+                        server_name: { type: string }
+                        description: { type: string }
+                        input_schema: { type: object, additionalProperties: true }
+                  message: { type: string }
+  /mcp-rest/tools/call:
+    post:
+      summary: Execute one MCP tool directly
+      tags: [mcp]
+      security: [{ gatewayKey: [] }, { mcpKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_id, name]
+              properties:
+                server_id: { type: string, description: Server id or slug }
+                name: { type: string, description: Tool name or namespaced name }
+                arguments: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Tool result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  server_id: { type: string }
+                  server_name: { type: string }
+                  tool: { type: string }
+                  is_error: { type: boolean }
+                  content: { type: array, items: { type: object, additionalProperties: true } }
+                  text: { type: string }
+                  duration_ms: { type: integer }
+        '403': { description: 'Tool is not available to this key on that server' }
+        '502': { description: 'The upstream MCP server failed' }
 components:
   responses:
     LBRuleSaved:
@@ -1352,6 +2071,13 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/LBRule' }
   securitySchemes:
+    mcpKey:
+      type: apiKey
+      in: header
+      name: x-litellm-api-key
+      description: |
+        Gateway key for MCP clients. MCP reserves `Authorization` for upstream
+        OAuth, so the LiteLLM convention is used here. Send `Bearer sk-gw-…`.
     bearerAuth:
       type: http
       scheme: bearer
@@ -1403,9 +2129,9 @@ components:
       required: [name, type]
       properties:
         name: { type: string, example: openai }
-        type: { type: string, enum: [openai, anthropic, azure, openai_compatible, antigravity, devin], example: openai }
+        type: { type: string, enum: [openai, anthropic, azure, openai_compatible, antigravity, devin, systemone, cloudflare, google, xai], example: openai }
         base_url: { type: string, example: https://api.openai.com/v1 }
-        api_key: { type: string, example: sk-... , description: 'Not required for OAuth providers (antigravity, devin).'}
+        api_key: { type: string, example: sk-... , description: 'Required for every provider type except antigravity and devin (OAuth flows) and systemone (a local llama.cpp / Kev server may use an empty key). A systemone provider may set an empty key; cloudflare and google do require one.'}
     CreateKey:
       type: object
       description: All fields optional except none — a key with no name gets key-<uuid8>.
@@ -1426,3 +2152,177 @@ components:
           maxItems: 100
           items: { type: string }
           description: Allowlist with * wildcard; empty = all models
+
+    ImageGenerationRequest:
+      type: object
+      required: [model, prompt]
+      description: |
+        OpenAI Images generation request. Unknown `size` values are rejected
+        locally with `400 invalid_request_error`; `quality`, `style`,
+        `aspect_ratio` and `resolution` are **not** validated by the gateway —
+        they are passed through to the provider, so provider-specific values
+        work. Reference images (`image` / `images`) are inlined JSON, not files:
+        a data URL, a bare base64 string, or an object. Remote http(s) URLs are
+        rejected because the gateway does not fetch user URLs server-side.
+      properties:
+        model: { type: string, example: gemini-2.5-flash-image, description: "Curated image model id (provider/model or bare)." }
+        prompt: { type: string, description: Text prompt describing the desired image. Max 32000 bytes. }
+        n: { type: integer, minimum: 1, maximum: 10, default: 1 }
+        size:
+          type: string
+          enum: [auto, 256x256, 512x512, 1024x1024, 1536x1024, 1024x1536, 1792x1024, 1024x1792, 2048x2048, 2048x1152, 1152x2048, 4096x4096]
+          default: auto
+        quality: { type: string, description: 'Provider-specific quality tier; passed through unchanged to OpenAI-compatible upstreams (commonly low/medium/high/auto/hd/standard). Not validated by the gateway.' }
+        style: { type: string, example: vivid, description: 'Provider-specific style; passed through unchanged. Not validated by the gateway.' }
+        response_format: { type: string, enum: [b64_json, url], default: b64_json }
+        aspect_ratio: { type: string, example: "16:9", description: 'Aspect ratio for providers that take one instead of pixel size (Gemini / Imagen / Grok); passed through unchanged.' }
+        resolution: { type: string, description: 'Provider-specific resolution tier; passed through unchanged (commonly 1k or 2k). Not validated by the gateway.' }
+        image:
+          oneOf:
+            - { type: string }
+            - { type: object }
+          description: 'Optional single reference image for image-to-image: data URL, bare base64, or an object with url/b64_json/data (+ optional mime_type/media_type). Remote http(s) URLs are rejected.'
+        images:
+          type: array
+          maxItems: 4
+          items:
+            oneOf:
+              - { type: string }
+              - { type: object }
+          description: 'Optional reference images for image-to-image generation (same element shapes as `image`). `image` plus `images` combined are capped at 4 files.'
+    ImageEditRequest:
+      type: object
+      required: [model, prompt]
+      description: |
+        `multipart/form-data` edit request. Upload the source file(s) as the
+        `image` part (repeat it) **or** as `images` parts; at most **4** source
+        files. At least one is required — that is validated after parsing, so it
+        is not marked `required` in the schema (the 400 is
+        `image: at least one image file is required for edits`).
+
+        Field naming differs from the OpenAI Images edit API, which keys on
+        `image` / `image[]`: this gateway accepts `image` and the `images` alias.
+
+        `size` is validated against the same value set as generation; `quality`,
+        `style`, `aspect_ratio` and `resolution` are passed through unvalidated.
+      properties:
+        model: { type: string, example: gpt-image-1 }
+        prompt: { type: string, description: Max 32000 bytes. }
+        image:
+          type: array
+          maxItems: 4
+          items: { type: string, format: binary }
+          description: 'Source image file(s). Repeat the part to send several; at most 4. At least one image part (or `images`) is required.'
+        images:
+          type: array
+          maxItems: 4
+          items: { type: string, format: binary }
+          description: 'Alias for `image`, for clients that upload an `images` array. `image` + `images` combined are capped at 4 files.'
+        mask: { type: string, format: binary, description: Optional mask image (transparent areas are edited). }
+        n: { type: integer, minimum: 1, maximum: 10, default: 1 }
+        size:
+          type: string
+          enum: [auto, 256x256, 512x512, 1024x1024, 1536x1024, 1024x1536, 1792x1024, 1024x1792, 2048x2048, 2048x1152, 1152x2048, 4096x4096]
+        quality: { type: string, description: 'Provider-specific quality tier; passed through unchanged. Not validated by the gateway.' }
+        style: { type: string, description: 'Provider-specific style; passed through unchanged. Not validated by the gateway.' }
+        response_format: { type: string, enum: [b64_json, url], default: b64_json }
+        aspect_ratio: { type: string, example: "16:9", description: 'Passed through unchanged for providers that take one.' }
+        resolution: { type: string, description: 'Provider-specific resolution tier; passed through unchanged. Not validated by the gateway.' }
+    ImagesResponse:
+      type: object
+      properties:
+        created: { type: integer, example: 1735689600 }
+        model: { type: string, example: gemini-2.5-flash-image }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ImageDatum' }
+        usage: { $ref: '#/components/schemas/ImageUsage' }
+    ImageDatum:
+      type: object
+      properties:
+        b64_json: { type: string, description: Base64-encoded image bytes (when response_format=b64_json). }
+        url: { type: string, description: Image URL or data URI (when response_format=url). }
+        mime_type: { type: string, example: image/png }
+        revised_prompt: { type: string }
+    ImageUsage:
+      type: object
+      properties:
+        input_tokens: { type: integer, example: 9 }
+        output_tokens: { type: integer, example: 1290 }
+        total_tokens: { type: integer, example: 1299 }
+    VideoCreateRequest:
+      type: object
+      required: [model, prompt]
+      description: |
+        Create an async video job. `seconds` and `size` are validated locally
+        against the OpenAI Videos vocabulary; unknown values are rejected with
+        `400` rather than forwarded (providers disagree on what an unsupported
+        value means — some 400, some silently default).
+      properties:
+        model: { type: string, example: veo-3.1-generate-preview, description: "Curated video model id (provider/model or bare). An image-only model is rejected with a pointer to the images endpoint." }
+        prompt: { type: string, description: Text prompt describing the desired video. Max 32000 bytes. }
+        seconds:
+          description: 'Clip length in seconds (4, 8 or 12). Both the string form "8" and the numeric form 8 are accepted; the job object always reports it as a string. Omitted -> "4".'
+          oneOf:
+            - { type: integer, enum: [4, 8, 12] }
+            - { type: string, enum: ['4', '8', '12'] }
+        size:
+          type: string
+          enum: [1280x720, 720x1280, 1024x1792, 1792x1024]
+          description: 'Output resolution / orientation. Omitted -> 720x1280.'
+        input_reference:
+          description: 'Optional reference image for image-to-video. Accepts a data URL, a bare base64 string, or an object with url/b64_json/data (+ optional mime_type). A remote http(s) URL is forwarded verbatim for providers that fetch it (xAI); inline images are inlined into the provider body.'
+          oneOf:
+            - { type: string }
+            - { type: object }
+        remixed_from_video_id: { type: string, description: 'Remix/extend extension: the id of a previous job. Passed through where the provider supports it.' }
+    Video:
+      type: object
+      description: |
+        A video job. `completed_at`, `expires_at` and `error` are always present
+        and are `null` until the corresponding state exists.
+      properties:
+        id: { type: string, example: video_abc123, description: 'Gateway-issued job id.' }
+        object: { type: string, example: video }
+        model: { type: string, example: veo-3.1-generate-preview }
+        status: { type: string, enum: [queued, in_progress, completed, failed], description: 'Terminal states are `completed` and `failed`; a terminal job is served from storage without re-polling the provider (an expired job answers 410 rather than 200).' }
+        progress: { type: integer, minimum: 0, maximum: 100, description: 'Percent complete (best effort — relayed from the provider where it reports one, synthesized for Veo).' }
+        created_at: { type: integer, example: 1735689600 }
+        size: { type: string, example: 1280x720 }
+        seconds: { type: string, example: '8', description: 'Clip length in seconds — always a string in the response, even when the create request sent a number.' }
+        prompt: { type: string }
+        completed_at: { type: integer, nullable: true }
+        expires_at: { type: integer, nullable: true, description: 'Provider-reported Unix time after which the job or asset may be purged. ENFORCED by the gateway: once it passes for a completed job, poll and content answer 410 and the job is marked failed with error.code="expired". Rows are never deleted, only marked.' }
+        error: { allOf: [{ $ref: '#/components/schemas/VideoError' }], nullable: true, description: 'null until the job fails or expires. error.code="expired" marks a job whose artefact is gone (provider retention window passed, or the provider answered 404/410).' }
+        remixed_from_video_id: { type: string, nullable: true }
+    VideoList:
+      type: object
+      properties:
+        object: { type: string, example: list }
+        data:
+          type: array
+          description: Newest first. Page size is bounded by `limit` (default 20, max 100).
+          items: { $ref: '#/components/schemas/Video' }
+        has_more:
+          type: boolean
+          description: |
+            True when at least one more (older) job exists. Pass `last_id` as the
+            `after` query parameter to fetch it.
+          example: false
+        last_id:
+          type: string
+          description: |
+            The id of the last job on this page; use it as the next `after`
+            cursor. Omitted when the page is empty.
+          example: video_abc123
+    VideoDeleted:
+      type: object
+      properties:
+        id: { type: string, example: video_abc123 }
+        object: { type: string, example: video.deleted }
+        deleted: { type: boolean, example: true }
+    VideoError:
+      type: object
+      properties:
+        code: { type: string, example: video_generation_failed }
+        message: { type: string }

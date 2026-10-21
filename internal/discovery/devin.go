@@ -189,6 +189,9 @@ type modelSnapshot struct {
 	ReasoningType         string    `json:"reasoning_type"`
 	ReasoningLevels       string    `json:"reasoning_levels"`
 	ReasoningOutputLimits string    `json:"reasoning_output_limits"`
+	Decision              bool      `json:"decision"`
+	Image                 bool      `json:"image"`
+	Video                 bool      `json:"video"`
 	ReasoningRouting      *string   `json:"reasoning_routing"`
 	Source                string    `json:"source"`
 	CreatedAt             time.Time `json:"created_at"`
@@ -202,8 +205,9 @@ func loadSnapshot(q dbQuerier, id string) (modelSnapshot, bool, error) {
 	var cc, cw sql.NullFloat64
 	var rn, tl, so, at sql.NullBool
 	var mods, rt, rl, rol, routing sql.NullString
-	err := q.QueryRow(db.Q(`SELECT id, provider_id, model_id, COALESCE(display_name,''), COALESCE(owned_by,''), COALESCE(context_window,0), COALESCE(max_output,0), COALESCE(input_cost,0), COALESCE(output_cost,0), cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, reasoning_routing, COALESCE(source,''), created_at, updated_at FROM provider_models WHERE id=?`), id).
-		Scan(&snap.ID, &snap.ProviderID, &snap.ModelID, &snap.DisplayName, &snap.OwnedBy, &snap.ContextWindow, &snap.MaxOutput, &snap.InputCost, &snap.OutputCost, &cc, &cw, &rn, &tl, &so, &at, &mods, &rt, &rl, &rol, &routing, &snap.Source, &snap.CreatedAt, &snap.UpdatedAt)
+	var dec, img, vid sql.NullInt64
+	err := q.QueryRow(db.Q(`SELECT id, provider_id, model_id, COALESCE(display_name,''), COALESCE(owned_by,''), COALESCE(context_window,0), COALESCE(max_output,0), COALESCE(input_cost,0), COALESCE(output_cost,0), cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, decision, image, video, reasoning_routing, COALESCE(source,''), created_at, updated_at FROM provider_models WHERE id=?`), id).
+		Scan(&snap.ID, &snap.ProviderID, &snap.ModelID, &snap.DisplayName, &snap.OwnedBy, &snap.ContextWindow, &snap.MaxOutput, &snap.InputCost, &snap.OutputCost, &cc, &cw, &rn, &tl, &so, &at, &mods, &rt, &rl, &rol, &dec, &img, &vid, &routing, &snap.Source, &snap.CreatedAt, &snap.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return modelSnapshot{}, false, nil
 	}
@@ -218,6 +222,9 @@ func loadSnapshot(q dbQuerier, id string) (modelSnapshot, bool, error) {
 	}
 	snap.Reasoning, snap.ToolCall, snap.StructuredOutput, snap.Attachment = rn.Bool, tl.Bool, so.Bool, at.Bool
 	snap.Modalities, snap.ReasoningType, snap.ReasoningLevels, snap.ReasoningOutputLimits = mods.String, rt.String, rl.String, rol.String
+	snap.Decision = dec.Int64 != 0
+	snap.Image = img.Int64 != 0
+	snap.Video = vid.Int64 != 0
 	if routing.Valid {
 		snap.ReasoningRouting = &routing.String
 	}

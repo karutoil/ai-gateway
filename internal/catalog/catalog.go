@@ -1,7 +1,9 @@
 package catalog
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +12,10 @@ import (
 	"time"
 
 	"ai-gateway/internal/db"
+	"ai-gateway/internal/decision"
+	"ai-gateway/internal/imagegen"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/videogen"
 )
 
 const ModelsDevURL = "https://models.dev/api.json"
@@ -37,7 +42,9 @@ type RawModel struct {
 		Output []string `json:"output"`
 	} `json:"modalities"`
 	OpenWeights bool `json:"open_weights"`
-	Limit       struct {
+	// Decision is the models.dev decision-model marker, when present.
+	Decision bool `json:"decision"`
+	Limit    struct {
 		Context int `json:"context"`
 		Output  int `json:"output"`
 		Input   int `json:"input"`
@@ -60,16 +67,24 @@ type RawProvider struct {
 type Store struct {
 	db     *sql.DB
 	client *http.Client
+
+	// cache is a tiny in-process modelID -> catalog-row memo, invalidated on
+	// every write that can change the catalog (sync, seeds, settings writes
+	// through the store). It exists because the capability guards ask the same
+	// handful of questions about the same model several times per request
+	// (images.go calls Get/GetByShortID up to 3x, costForModel once) and each
+	// miss used to be a 6 ms full table scan at 4k rows.
+	cache *modelCache
 }
 
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db, client: &http.Client{Timeout: 30 * time.Second}}
+	return &Store{db: db, client: &http.Client{Timeout: 30 * time.Second}, cache: newModelCache()}
 }
 
 // catalogColumns is the canonical projection for one catalog row. All four
 // read paths share it so a new column cannot be added to some scans and not
 // others.
-const catalogColumns = `id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits`
+const catalogColumns = `id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits, decision, image, video`
 
 // catalogRowScanner is the subset of *sql.Row / *sql.Rows that Scan needs.
 type catalogRowScanner interface{ Scan(dest ...any) error }
@@ -95,11 +110,14 @@ func scanCatalogModel(sc catalogRowScanner) (*models.CatalogModel, error) {
 		attachment, openWeights                              sql.NullBool
 		updatedAt                                            sql.NullTime
 		rt, rl, rol                                          sql.NullString
+		decision                                             sql.NullInt64
+		image                                                sql.NullInt64
+		video                                                sql.NullInt64
 	)
 	if err := sc.Scan(&m.ID, &m.Provider, &m.Name, &description, &family, &contextWindow, &maxOutput,
 		&inputCost, &outputCost, &cacheReadCost, &cacheWriteCost,
 		&reasoning, &toolCall, &structuredOutput, &attachment, &modalities,
-		&openWeights, &knowledgeCutoff, &updatedAt, &rt, &rl, &rol); err != nil {
+		&openWeights, &knowledgeCutoff, &updatedAt, &rt, &rl, &rol, &decision, &image, &video); err != nil {
 		return nil, err
 	}
 	m.Description = description.String
@@ -123,7 +141,31 @@ func scanCatalogModel(sc catalogRowScanner) (*models.CatalogModel, error) {
 	m.ReasoningType = rt.String
 	m.ReasoningLevels = rl.String
 	m.ReasoningOutputLimits = rol.String
+	m.Decision = decision.Int64 != 0 || decisionModality(modalities.String)
+	m.Image = image.Int64 != 0 || imagegen.ImageModality(modalities.String)
+	m.Video = video.Int64 != 0 || videogen.VideoModality(modalities.String)
 	return &m, nil
+}
+
+// decisionModality reports whether a modalities JSON blob declares the
+// "decision" output modality. It is the fallback marker for rows synced from
+// an upstream that carries the modality but not an explicit decision flag.
+func decisionModality(modalities string) bool {
+	if modalities == "" {
+		return false
+	}
+	var mm struct {
+		Output []string `json:"output"`
+	}
+	if json.Unmarshal([]byte(modalities), &mm) != nil {
+		return false
+	}
+	for _, o := range mm.Output {
+		if o == "decision" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Count() (int, error) {
@@ -165,29 +207,112 @@ func (s *Store) List(filter string, providerFilter string, reasoningOnly bool, l
 	return out, nil
 }
 
+// cacheKey scopes a cache entry to the resolution tier that produced it. Get and
+// GetByShortID must not share a key: a negative entry written by an exact-id miss
+// would otherwise short-circuit GetByShortID's short_id/LIKE tiers for the same
+// spelling, which is exactly the miss those tiers exist to resolve.
+func cacheKey(tier, id string) string { return tier + ":" + id }
+
 func (s *Store) Get(id string) (*models.CatalogModel, error) {
-	return scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE id=?`), id))
+	key := cacheKey("id", id)
+	if m, found, ok := s.cache.get(key); ok {
+		if !found {
+			// Negative hit: a very recent miss on this exact id.
+			return nil, sql.ErrNoRows
+		}
+		return m, nil
+	}
+	m, err := scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE id=?`), id))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			s.cache.putMiss(key)
+		}
+		return nil, err
+	}
+	s.cache.put(key, m)
+	return m, nil
 }
 
+// GetByShortID resolves a bare or gateway-qualified model id to its catalog row.
+//
+// Tiers, cheapest first (this is on the hot path of every chat request and is
+// called up to 3x per image request):
+//
+//  1. exact match on models_catalog.id (primary key);
+//  2. exact match on models_catalog.short_id, the stored suffix after the last
+//     '/' (migration 030, indexed) — a gateway-qualified id like
+//     "oc1/muse-spark-1.3-contributor" strips to the bare slug and lands here;
+//  3. lower(id) = lower(slug) — an index-only case-insensitive exact match
+//     (idx_models_catalog_id_lower);
+//  4. only now the containment scan (`LOWER(id) LIKE '%slug%'`), which cannot
+//     use an index and is what every lookup used to do. It stays as the last
+//     resort for dated/suffixed variants nobody enumerated.
+//
+// The historical ORDER BY on the containment query (priced rows first, then id)
+// is kept so a zero-price reseller mirror still loses to a priced row.
 func (s *Store) GetByShortID(shortID string) (*models.CatalogModel, error) {
+	// Keyed by the ORIGINAL argument, whatever tier resolves it: the same
+	// request id is what the guards ask about repeatedly.
+	key := cacheKey("short", shortID)
+	if m, found, ok := s.cache.get(key); ok {
+		if !found {
+			return nil, sql.ErrNoRows
+		}
+		return m, nil
+	}
 	if m, err := s.Get(shortID); err == nil {
 		return m, nil
 	}
-	// Gateway-qualified IDs carry the *gateway provider* prefix
-	// ("oc1/muse-spark-1.3-contributor"), which never matches catalog IDs
-	// (keyed by models.dev provider namespace). Strip to the suffix before
-	// the suffix match, otherwise every cost lookup misses and bills $0.
 	trimmed := strings.TrimSpace(shortID)
-	if i := strings.LastIndex(trimmed, "/"); i >= 0 && i+1 < len(trimmed) {
-		if m, err := s.Get(trimmed[i+1:]); err == nil {
-			return m, nil
-		}
-		trimmed = trimmed[i+1:]
-	}
 	if trimmed == "" {
+		s.cache.putMiss(key)
 		return nil, sql.ErrNoRows
 	}
-	return scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), id LIMIT 1`), "%/"+escapeLike(trimmed)))
+	// Exact short_id hit — the case this column exists for.
+	if m, err := s.getByShortIDExact(trimmed); err == nil {
+		s.cache.put(key, m)
+		return m, nil
+	}
+	// Gateway-qualified ids carry the *gateway provider* prefix
+	// ("oc1/muse-spark-1.3-contributor"), which never matches catalog ids (keyed
+	// by models.dev provider namespace). Strip to the suffix before the suffix
+	// match, otherwise every cost lookup misses and bills $0.
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 && i+1 < len(trimmed) {
+		trimmed = trimmed[i+1:]
+		if m, err := s.getByShortIDExact(trimmed); err == nil {
+			s.cache.put(key, m)
+			return m, nil
+		}
+	}
+	// Case-insensitive exact match: indexable via idx_models_catalog_id_lower.
+	if m, err := scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id)=LOWER(?) LIMIT 1`), trimmed)); err == nil {
+		s.cache.put(key, m)
+		return m, nil
+	}
+	// Last resort: dated/suffixed containment (full scan, no index can help a
+	// leading-wildcard LIKE).
+	m, err := scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), id LIMIT 1`), "%/"+escapeLike(trimmed)))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Cache the full-chain miss so the second and third guard calls on
+			// the same request do not each re-run the containment scan.
+			s.cache.putMiss(key)
+		}
+		return nil, err
+	}
+	s.cache.put(key, m)
+	return m, nil
+}
+
+// getByShortIDExact is the indexed tier of GetByShortID: an exact match on the
+// stored short_id column. Rows written before migration 030's backfill (or by an
+// out-of-band INSERT) have short_id NULL and simply miss here.
+func (s *Store) getByShortIDExact(slug string) (*models.CatalogModel, error) {
+	m, err := scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE short_id=? ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), id LIMIT 1`), slug))
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // NormalizeModelID strips reseller channel tags and routing prefixes,
@@ -704,79 +829,23 @@ func (s *Store) SyncFromBytes(body []byte) (int, error) {
 	return s.syncFromProviders(providers)
 }
 
-func (s *Store) syncFromProviders(providers map[string]RawProvider) (int, error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	stmt, err := tx.Prepare(db.Q(`INSERT INTO models_catalog(id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`) + db.UpsertEnd([]string{"id"}, []string{"provider", "name", "description", "family", "context_window", "max_output", "input_cost", "output_cost", "cache_read_cost", "cache_write_cost", "reasoning", "tool_call", "structured_output", "attachment", "modalities", "open_weights", "knowledge_cutoff", "updated_at", "reasoning_type", "reasoning_levels", "reasoning_output_limits"}))
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
-	count := 0
-	now := time.Now().UTC()
-	for provID, prov := range providers {
-		for _, m := range prov.Models {
-			modalitiesBytes, _ := json.Marshal(m.Modalities)
-			fullID := m.ID
-			if len(fullID) < 3 || !containsSlash(fullID) {
-				fullID = provID + "/" + m.ID
-			}
-			ctx := m.Limit.Context
-			if ctx == 0 {
-				ctx = m.Limit.Input
-			}
-			out := m.Limit.Output
-			reasoningType, reasoningLevelsJSON, reasoningLimitsJSON := parseReasoningOptions(m)
-			_, err := stmt.Exec(fullID, provID, m.Name, m.Description, m.Family, ctx, out, m.Cost.Input, m.Cost.Output, m.Cost.CacheRead, m.Cost.CacheWrite, m.Reasoning, m.ToolCall, m.StructuredOutput, m.Attachment, string(modalitiesBytes), m.OpenWeights, m.Knowledge, now, reasoningType, reasoningLevelsJSON, reasoningLimitsJSON)
-			if err != nil {
-				return count, err
-			}
-			count++
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	s.db.Exec(db.Q(`INSERT INTO system_config(key,value,updated_at) VALUES('models_last_sync',?,?)`)+db.UpsertEnd([]string{"key"}, []string{"value", "updated_at"}), now.Format(time.RFC3339), now)
-	return count, nil
-}
+// catalogInsertColumns is the canonical column list for a models_catalog
+// INSERT. `short_id` (migration 030) is written on every path so the lookup can
+// be an index hit instead of a containment scan.
+const catalogInsertColumns = `id, provider, name, description, family, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, open_weights, knowledge_cutoff, updated_at, reasoning_type, reasoning_levels, reasoning_output_limits, decision, image, video, short_id`
 
-func parseReasoningOptions(m RawModel) (string, string, string) {
-	if !m.Reasoning {
-		return "none", "[]", "{}"
-	}
-	if len(m.ReasoningOptions) == 0 {
-		// reasoning without options → single toggle
-		b, _ := json.Marshal([]string{"on"})
-		return "toggle", string(b), "{}"
-	}
-	// prefer first option
-	opt := m.ReasoningOptions[0]
-	if opt.Type == "toggle" {
-		b, _ := json.Marshal([]string{"off", "on"})
-		return "toggle", string(b), "{}"
-	}
-	// effort type
-	if len(opt.Values) > 0 {
-		b, _ := json.Marshal(opt.Values)
-		// default per-level output limits as empty map, UI will allow setting
-		return opt.Type, string(b), "{}"
-	}
-	b, _ := json.Marshal([]string{"low", "medium", "high"})
-	return "effort", string(b), "{}"
-}
+const catalogInsertPlaceholders = `?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?`
 
-func containsSlash(s string) bool {
-	for _, c := range s {
-		if c == '/' {
-			return true
-		}
-	}
-	return false
-}
+// catalogUpsertColumns are the columns a models.dev sync overwrites. For that
+// path upstream is the source of truth, so a full overwrite is defensible — the
+// curated seeds below deliberately do NOT do this (see seedRowsInto).
+var catalogUpsertColumns = []string{"provider", "name", "description", "family", "context_window", "max_output", "input_cost", "output_cost", "cache_read_cost", "cache_write_cost", "reasoning", "tool_call", "structured_output", "attachment", "modalities", "open_weights", "knowledge_cutoff", "updated_at", "reasoning_type", "reasoning_levels", "reasoning_output_limits", "decision", "image", "video", "short_id"}
+
+// curatedSeedVersionKey is the system_config marker recording which version of
+// the curated registries has already been seeded. It is a content hash, so an
+// unchanged registry writes nothing at all (not even 34 no-op upserts) and a
+// changed one only has to insert the rows the operator does not have yet.
+const curatedSeedVersionKey = "curated_seed_version"
 
 // CostFor computes cost USD given tokens and model
 func CostFor(m *models.CatalogModel, promptTokens, completionTokens int) float64 {
@@ -839,4 +908,383 @@ func CostForSplit(m *models.CatalogModel, s CacheSplit) float64 {
 		float64(s.CacheRead)*cacheReadRate/perM +
 		float64(s.CacheWrite)*cacheWriteRate/perM +
 		float64(s.Completion)*m.OutputCost/perM
+}
+
+func containsSlash(s string) bool {
+	return strings.Contains(s, "/")
+}
+
+func parseReasoningOptions(m RawModel) (string, string, string) {
+	if !m.Reasoning {
+		return "none", "[]", "{}"
+	}
+	if len(m.ReasoningOptions) == 0 {
+		// reasoning without options -> single toggle
+		b, _ := json.Marshal([]string{"on"})
+		return "toggle", string(b), "{}"
+	}
+	// prefer first option
+	opt := m.ReasoningOptions[0]
+	if opt.Type == "toggle" {
+		b, _ := json.Marshal([]string{"off", "on"})
+		return "toggle", string(b), "{}"
+	}
+	// effort type
+	if len(opt.Values) > 0 {
+		b, _ := json.Marshal(opt.Values)
+		// default per-level output limits as empty map, UI will allow setting
+		return opt.Type, string(b), "{}"
+	}
+	b, _ := json.Marshal([]string{"low", "medium", "high"})
+	return "effort", string(b), "{}"
+}
+
+func (s *Store) syncFromProviders(providers map[string]RawProvider) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(db.Q(`INSERT INTO models_catalog(`+catalogInsertColumns+`) VALUES(`+catalogInsertPlaceholders+`)`) + db.UpsertEnd([]string{"id"}, catalogUpsertColumns))
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	count := 0
+	now := time.Now().UTC()
+	for provID, prov := range providers {
+		for _, m := range prov.Models {
+			modalitiesBytes, _ := json.Marshal(m.Modalities)
+			fullID := m.ID
+			if len(fullID) < 3 || !containsSlash(fullID) {
+				fullID = provID + "/" + m.ID
+			}
+			ctx := m.Limit.Context
+			if ctx == 0 {
+				ctx = m.Limit.Input
+			}
+			out := m.Limit.Output
+			reasoningType, reasoningLevelsJSON, reasoningLimitsJSON := parseReasoningOptions(m)
+			isDecision := m.Decision || decisionModality(string(modalitiesBytes)) || decision.IsDecisionModel(fullID)
+			// models.dev's `modalities.output` IS the image-generation tag: it is
+			// authoritative whenever present, so `image` and the emitted
+			// modalities can never contradict each other. The curated registry is
+			// consulted only when models.dev carries no modality data for the row
+			// (a brand-new model, or a listing that omits modalities entirely).
+			// ORing the two unconditionally used to flag reseller rows that
+			// models.dev reports as text-only (`output: ["text"]`), producing
+			// rows that claimed image output while advertising text output.
+			var isImage bool
+			if len(imagegen.OutputModalities(string(modalitiesBytes))) > 0 {
+				isImage = imagegen.ImageModality(string(modalitiesBytes))
+			} else {
+				isImage = imagegen.IsImageModel(fullID)
+			}
+			isVideo := videogen.VideoModality(string(modalitiesBytes))
+			if _, err := stmt.Exec(fullID, provID, m.Name, m.Description, m.Family, ctx, out, m.Cost.Input, m.Cost.Output, m.Cost.CacheRead, m.Cost.CacheWrite, m.Reasoning, m.ToolCall, m.StructuredOutput, m.Attachment, string(modalitiesBytes), m.OpenWeights, m.Knowledge, now, reasoningType, reasoningLevelsJSON, reasoningLimitsJSON, db.BoolInt(isDecision), db.BoolInt(isImage), db.BoolInt(isVideo), db.ShortID(fullID)); err != nil {
+				return count, err
+			}
+			count++
+		}
+	}
+	// Curated rows are seeded INSIDE the sync transaction so a sync cannot leave
+	// the models.dev rows committed while the curated rows failed, and so a seed
+	// failure surfaces instead of being swallowed by `_, _ =`. This was P1-11:
+	// the seeds used to run after Commit() on s.db with their errors discarded,
+	// so a Postgres-only failure (the pq integer/bool class) silently left a
+	// deployment with zero image and video models until the next daily sync.
+	// (A zero return here means the curated_seed_version marker matched, i.e.
+	// nothing needed writing — not an error.)
+	if _, err := seedAllTx(tx); err != nil {
+		return count, fmt.Errorf("curated model seed: %w", err)
+	}
+	nowValue := now.Format(time.RFC3339)
+	if _, err := tx.Exec(db.Q(`INSERT INTO system_config(key,value,updated_at) VALUES('models_last_sync',?,?)`)+db.UpsertEnd([]string{"key"}, []string{"value", "updated_at"}), nowValue, now); err != nil {
+		return count, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	// Every catalog row may have changed: drop the memo.
+	s.InvalidateCache()
+	return count, nil
+}
+
+// catalogSeedRow is one curated registry entry in the shape models_catalog
+// stores. It exists so the three registries (decision / image / video) share a
+// single INSERT path instead of three copy-pasted ones that drifted apart.
+type catalogSeedRow struct {
+	ID            string
+	Provider      string
+	Name          string
+	Description   string
+	Family        string
+	ContextWindow int
+	MaxOutput     int
+	InputCost     float64
+	OutputCost    float64
+	Reasoning     bool
+	ToolCall      bool
+	StructuredOut bool
+	Attachment    bool
+	Modalities    string
+	OpenWeights   bool
+	Decision      bool
+	Image         bool
+	Video         bool
+}
+
+// decisionSeedRows projects the curated System One / decision registry.
+func decisionSeedRows() []catalogSeedRow {
+	all := decision.All()
+	rows := make([]catalogSeedRow, 0, len(all))
+	for _, dm := range all {
+		rows = append(rows, catalogSeedRow{
+			ID:            dm.CatalogID(),
+			Provider:      dm.Namespace,
+			Name:          dm.Name,
+			Description:   dm.Description(),
+			Family:        dm.Family,
+			ContextWindow: dm.ContextWindow,
+			InputCost:     dm.InputCostPerM,
+			OutputCost:    dm.OutputCostPerM,
+			Reasoning:     false,
+			ToolCall:      false,
+			StructuredOut: true,
+			Attachment:    dm.Vision,
+			Modalities:    dm.ModalitiesJSON(),
+			OpenWeights:   dm.Family != "jev",
+			Decision:      true,
+		})
+	}
+	return rows
+}
+
+// imageSeedRows projects the curated image-generation registry. Image models
+// bill per generated image, so the per-token columns are written as literal
+// zeros: the registry carries InputCostPerM/OutputCostPerM for providers that
+// price images per token, but writing them here would let CostForSplit price an
+// image row as if it were a chat model.
+func imageSeedRows() []catalogSeedRow {
+	all := imagegen.All()
+	rows := make([]catalogSeedRow, 0, len(all))
+	for _, im := range all {
+		rows = append(rows, catalogSeedRow{
+			ID:          im.CatalogID(),
+			Provider:    im.Namespace,
+			Name:        im.Name,
+			Description: im.Description(),
+			Family:      im.Family,
+			Reasoning:   false,
+			ToolCall:    false,
+			Attachment:  im.SupportsEdit,
+			Modalities:  im.ModalitiesJSON(),
+			OpenWeights: false,
+			Image:       true,
+		})
+	}
+	return rows
+}
+
+// videoSeedRows projects the curated video-generation registry. Video models
+// bill per generated second; the per-token columns are zero for the same reason
+// as the image rows.
+func videoSeedRows() []catalogSeedRow {
+	all := videogen.All()
+	rows := make([]catalogSeedRow, 0, len(all))
+	for _, vm := range all {
+		rows = append(rows, catalogSeedRow{
+			ID:          vm.CatalogID(),
+			Provider:    vm.Namespace,
+			Name:        vm.Name,
+			Description: vm.Description(),
+			Family:      vm.Family,
+			Reasoning:   false,
+			ToolCall:    false,
+			Attachment:  vm.SupportsImageInput,
+			Modalities:  vm.ModalitiesJSON(),
+			OpenWeights: false,
+			Video:       true,
+		})
+	}
+	return rows
+}
+
+// curatedSeedRows is every curated row in one slice (decision, then image, then
+// video).
+func curatedSeedRows() []catalogSeedRow {
+	rows := decisionSeedRows()
+	rows = append(rows, imageSeedRows()...)
+	rows = append(rows, videoSeedRows()...)
+	return rows
+}
+
+// curatedSeedVersion is a content hash of the curated registries. It is stored in
+// system_config so an unchanged binary writes nothing on boot or on sync, and
+// bumps automatically whenever a registry entry changes (no hand-maintained
+// version number to forget).
+func curatedSeedVersion(rows []catalogSeedRow) string {
+	h := sha256.New()
+	for _, r := range rows {
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%d\x00%.6f\x00%.6f\x00%s\x00%t%t%t%t%t\n",
+			r.ID, r.Provider, r.Name, r.Family, r.ContextWindow, r.InputCost, r.OutputCost,
+			r.Modalities, r.Decision, r.Image, r.Video, r.Attachment, r.OpenWeights)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// seedExecer is the subset of *sql.DB / *sql.Tx the seeder needs.
+type seedExecer interface {
+	Prepare(query string) (*sql.Stmt, error)
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// seedRowsInto writes curated rows with INSERT ... ON CONFLICT(id) DO NOTHING.
+//
+// This is the P0-4 fix. The previous statement was `ON CONFLICT(id) DO UPDATE
+// SET` over every column — including input_cost, output_cost, context_window and
+// the capability flags — so an operator's negotiated price was reverted to the
+// baked-in value on every boot and every 24h sync (proven: 2.40 -> 0.24), and an
+// operator's capability correction was silently re-flagged. That is a
+// spend-attribution bug: CostForSplit and /v1/models image_cost/video_cost all
+// read these columns, so under-reporting lets a key blow its budget.
+//
+// Insert-only means: seed rows the database does not have yet, never fight the
+// operator over rows it does.
+func seedRowsInto(ex seedExecer, rows []catalogSeedRow) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	stmt, err := ex.Prepare(db.Q(`INSERT INTO models_catalog(`+catalogInsertColumns+`) VALUES(`+catalogInsertPlaceholders+`)`) + db.InsertIgnoreEnd([]string{"id"}))
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	now := time.Now().UTC()
+	n := 0
+	for _, r := range rows {
+		res, err := stmt.Exec(r.ID, r.Provider, r.Name, r.Description, r.Family, r.ContextWindow, r.MaxOutput,
+			r.InputCost, r.OutputCost, 0, 0,
+			r.Reasoning, r.ToolCall, r.StructuredOut, r.Attachment, r.Modalities, r.OpenWeights, "", now,
+			"none", "[]", "{}", db.BoolInt(r.Decision), db.BoolInt(r.Image), db.BoolInt(r.Video), db.ShortID(r.ID))
+		if err != nil {
+			return n, err
+		}
+		// RowsAffected is 0 for an INSERT ... DO NOTHING that hit an existing
+		// row, which is what makes "seeded N new rows" meaningful.
+		if affected, aerr := res.RowsAffected(); aerr == nil {
+			n += int(affected)
+		}
+	}
+	return n, nil
+}
+
+// seedAllTx seeds all three curated registries inside an existing transaction,
+// gated by the curated_seed_version marker so an unchanged registry writes
+// nothing. A seed error is returned to the caller (which rolls the transaction
+// back) instead of being swallowed.
+func seedAllTx(tx *sql.Tx) (int, error) {
+	rows := curatedSeedRows()
+	version := curatedSeedVersion(rows)
+	var stored string
+	err := tx.QueryRow(db.Q(`SELECT value FROM system_config WHERE key=?`), curatedSeedVersionKey).Scan(&stored)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+	if err == nil && stored == version {
+		// Registry unchanged since the last seed: nothing to do at all.
+		return 0, nil
+	}
+	n, err := seedRowsInto(tx, rows)
+	if err != nil {
+		return n, err
+	}
+	// Record the marker. DO UPDATE here is deliberate and safe: it is our own
+	// bookkeeping key, not operator data.
+	if _, err := tx.Exec(db.Q(`INSERT INTO system_config(key,value,updated_at) VALUES(?,?,?)`)+db.UpsertEnd([]string{"key"}, []string{"value", "updated_at"}), curatedSeedVersionKey, version, time.Now().UTC()); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// SeedAllCuratedModels seeds the curated decision, image AND video registries in
+// ONE transaction, and is the single entry point a boot path should call.
+//
+// Why this exists (P1-11): the three seeds used to be reachable only through the
+// daily models.dev sync (`SeedDecisionModels` additionally ran at boot), so a
+// fresh deploy that could not reach models.dev listed 0 image/video models for
+// up to 24h even though both registries are embedded in the binary. A single
+// combined seeder is ~1.6 ms, idempotent, and insert-only.
+//
+// Intended call site (cmd/gateway/main.go is owned by another change, so this is
+// exported rather than wired): replace the boot-time
+// `catalogStore.SeedDecisionModels()` call (~main.go:107) with
+//
+//	if n, err := catalogStore.SeedAllCuratedModels(); err != nil {
+//		log.Warn().Err(err).Msg("curated model seed failed")
+//	} else if n > 0 {
+//		log.Debug().Int("models", n).Msg("curated models seeded")
+//	}
+//
+// It is safe to call on every boot: an unchanged registry writes nothing (see the
+// curated_seed_version marker) and existing rows are never modified.
+func (s *Store) SeedAllCuratedModels() (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	n, err := seedAllTx(tx)
+	if err != nil {
+		return n, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.InvalidateCache()
+	return n, nil
+}
+
+// SeedDecisionModels seeds the curated System One / decision-model registry.
+//
+// Insert-only and idempotent: rows the database already has (including any the
+// operator has edited — price, capability flags, name) are left untouched, so a
+// re-seed can never revert an operator override. Prefer SeedAllCuratedModels at
+// boot; this stays exported because it is the narrow entry point for tests and
+// for callers that deliberately want only the decision rows.
+func (s *Store) SeedDecisionModels() (int, error) {
+	return s.seedRowsStandalone(decisionSeedRows())
+}
+
+// SeedImageModels seeds the curated image-generation registry. Insert-only;
+// token costs are written as zero because image models bill per image.
+func (s *Store) SeedImageModels() (int, error) {
+	return s.seedRowsStandalone(imageSeedRows())
+}
+
+// SeedVideoModels seeds the curated video-generation registry. Insert-only;
+// token costs are written as zero because video models bill per second.
+func (s *Store) SeedVideoModels() (int, error) {
+	return s.seedRowsStandalone(videoSeedRows())
+}
+
+// seedRowsStandalone runs one registry seed in a single transaction (one Prepare
+// and one Commit instead of 10-14 autocommit statements) and propagates the
+// first error instead of discarding it.
+func (s *Store) seedRowsStandalone(rows []catalogSeedRow) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	n, err := seedRowsInto(tx, rows)
+	if err != nil {
+		return n, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	s.InvalidateCache()
+	return n, nil
 }

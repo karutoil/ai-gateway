@@ -9,6 +9,7 @@ export type Perm =
   | 'routing:read' | 'routing:write'
   | 'catalog:read' | 'catalog:write'
   | 'orgs:read' | 'orgs:write'
+  | 'mcp:read' | 'mcp:write'
   | 'users:read' | 'users:write'
   | 'audit:read'
   | 'settings:write'
@@ -20,6 +21,7 @@ export const PERM_CATALOG: Perm[] = [
   'routing:read', 'routing:write',
   'catalog:read', 'catalog:write',
   'orgs:read', 'orgs:write',
+  'mcp:read', 'mcp:write',
   'users:read', 'users:write',
   'audit:read',
   'settings:write',
@@ -78,6 +80,13 @@ export const PERM_GROUPS: { resource: string; label: string; perms: { perm: Perm
     ],
   },
   {
+    resource: 'mcp', label: 'MCP Servers',
+    perms: [
+      { perm: 'mcp:read', label: 'View MCP servers & tools' },
+      { perm: 'mcp:write', label: 'Manage MCP servers', hint: 'Add, edit, delete, enable/disable, test connections and rediscover tools.' },
+    ],
+  },
+  {
     resource: 'users', label: 'Users',
     perms: [
       { perm: 'users:read', label: 'View users' },
@@ -131,6 +140,7 @@ function legacyCan(perm: Perm): boolean {
       return true
     case 'keys:create': case 'keys:update': case 'keys:rotate': case 'keys:delete': case 'keys:limits':
     case 'providers:read': case 'providers:write': case 'providers:test': case 'providers:delete':
+    case 'mcp:read': case 'mcp:write':
       return writeRoles.includes(currentRole)
     case 'logs:read': case 'logs:read_bodies': case 'analytics:read':
       // Org-wide request visibility: legacy readonly saw it, the RBAC default

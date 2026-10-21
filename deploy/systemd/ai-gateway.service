@@ -51,9 +51,19 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 
-# Graceful drain window for in-flight LLM streams on restart (matches the
-# gateway's SHUTDOWN_GRACE_SECONDS; raise both together for long streams).
-TimeoutStopSec=95
+# Graceful drain window for in-flight requests on restart.
+#
+# DEPLOYMENT INVARIANT: this must exceed SHUTDOWN_GRACE_SECONDS, which in turn
+# must be >= IMAGE_TIMEOUT_SECONDS (300s by default). Image generation is
+# allowed up to 300s; a shorter drain cancels it mid-flight — the client gets a
+# 502 and the request_logs billing row is never written, because the DB is
+# closed immediately after the drain. See deploy/README.md §1.
+#
+# Set in /etc/ai-gateway.env, keeping TimeoutStopSec > SHUTDOWN_GRACE_SECONDS:
+#     SHUTDOWN_GRACE_SECONDS=330
+#     # systemd: TimeoutStopSec=360 (this file)
+# The gateway logs a boot-time WARNING when the two env values disagree.
+TimeoutStopSec=360
 KillSignal=SIGTERM
 
 [Install]

@@ -97,6 +97,9 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
   const [data, setData] = useState<KeyAnalytics | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  // Retry needs a dependency that actually changes; `setRange(r => r)` is a
+  // no-op for React and refetched nothing.
+  const [reload, setReload] = useState(0)
 
   useEffect(() => {
     if (!keyId) { setData(null); setError(''); return }
@@ -104,13 +107,13 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
     api.keys.analytics(keyId, range)
       .then(d => { setData(d as KeyAnalytics); setLoading(false) })
       .catch((e: any) => { setError(e?.message || String(e)); setLoading(false) })
-  }, [keyId, range])
+  }, [keyId, range, reload])
 
   return (
     <Modal open={keyId !== null} onClose={onClose} title="Key performance" width="max-w-3xl">
       {error && (
         <EmptyState icon="alert" title="Could not load analytics" hint={error}
-          action={<Button variant="secondary" size="sm" onClick={() => setRange(r => r)}><Icon name="refresh" size={14} />Retry</Button>} />
+          action={<Button variant="secondary" size="sm" onClick={() => setReload(n => n + 1)}><Icon name="refresh" size={14} />Retry</Button>} />
       )}
       {!error && (
         <div className="space-y-5">

@@ -91,6 +91,85 @@ var migration024SQL string
 //go:embed migrations/025_routing_quota_threshold.sql
 var migration025SQL string
 
+//go:embed migrations/026_decision_models.sql
+var migration026SQL string
+
+//go:embed migrations/027_image_models.sql
+var migration027SQL string
+
+//go:embed migrations/028_video_jobs.sql
+var migration028SQL string
+
+//go:embed migrations/029_video_models.sql
+var migration029SQL string
+
+//go:embed migrations/030_video_retention_and_short_id.sql
+var migration030SQL string
+
+//go:embed migrations/031_video_jobs_key_prefix_not_null.sql
+var migration031SQL string
+
+//go:embed migrations/032_mcp.sql
+var migration032SQL string
+
+//go:embed migrations/033_passkey_backup_flags.sql
+var migration033SQL string
+
+// migrationsList is the ordered set of embedded migrations. It is a function
+// (rather than an inline literal) so callers and tests can introspect the
+// schema version instead of hardcoding a count that goes stale on every new
+// migration.
+func migrationsList() []struct {
+	version int
+	sql     string
+} {
+	return []struct {
+		version int
+		sql     string
+	}{
+		{1, migration001SQL},
+		{2, migration002SQL},
+		{3, migration003SQL},
+		{4, migration004SQL},
+		{5, migration005SQL},
+		{6, migration006SQL},
+		{7, migration007SQL},
+		{8, migration008SQL},
+		{9, migration009SQL},
+		{10, migration010SQL},
+		{11, migration011SQL},
+		{12, migration012SQL},
+		{13, migration013SQL},
+		{14, migration014SQL},
+		{15, migration015SQL},
+		{16, migration016SQL},
+		{17, migration017SQL},
+		{18, migration018SQL},
+		{19, migration019SQL},
+		{20, migration020SQL},
+		{21, migration021SQL},
+		{22, migration022SQL},
+		{23, migration023SQL},
+		{24, migration024SQL},
+		{25, migration025SQL},
+		{26, migration026SQL},
+		{27, migration027SQL},
+		{28, migration028SQL},
+		{29, migration029SQL},
+		{30, migration030SQL},
+		{31, migration031SQL},
+		{32, migration032SQL},
+		{33, migration033SQL},
+	}
+}
+
+// LatestMigrationVersion is the highest embedded migration version — the schema
+// version a freshly migrated database reports.
+func LatestMigrationVersion() int {
+	ms := migrationsList()
+	return ms[len(ms)-1].version
+}
+
 // Dialect returns the current SQL dialect based on DATABASE_URL.
 // Returns "postgres" when DATABASE_URL starts with postgres:// or postgresql://, otherwise "sqlite".
 // Phase 3 uses this to switch migrations and queries; Phase 2.5 keeps sqlite default.
@@ -100,6 +179,133 @@ func Dialect() string {
 		return "postgres"
 	}
 	return "sqlite"
+}
+
+// migrationStatements splits one embedded migration file into the statements a
+// driver can execute.
+//
+// Until migration 030 this was `[]string{trimmed}` on SQLite (go-sqlite3 happily
+// runs a multi-statement Exec) and splitStatements on Postgres. That left the
+// two dialects with different statement boundaries, which matters now that a
+// statement failing with "already exists" is tolerated individually: SQLite
+// would have failed the whole file as one unit. Both dialects now get the same
+// per-statement list (statement-at-a-time Exec is also what keeps a
+// multi-statement migration inside the transaction that wraps it).
+//
+// Nothing triggers in either tree: re-running a file is not a supported way to
+// refresh data (migrations must be idempotent), and no migration so far has a
+// BEGIN/END trigger body, which the ';' split would break. splitStatements and
+// the SQLite driver both leave a BEGIN ... END body intact, so a future
+// trigger-bearing migration must be verified by hand rather than trusted.
+func migrationStatements(sqlText string) []string {
+	if Dialect() == "postgres" {
+		return splitStatements(pgTranslateDDL(sqlText))
+	}
+	return splitStatements(sqlText)
+}
+
+// isDuplicateObjectErr reports whether err is the driver's way of saying "this
+// object is already there", which is what a replay of an already-applied
+// migration produces.
+//
+// SQLite:      "duplicate column name: x", "table x already exists",
+//
+//	"index x already exists"
+//
+// Postgres:    SQLSTATE 42701 duplicate_column, 42P07 duplicate_table,
+//
+//	42710 duplicate_object (index/constraint), 42P16 invalid_table_definition
+//	(a NOT NULL/CHECK re-added via ALTER), plus the bare message
+//	forms lib/pq surfaces.
+//
+// Anything else (syntax, missing table, permissions, disk full) must still fail
+// the migration and mark it dirty: silently swallowing those is how a schema
+// ends up half-applied with a clean ledger.
+func isDuplicateObjectErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"duplicate column",
+		"already exists",
+		"duplicate name",
+		"duplicate_table",
+		"duplicate_column",
+		"duplicate_object",
+		"duplicate_schema",
+		"duplicate index",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// ShortID returns the catalog "short id" for a model id: the substring after the
+// last '/', or the whole id when it carries no separator.
+//
+// It is the canonical spelling of a model inside a provider namespace
+// ("openai/gpt-4o" -> "gpt-4o") and is stored in models_catalog.short_id by the
+// seed/sync/backfill paths so lookups by bare slug are an index hit instead of a
+// leading-wildcard LIKE (which is a full table scan on every chat request).
+//
+// Kept in this package so the backfill here and the write paths in
+// internal/catalog cannot drift into two different definitions of the column.
+func ShortID(modelID string) string {
+	trimmed := strings.TrimSpace(modelID)
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 && i+1 < len(trimmed) {
+		return trimmed[i+1:]
+	}
+	return trimmed
+}
+
+// applyModelShortIDBackfill fills models_catalog.short_id for rows that predate
+// migration 030 (or that were inserted by a path that does not set it).
+//
+// The extraction is done in Go: SQLite has instr() but no strpos(), Postgres has
+// strpos() but no instr(), and neither has a portable "substring after the last
+// '/'" expression, so a SQL backfill would be two dialect-specific statements
+// for a value that is trivial to compute once per row. Runs inside the 030
+// migration and again from Migrate's legacy path; idempotent and cheap in steady
+// state (only rows with a NULL/empty short_id are touched).
+func applyModelShortIDBackfill(database *sql.DB) error {
+	// Only rows that are missing the value are backfilled, so a steady-state boot
+	// costs this single (low cardinality) query and nothing else. The write paths
+	// in internal/catalog maintain short_id on every insert/upsert, so a stale
+	// non-NULL value is not a shape this schema produces.
+	rows, err := database.Query(`SELECT id FROM models_catalog WHERE short_id IS NULL OR short_id = ''`)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, 1024)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	stmt, err := database.Prepare(Rebind(`UPDATE models_catalog SET short_id=? WHERE id=?`))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.Exec(ShortID(id), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DialectForURL is helper for testing / config injection.
@@ -132,6 +338,28 @@ func Rebind(query string) string {
 
 // Q is helper alias for Rebind, for terse call sites: db.Q("SELECT ... WHERE id=?", id)
 func Q(query string) string { return Rebind(query) }
+
+// BoolInt converts a Go bool to the 0/1 integer the capability-flag columns
+// (decision / image / video) store.
+//
+// Those three columns are INTEGER rather than BOOLEAN on purpose, and this
+// helper is why: the Go layer naturally carries these flags as bool, and
+// lib/pq refuses to coerce a Go bool into an integer column —
+//
+//	pq: invalid input syntax for type integer: "false"
+//
+// — while SQLite accepts either. Normalizing to an integer on the way in keeps
+// one code path working on both dialects. The sibling capability columns
+// (reasoning, tool_call, structured_output, attachment, open_weights) are
+// genuine BOOLEANs and take bools directly; only these three are integers,
+// because they were added by later migrations and scanning them as
+// sql.NullInt64 is what every read path already does.
+func BoolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 // DateBucketExpr returns the daily bucket expression for request_logs charts.
 func DateBucketExpr(col string) string {
@@ -239,6 +467,18 @@ func UpsertEnd(conflictCols []string, updateCols []string) string {
 	return b.String()
 }
 
+// InsertIgnoreEnd returns the dialect-appropriate tail for an INSERT that must
+// never touch an existing row: `ON CONFLICT(id) DO NOTHING`.
+//
+// This is what curated catalog seeds use. `DO UPDATE SET` on a curated row
+// silently reverts operator edits — a price override negotiated at 2.40 went
+// back to the baked-in 0.24 on the next boot/sync, which under-reports spend
+// and lets a key blow its budget. A seed inserts rows the operator does not
+// have yet and otherwise keeps its hands off the database.
+func InsertIgnoreEnd(conflictCols []string) string {
+	return " ON CONFLICT(" + strings.Join(conflictCols, ",") + ") DO NOTHING"
+}
+
 func Open(path string) (*sql.DB, error) {
 	// Phase 3: postgres:// switches driver; otherwise sqlite path handling as before.
 	if DialectForURL(path) == "postgres" {
@@ -323,36 +563,7 @@ func Migrate(db *sql.DB) error {
 		return err
 	}
 
-	migrations := []struct {
-		version int
-		sql     string
-	}{
-		{1, migration001SQL},
-		{2, migration002SQL},
-		{3, migration003SQL},
-		{4, migration004SQL},
-		{5, migration005SQL},
-		{6, migration006SQL},
-		{7, migration007SQL},
-		{8, migration008SQL},
-		{9, migration009SQL},
-		{10, migration010SQL},
-		{11, migration011SQL},
-		{12, migration012SQL},
-		{13, migration013SQL},
-		{14, migration014SQL},
-		{15, migration015SQL},
-		{16, migration016SQL},
-		{17, migration017SQL},
-		{18, migration018SQL},
-		{19, migration019SQL},
-		{20, migration020SQL},
-		{21, migration021SQL},
-		{22, migration022SQL},
-		{23, migration023SQL},
-		{24, migration024SQL},
-		{25, migration025SQL},
-	}
+	migrations := migrationsList()
 
 	for _, m := range migrations {
 		var cnt int
@@ -377,11 +588,16 @@ func Migrate(db *sql.DB) error {
 			// failure cannot leave partial DDL: SQLite supports transactional
 			// DDL; Postgres too. On failure the rollback leaves the DB at the
 			// previous version and we mark dirty for the operator.
-			// Postgres cannot run multi-statement Exec in one call, so split.
-			stmts := []string{trimmed}
-			if Dialect() == "postgres" {
-				stmts = splitStatements(pgTranslateDDL(trimmed))
-			}
+			//
+			// Statements that fail because the object ALREADY EXISTS are
+			// tolerated on both dialects. Without that tolerance a replay of
+			// the migration set against a schema that is already current (a
+			// legacy unversioned DB, or a hand-edited ledger) aborts dirty at
+			// migration 4 ("duplicate column name: last_login_at") and then
+			// blocks every subsequent boot on the dirty check above. The
+			// legacy ALTER path exists exactly for that database shape, so
+			// aborting before reaching it was a boot-loop bug.
+			steps := migrationStatements(trimmed)
 			tx, txErr := db.Begin()
 			if txErr != nil {
 				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
@@ -389,9 +605,42 @@ func Migrate(db *sql.DB) error {
 			}
 			failed := false
 			var execErr error
-			for _, s := range stmts {
-				if _, execErr = tx.Exec(s); execErr != nil {
+			for i, s := range steps {
+				// Each statement runs under its own savepoint. Postgres aborts the
+				// ENTIRE transaction on any error ("current transaction is aborted,
+				// commands ignored until end of transaction block"), so merely
+				// ignoring the duplicate-object error and continuing would fail the
+				// next statement — the savepoint is what lets a tolerated
+				// "already exists" be rolled back individually while a genuine
+				// failure still aborts the whole migration. SQLite supports
+				// SAVEPOINT inside a transaction for the same purpose.
+				sp := fmt.Sprintf("mig_%d_%d", m.version, i)
+				if _, err := tx.Exec("SAVEPOINT " + sp); err != nil {
 					failed = true
+					execErr = err
+					break
+				}
+				if _, err := tx.Exec(s); err != nil {
+					if isDuplicateObjectErr(err) {
+						// Already applied by the legacy path or by a previous
+						// partial run. Undo just this statement's savepoint so the
+						// enclosing transaction stays usable.
+						if _, rbErr := tx.Exec("ROLLBACK TO SAVEPOINT " + sp); rbErr != nil {
+							failed = true
+							execErr = rbErr
+							break
+						}
+						_, _ = tx.Exec("RELEASE SAVEPOINT " + sp)
+						log.Debug().Err(err).Int("version", m.version).Msg("migration statement already applied; continuing")
+						continue
+					}
+					failed = true
+					execErr = err
+					break
+				}
+				if _, err := tx.Exec("RELEASE SAVEPOINT " + sp); err != nil {
+					failed = true
+					execErr = err
 					break
 				}
 			}
@@ -403,6 +652,13 @@ func Migrate(db *sql.DB) error {
 			if err := tx.Commit(); err != nil {
 				_, _ = db.Exec(upsertSchemaMigration(db, m.version, true))
 				return fmt.Errorf("migration %d commit failed: %w", m.version, err)
+			}
+		}
+		// Migration 030 shipped models_catalog.short_id; backfill it in Go
+		// because last-slash extraction has no portable SQL spelling.
+		if m.version == 30 {
+			if err := applyModelShortIDBackfill(db); err != nil {
+				log.Warn().Err(err).Msg("models_catalog.short_id backfill failed (lookups will fall back to containment)")
 			}
 		}
 		// Run idempotent ALTERs for hardening (budget columns etc). Ignores duplicate-column errors.
@@ -533,6 +789,29 @@ func Migrate(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at);
 	CREATE INDEX IF NOT EXISTS idx_provider_models_provider ON provider_models(provider_id);
 	CREATE INDEX IF NOT EXISTS idx_provider_models_model ON provider_models(model_id);
+	CREATE TABLE IF NOT EXISTS video_jobs (
+		id TEXT PRIMARY KEY,
+		provider_id TEXT NOT NULL,
+		key_prefix TEXT,
+		dialect TEXT NOT NULL,
+		model TEXT NOT NULL,
+		upstream_id TEXT NOT NULL,
+		prompt TEXT,
+		seconds TEXT,
+		size TEXT,
+		status TEXT NOT NULL DEFAULT 'queued',
+		progress INTEGER DEFAULT 0,
+		error_code TEXT,
+		error_message TEXT,
+		video_url TEXT,
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		completed_at DATETIME,
+		expires_at DATETIME
+	);
+	CREATE INDEX IF NOT EXISTS idx_video_jobs_key ON video_jobs(key_prefix);
+	CREATE INDEX IF NOT EXISTS idx_video_jobs_provider ON video_jobs(provider_id);
+	CREATE INDEX IF NOT EXISTS idx_video_jobs_created ON video_jobs(created_at);
 	`
 	if Dialect() == "postgres" {
 		for _, part := range splitStatements(pgTranslateDDL(legacySchema)) {
@@ -710,10 +989,7 @@ func execAlterIdempotent(db *sql.DB, stmt string) {
 		execStmt = pgTranslateDDL(stmt)
 	}
 	if _, err := db.Exec(execStmt); err != nil {
-		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "duplicate column") || // sqlite
-			strings.Contains(msg, "already exists") || // postgres 42710
-			strings.Contains(msg, "duplicate name") { // sqlite alt form
+		if isDuplicateObjectErr(err) {
 			return
 		}
 		log.Error().Err(err).Str("stmt", stmt).Msg("schema ALTER failed (non-duplicate)")
@@ -815,9 +1091,29 @@ func applyLegacyAlters(db *sql.DB) {
 		"ALTER TABLE provider_models ADD COLUMN cache_read_cost REAL",
 		"ALTER TABLE provider_models ADD COLUMN cache_write_cost REAL",
 		"ALTER TABLE provider_models ADD COLUMN structured_output BOOLEAN",
+		"ALTER TABLE models_catalog ADD COLUMN decision INTEGER DEFAULT 0",
+		"ALTER TABLE provider_models ADD COLUMN decision INTEGER DEFAULT 0",
+		// 027 / 029 shipped `image` and `video` but only `decision` was mirrored
+		// here, so a legacy DB that reached this path landed without the two
+		// newest capability flags and every image/video row read back as text.
+		"ALTER TABLE models_catalog ADD COLUMN image INTEGER DEFAULT 0",
+		"ALTER TABLE provider_models ADD COLUMN image INTEGER DEFAULT 0",
+		"ALTER TABLE models_catalog ADD COLUMN video INTEGER DEFAULT 0",
+		"ALTER TABLE provider_models ADD COLUMN video INTEGER DEFAULT 0",
+		// 030: indexed short id for the per-request catalog lookup.
+		"ALTER TABLE models_catalog ADD COLUMN short_id TEXT",
 	}
 	for _, stmt := range cols {
 		execAlterIdempotent(db, stmt) // ignore error if exists
+	}
+	// 030 indexes and short_id backfill: harmless no-ops on a DB that has them.
+	execCreateIndexIdempotent(db, "idx_models_catalog_short_id", "CREATE INDEX IF NOT EXISTS idx_models_catalog_short_id ON models_catalog(short_id)")
+	execCreateIndexIdempotent(db, "idx_models_catalog_id_lower", "CREATE INDEX IF NOT EXISTS idx_models_catalog_id_lower ON models_catalog(LOWER(id))")
+	execCreateIndexIdempotent(db, "idx_models_catalog_decision", "CREATE INDEX IF NOT EXISTS idx_models_catalog_decision ON models_catalog(decision)")
+	execCreateIndexIdempotent(db, "idx_models_catalog_image", "CREATE INDEX IF NOT EXISTS idx_models_catalog_image ON models_catalog(image)")
+	execCreateIndexIdempotent(db, "idx_models_catalog_video", "CREATE INDEX IF NOT EXISTS idx_models_catalog_video ON models_catalog(video)")
+	if err := applyModelShortIDBackfill(db); err != nil {
+		log.Warn().Err(err).Msg("models_catalog.short_id backfill failed (lookups will fall back to containment)")
 	}
 }
 

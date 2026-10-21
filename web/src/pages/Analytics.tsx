@@ -169,7 +169,7 @@ export default function Analytics() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Observe · Overview"
+        eyebrow="Optimize · Overview"
         title="Analytics"
         description="A windowed view of traffic, usage, reliability, speed, and caching. Explore detailed reports for deeper breakdowns."
         actions={<Button variant="secondary" size="sm" onClick={() => setReloadKey(k => k + 1)} disabled={loading} title="Reload analytics">

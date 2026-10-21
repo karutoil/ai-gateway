@@ -1,5 +1,21 @@
 name: CI
 
+# Parity contract: CI must stay equivalent to `make ci` (plus the gates that
+# only make sense with a service container / Python / Node):
+#
+#   CI `backend`  = make fmt-check + go vet + go build + make test-race
+#   CI `postgres` = make pg-test   (needs the postgres service container)
+#   CI `lint`     = make lint      (pinned golangci-lint, zero-issue gate)
+#   CI `openapi`  = make openapi-check (+ the embedded-copy drift warning)
+#   CI `frontend` = cd web && npx tsc -b && npm run build
+#   CI `docker`   = docker build + container smoke test
+#
+# If you add a gate on one side, add it on the other. The Makefile names this
+# file in the `ci` target so the pairing is discoverable from either end.
+#
+# Jobs are independent and run in parallel; `docker` is the only one with a
+# `needs:` because it consumes both the backend result and the web build.
+
 'on':
   push:
   pull_request:
@@ -7,6 +23,13 @@ name: CI
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '20'
+  # Pinned: a floating linter version turns a green main red without a commit.
+  GOLANGCI_LINT_VERSION: 'v2.15.0'
+  OPENAPI_SPEC_VALIDATOR_VERSION: '0.9.0'
 
 jobs:
   backend:
@@ -18,14 +41,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
           # setup-go caches the module + build caches keyed on go.sum automatically
-
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
 
       - name: Gofmt check
         run: |
@@ -36,8 +53,187 @@ jobs:
             exit 1
           fi
 
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Full-tree race suite, matching `make test-race` / `make ci`. The
+      # Postgres dialect suite lives in its own job (needs a service container)
+      # and self-skips here, which is why the guard there matters.
       - name: Test (race)
         run: go test ./... -race -count=1
+
+  # P1-15: the Postgres dialect suite. internal/db/pgsmoke skips every test when
+  # GATEWAY_PG_DSN is unset, so for a long time the "never write a Go bool into
+  # an INTEGER column" trap (pq: invalid input syntax for type integer: "false")
+  # could regress with CI still green. This job both supplies a real Postgres
+  # and FAILS if the package skips, so a silent skip cannot masquerade as a pass.
+  postgres:
+    name: Postgres dialect suite (pgsmoke)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Pin a minor version: a floating tag means the dialect under test can
+        # change without a commit in this repo.
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway
+          POSTGRES_DB: gwtest
+        ports:
+          - 5432:5432
+        # The suite drops and recreates the public schema, so the database MUST
+        # be dedicated to it (hence "gwtest", not "gateway").
+        #
+        # The health check is what gates step execution: GitHub does not start
+        # the job's steps until the service reports healthy, and fails the job
+        # with "Health check failed" otherwise. 20 x 5s is the readiness budget.
+        # No separate sleep/wait step is used on purpose — a TCP connect test
+        # would pass as soon as the port opens, which is several seconds before
+        # initdb finishes, and would then produce a confusing "connection reset
+        # by peer" from the first test instead of a clear service error.
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gwtest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GATEWAY_PG_DSN: postgres://gateway:gateway@127.0.0.1:5432/gwtest?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run pgsmoke against real Postgres
+        run: |
+          set -euo pipefail
+          # -v so the skip guard below can see per-test SKIP lines.
+          go test ./internal/db/pgsmoke -count=1 -v 2>&1 | tee /tmp/pgsmoke.log
+
+      # A skipped suite is not a passing suite. Without GATEWAY_PG_DSN every
+      # test self-skips (pgsmoke/main_test.go), so a broken DSN, a typo in the
+      # service name or a dropped service container would otherwise report
+      # green while testing nothing.
+      - name: "Guard: no skips allowed"
+        if: always()
+        run: |
+          set -euo pipefail
+          log=/tmp/pgsmoke.log
+          if [ ! -f "$log" ]; then
+            echo "::error::pgsmoke produced no output — the suite did not run"
+            exit 1
+          fi
+
+          skipped="$(grep -E '^\s*--- SKIP' "$log" || true)"
+          if [ -n "$skipped" ]; then
+            echo "::error::pgsmoke skipped tests instead of running them (GATEWAY_PG_DSN must be set):"
+            echo "$skipped"
+            exit 1
+          fi
+
+          # Independently require that the dialect-critical tests were actually
+          # executed. A package-level skip or a rename that silently drops a
+          # test must not read as success.
+          for t in TestCapabilityFlagWritesAgainstPostgres \
+                   TestCapabilityColumnsAreIntegerOnPostgres \
+                   TestVideoJobsSchemaOnPostgres \
+                   TestMigrateReplayOnMigratedPostgresDatabase; do
+            if ! grep -qE "^\s*--- PASS: ${t}\b" "$log"; then
+              echo "::error::expected test ${t} did not pass — see the log above"
+              exit 1
+            fi
+          done
+          echo "pgsmoke ran against Postgres with no skips"
+
+      - name: Upload pgsmoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgsmoke-log
+          path: /tmp/pgsmoke.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  openapi:
+    name: OpenAPI spec validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install openapi-spec-validator
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "openapi-spec-validator==${OPENAPI_SPEC_VALIDATOR_VERSION}"
+
+      # P0-5 lives here: unquoted commas in YAML and undeclared {id} path params
+      # make the spec invalid, and it is served to clients at /openapi.yaml.
+      - name: Validate openapi.yaml
+        run: |
+          set -euo pipefail
+          openapi-spec-validator openapi.yaml
+
+      # The binary serves the EMBEDDED copy (cmd/gateway/openapi.yaml via
+      # //go:embed), not the root file, so an invalid or stale embedded copy is
+      # visible to clients even when the root spec validates. This gate is
+      # BLOCKING: the embedded copy had silently drifted and did not even parse
+      # as YAML, which meant /openapi.yaml served a broken document to every
+      # client while the root file validated. Keep the two byte-identical.
+      - name: Validate embedded spec
+        run: |
+          set -euo pipefail
+          if [ ! -f cmd/gateway/openapi.yaml ]; then
+            echo "::error file=cmd/gateway/openapi.yaml::embedded spec missing; /openapi.yaml will not be served"
+            exit 1
+          fi
+          if ! openapi-spec-validator cmd/gateway/openapi.yaml; then
+            echo "::error file=cmd/gateway/openapi.yaml::the EMBEDDED spec served at /openapi.yaml is invalid — regenerate it from openapi.yaml"
+            exit 1
+          fi
+          if ! diff -q openapi.yaml cmd/gateway/openapi.yaml >/dev/null; then
+            echo "::error file=cmd/gateway/openapi.yaml::embedded spec has drifted from openapi.yaml — clients of /openapi.yaml get the stale copy. Run: cp openapi.yaml cmd/gateway/openapi.yaml"
+            exit 1
+          fi
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Pinned binary, not the action: the action's version-is-latest default
+      # makes the gate non-reproducible, and .golangci.yml is a v2 config.
+      - name: Install golangci-lint
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/golangci-lint.tar.gz \
+            "https://github.com/golangci/golangci-lint/releases/download/${GOLANGCI_LINT_VERSION}/golangci-lint-${GOLANGCI_LINT_VERSION#v}-linux-amd64.tar.gz"
+          tar -xzf /tmp/golangci-lint.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/golangci-lint-${GOLANGCI_LINT_VERSION#v}-linux-amd64/golangci-lint" /usr/local/bin/golangci-lint
+          golangci-lint version
+
+      # Blocking at zero issues. .golangci.yml enables only the linters the tree
+      # is currently clean under (govet, misspell); the debt in errcheck /
+      # revive / unused / staticcheck is tracked by `make lint-debt` and moves
+      # into that file as it is cleared. A tolerance setting here would let new
+      # findings hide among old ones, which is the failure mode this replaces.
+      - name: golangci-lint run
+        run: golangci-lint run --timeout 5m ./...
 
   frontend:
     name: Web UI typecheck / build
@@ -51,7 +247,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -59,14 +255,18 @@ jobs:
         run: npm ci
 
       - name: Typecheck
-        run: npx tsc --noEmit
+        # `tsc -b` (project references) is what `npm run build` runs and what
+        # the Dockerfile relies on; --noEmit is not compatible with -b.
+        run: npx tsc -b
 
-      - name: Build
+      - name: Build (also runs scripts/check-bundle.mjs)
         run: npm run build
 
   docker:
     name: Docker image build
-    needs: backend
+    # The image embeds cmd/gateway/web via go:embed, so a broken UI must not be
+    # able to go green behind the image build.
+    needs: [backend, frontend]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +274,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # The Dockerfile now builds the web UI inside the image (node stage), so
+      # this job also proves the embed input exists from a clean checkout —
+      # the failure mode that used to need a committed cmd/gateway/web.
       - name: Build image (no push)
         uses: docker/build-push-action@v6
         with:
@@ -81,3 +284,39 @@ jobs:
           push: false
           load: true
           tags: ai-gateway:ci
+
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          docker run -d --name gw-ci -p 18080:8080 \
+            -e PORT=8080 \
+            -e ADMIN_PASSWORD=ci-not-a-real-password \
+            -e DATABASE_URL=/data/gateway.db \
+            ai-gateway:ci
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:18080/health" -o /tmp/health.json; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            docker logs gw-ci || true
+            docker rm -f gw-ci >/dev/null 2>&1 || true
+            echo "::error::container never answered GET /health" >&2
+            exit 1
+          fi
+          cat /tmp/health.json
+
+          # The embedded UI must be served: the image builds web/ itself, so a
+          # missing or broken build here is exactly the regression this guards.
+          curl -fsS "http://127.0.0.1:18080/" -o /tmp/index.html
+          grep -q 'id="root"' /tmp/index.html
+
+          # The embedded OpenAPI doc is served too (and is a separate go:embed).
+          curl -fsS "http://127.0.0.1:18080/openapi.yaml" -o /tmp/openapi.yaml
+          head -1 /tmp/openapi.yaml | grep -q '^openapi:'
+
+          docker rm -f gw-ci >/dev/null 2>&1 || true
+          echo "image serves /health, the embedded UI and /openapi.yaml"

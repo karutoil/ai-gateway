@@ -27,6 +27,7 @@ import (
 // | PUBLIC_URL           | no       | ""                  | https://gateway.example.com — public URL for Cloudflare Tunnel / reverse proxy. Used for CORS + logs |
 // | CORS_ALLOWED_ORIGINS | no       | "" (= *)            | comma-separated origins, e.g. https://app.example.com,https://ai.example.com. Overrides PUBLIC_URL. Supports "*" |
 // | TRUSTED_PROXIES      | no       | ""                  | comma-separated IPs/CIDRs trusted for X-Forwarded-* / CF-Connecting-IP (empty = loopback only; "*" trusts all) |
+// | IMAGE_TIMEOUT_SECONDS| no       | 300                 | client first-byte budget for /v1/images/*: -1/unset = 300s default, 0 = disabled, N = N seconds |
 
 type Config struct {
 	Port               string
@@ -79,9 +80,44 @@ type Config struct {
 	RoutingLegacyFallback bool
 
 	MetricsRequireAuth bool
+
+	// ImageTimeoutSecs is the client-facing first-byte budget for
+	// /v1/images/generations and /v1/images/edits. Image generation is
+	// legitimately slow (10–60s+), so it must NOT inherit the 85s chat TTFB
+	// default.
+	//
+	// Tri-state, mirrored by proxy.Handler.ImageTTFB:
+	//
+	//	< 0  (unset, or IMAGE_TIMEOUT_SECONDS=-1) -> built-in default (300s)
+	//	== 0                                    -> budget DISABLED
+	//	> 0                                     -> that many seconds
+	//
+	// Parsing uses getIntSigned rather than getInt: the generic getInt helper
+	// rejects any non-digit character, which silently made the -1 sentinel
+	// unreachable from the environment and collapsed "disabled" onto
+	// "default".
+	ImageTimeoutSecs int
+
+	// Centralized MCP (Model Context Protocol) registry + unified /mcp
+	// endpoint.
+	//
+	// MCPMaxRounds caps the gateway-side tool-execution loop for requests that
+	// opt in with require_approval:"never". It exists to make an unbounded
+	// model/tool ping-pong impossible: a model that keeps calling tools would
+	// otherwise loop forever inside one client request.
+	MCPMaxRounds int
+	// MCPCallTimeoutSecs bounds one MCP operation (connect / list / call) and
+	// one LLM round inside the loop.
+	MCPCallTimeoutSecs int
+	// MCPLoopTimeoutSecs bounds the whole tool loop for one client request.
+	MCPLoopTimeoutSecs int
+	// MCPHealthIntervalSecs is how often enabled MCP servers are probed and
+	// reconnected by the background health loop.
+	MCPHealthIntervalSecs int
 }
 
-// getInt reads an integer env var with default fallback.
+// getInt reads an integer env var with default fallback. Digits only: it is
+// used by knobs where a negative value has no meaning.
 func getInt(name string, def int) int {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -93,6 +129,35 @@ func getInt(name string, def int) int {
 			return def
 		}
 		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+// getIntSigned reads an integer env var that may legitimately be negative, with
+// a default fallback for unset/malformed values. Used by tri-state knobs where
+// -1 is a meaningful sentinel (e.g. IMAGE_TIMEOUT_SECONDS).
+func getIntSigned(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	neg := false
+	if strings.HasPrefix(v, "-") {
+		neg = true
+		v = v[1:]
+	}
+	if v == "" {
+		return def
+	}
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+	}
+	if neg {
+		return -n
 	}
 	return n
 }
@@ -390,6 +455,17 @@ func Load() (*Config, error) {
 		RoutingLegacyFallback: getBool("ROUTING_LEGACY_FALLBACK"),
 
 		MetricsRequireAuth: getBool("METRICS_PROTECT"),
+
+		// Image endpoints get their own first-byte budget: image generation
+		// routinely exceeds the 85s chat budget. -1 = built-in default (300s).
+		ImageTimeoutSecs: getIntSigned("IMAGE_TIMEOUT_SECONDS", -1),
+
+		// Centralized MCP. 25 rounds matches the LiteLLM-compatible default
+		// documented for gateway-side tool execution.
+		MCPMaxRounds:          getInt("MCP_MAX_ROUNDS", 25),
+		MCPCallTimeoutSecs:    getInt("MCP_CALL_TIMEOUT_SECONDS", 90),
+		MCPLoopTimeoutSecs:    getInt("MCP_LOOP_TIMEOUT_SECONDS", 600),
+		MCPHealthIntervalSecs: getInt("MCP_HEALTH_INTERVAL_SECONDS", 60),
 	}
 	// Wildcard CORS is incompatible with a hardened control plane.
 	if cfg.Production && !allowInsecure {

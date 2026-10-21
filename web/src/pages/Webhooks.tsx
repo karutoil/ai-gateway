@@ -42,7 +42,7 @@ export default function Webhooks() {
   const [testing, setTesting] = useState<string | null>(null)
 
   const load = () => api.webhooks.list()
-    .then((h: any) => setHooks(Array.isArray(h) ? h : []))
+    .then((h: any) => { setHooks(Array.isArray(h) ? h : []); setErr('') })
     .catch(e => setErr(e?.message || String(e)))
     .finally(() => setLoading(false))
 
@@ -65,6 +65,10 @@ export default function Webhooks() {
       name: editing.name.trim(),
       url: editing.url.trim(),
       events: events.join(','),
+      // The format picker was rendered but never sent: the payload shape stayed
+      // whatever it was on create, and PUT (which defaults an empty format to
+      // "json") silently downgraded a Discord/Slack hook on any edit.
+      format: editing.format || 'json',
       enabled: editing.enabled !== false,
     }
     try {
@@ -119,7 +123,8 @@ export default function Webhooks() {
         }
       />
 
-      {err && <Card><EmptyState icon="alert" title="Could not load webhooks" hint={err} /></Card>}
+      {err && <Card><EmptyState icon="alert" title="Could not load webhooks" hint={err}
+        action={<Button variant="secondary" onClick={() => { setLoading(true); load() }}><Icon name="refresh" size={15}/>Retry</Button>} /></Card>}
 
       {!err && loading && (
         <Card className="space-y-3">

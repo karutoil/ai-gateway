@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"ai-gateway/internal/cache"
 	"ai-gateway/internal/catalog"
 	"ai-gateway/internal/db"
+	"ai-gateway/internal/decision"
+	"ai-gateway/internal/imagegen"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/provider"
+	"ai-gateway/internal/videogen"
 
 	"github.com/google/uuid"
 )
@@ -57,6 +61,18 @@ func (s *Service) Discover(providerID string) (int, error) {
 	if p.Type == models.ProviderDevin {
 		return s.discoverDevin(p)
 	}
+	// Cloudflare Workers AI has no /v1/models listing for decision models
+	// (the model is addressed in the path), so seed the curated Clef family.
+	if p.Type == models.ProviderCloudflare {
+		return s.seedDecisionModels(p)
+	}
+	// Google Gemini exposes its own models listing (models/… with the key in
+	// the query string), not an [OI] /models route. Probe it, then always
+	// merge the curated image registry so Nano Banana / Imagen rows exist
+	// even when the listing omits them.
+	if p.Type == models.ProviderGoogle {
+		return s.discoverGoogle(p)
+	}
 	apiKey, err := s.providerStore.DecryptKey(p)
 	if err != nil {
 		return 0, err
@@ -96,6 +112,17 @@ func (s *Service) Discover(providerID string) (int, error) {
 		}
 	}
 	if len(fetched) == 0 {
+		// A generic systemone provider (Kev / llama.cpp) normally exposes
+		// /v1/models; when it does not, fall back to the curated registry so
+		// its decision models are still routable.
+		if p.Type == models.ProviderSystemOne {
+			return s.seedDecisionModels(p)
+		}
+		// xAI exposes /v1/models for chat but the curated image models
+		// (grok-2-image, grok-imagine) may not appear in every listing.
+		if p.Type == models.ProviderXAI {
+			return s.seedImageModels(p, "xai")
+		}
 		return 0, fmt.Errorf("no models discovered (check provider base_url and key)")
 	}
 	count := 0
@@ -104,10 +131,92 @@ func (s *Service) Discover(providerID string) (int, error) {
 			count++
 		}
 	}
+	if p.Type == models.ProviderXAI {
+		// xAI is [OI]-compatible: discovered chat models plus the curated
+		// image models (which bill per image).
+		if n, err := s.seedImageModels(p, "xai"); err == nil {
+			count += n
+		}
+		if n, err := s.seedVideoModels(p, "xai"); err == nil {
+			count += n
+		}
+	}
 	if s.Cache != nil && count > 0 {
 		s.Cache.Invalidate("models:")
 	}
 	return count, nil
+}
+
+// discoverGoogle probes Google's native models listing and merges the curated
+// image registry. The listing (GET {base}/v1beta/models?key=…) carries
+// `models/…` names; image models are matched against the curated registry so
+// they are flagged as image models even without modality metadata.
+func (s *Service) discoverGoogle(p *models.Provider) (int, error) {
+	apiKey, err := s.providerStore.DecryptKey(p)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	if modelsList := s.fetchGoogle(p, apiKey); len(modelsList) > 0 {
+		for _, m := range modelsList {
+			if err := s.upsert(p, m); err == nil {
+				count++
+			}
+		}
+	}
+	if n, err := s.seedImageModels(p, "google"); err == nil {
+		count += n
+	}
+	if n, err := s.seedVideoModels(p, "google"); err == nil {
+		count += n
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("no models discovered (check provider base_url and key)")
+	}
+	if s.Cache != nil {
+		s.Cache.Invalidate("models:")
+	}
+	return count, nil
+}
+
+// fetchGoogle lists Gemini models (GET {base}/v1beta/models?key=API_KEY),
+// which returns {"models":[{"name":"models/gemini-…"}]}.
+func (s *Service) fetchGoogle(p *models.Provider, apiKey string) []rawModel {
+	base := strings.TrimRight(p.BaseURL, "/")
+	if strings.HasSuffix(base, "/v1beta") {
+		base = strings.TrimSuffix(base, "/v1beta")
+	}
+	target := base + "/v1beta/models?key=" + url.QueryEscape(apiKey)
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := s.client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	resp.Body.Close()
+	var list struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(body, &list) != nil {
+		return nil
+	}
+	var out []rawModel
+	for _, m := range list.Models {
+		id := strings.TrimPrefix(m.Name, "models/")
+		if id == "" {
+			continue
+		}
+		out = append(out, rawModel{ID: id, OwnedBy: p.Name})
+	}
+	return out
 }
 
 func (s *Service) fetchOpenAI(p *models.Provider, apiKey string) []rawModel {
@@ -268,10 +377,22 @@ func (s *Service) fetchAnthropic(p *models.Provider, apiKey string) []rawModel {
 type rawModel struct {
 	ID      string
 	OwnedBy string
+	// Decision forces the decision flag on, for models seeded from the
+	// curated registry rather than discovered from an upstream listing.
+	Decision bool
+	// Image forces the image flag on, for models seeded from the curated
+	// image registry rather than discovered from an upstream listing.
+	Image bool
+	// Video forces the video flag on, for models seeded from the curated
+	// video registry rather than discovered from an upstream listing.
+	Video bool
 }
 
 func (s *Service) upsert(p *models.Provider, m rawModel) error {
 	e := s.enrichFor(m.ID)
+	e.decision = e.decision || m.Decision
+	e.image = e.image || m.Image
+	e.video = e.video || m.Video
 	// check existing to preserve manual overrides
 	var existingID string
 	var existingSource string
@@ -286,13 +407,13 @@ func (s *Service) upsert(p *models.Provider, m rawModel) error {
 		return nil
 	}
 	if err == nil {
-		_, err = s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, source=?, updated_at=? WHERE id=?`),
-			m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), existingID)
+		_, err = s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, decision=?, image=?, video=?, source=?, updated_at=? WHERE id=?`),
+			m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, db.BoolInt(e.decision), db.BoolInt(e.image), db.BoolInt(e.video), e.source, time.Now().UTC(), existingID)
 		return err
 	}
 	id := uuid.NewString()
-	_, err = s.db.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
-		id, p.ID, m.ID, m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), time.Now().UTC())
+	_, err = s.db.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, decision, image, video, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+		id, p.ID, m.ID, m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, db.BoolInt(e.decision), db.BoolInt(e.image), db.BoolInt(e.video), e.source, time.Now().UTC(), time.Now().UTC())
 	return err
 }
 
@@ -307,6 +428,9 @@ type enrichment struct {
 	modalities                     string
 	reasoningType, reasoningLevels string
 	reasoningLimits, source        string
+	decision                       bool
+	image                          bool
+	video                          bool
 }
 
 // enrichFor resolves catalog detail for any upstream model ID, including
@@ -315,24 +439,93 @@ type enrichment struct {
 // estimated pricing stays distinguishable; misses stay "discovered".
 func (s *Service) enrichFor(modelID string) enrichment {
 	e := enrichment{source: "discovered"}
-	if s.catalogStore == nil {
-		return e
+	if s.catalogStore != nil {
+		if cm, kind, err := s.catalogStore.FindBestMatch(modelID); err == nil {
+			e.ctx, e.maxOut = cm.ContextWindow, cm.MaxOutput
+			e.inputCost, e.outputCost = cm.InputCost, cm.OutputCost
+			e.cacheReadCost, e.cacheWriteCost = cm.CacheReadCost, cm.CacheWriteCost
+			e.reasoning, e.toolCall, e.structuredOutput, e.attachment = cm.Reasoning, cm.ToolCall, cm.StructuredOutput, cm.Attachment
+			e.modalities = cm.Modalities
+			e.reasoningType, e.reasoningLevels, e.reasoningLimits = cm.ReasoningType, cm.ReasoningLevels, cm.ReasoningOutputLimits
+			e.decision = cm.Decision
+			e.image = cm.Image
+			e.video = cm.Video
+			e.source = "enriched"
+			if kind == "wildcard" {
+				e.source = "enriched-wildcard"
+			}
+		}
 	}
-	cm, kind, err := s.catalogStore.FindBestMatch(modelID)
-	if err != nil {
-		return e
+	// Curated decision registry fallback: a decision model is recognized even
+	// when the catalog snapshot has not caught up with the release, so it is
+	// listed with the right capabilities and (input-only) pricing.
+	if dm, ok := decision.Lookup(modelID); ok {
+		e.decision = true
+		if e.ctx == 0 {
+			e.ctx = dm.ContextWindow
+		}
+		if e.inputCost == 0 && dm.InputCostPerM > 0 {
+			e.inputCost = dm.InputCostPerM
+		}
+		if e.outputCost == 0 {
+			e.outputCost = dm.OutputCostPerM
+		}
+		if e.modalities == "" {
+			e.modalities = dm.ModalitiesJSON()
+		}
+		if e.source == "discovered" {
+			e.source = "decision"
+		}
 	}
-	e.ctx, e.maxOut = cm.ContextWindow, cm.MaxOutput
-	e.inputCost, e.outputCost = cm.InputCost, cm.OutputCost
-	e.cacheReadCost, e.cacheWriteCost = cm.CacheReadCost, cm.CacheWriteCost
-	e.reasoning, e.toolCall, e.structuredOutput, e.attachment = cm.Reasoning, cm.ToolCall, cm.StructuredOutput, cm.Attachment
-	e.modalities = cm.Modalities
-	e.reasoningType, e.reasoningLevels, e.reasoningLimits = cm.ReasoningType, cm.ReasoningLevels, cm.ReasoningOutputLimits
-	e.source = "enriched"
-	if kind == "wildcard" {
-		e.source = "enriched-wildcard"
+	// Curated image-model registry fallback: an image model is recognized even
+	// when the catalog snapshot has not caught up with the release, so it is
+	// listed with the right capability (and can be routed to the images
+	// endpoint) instead of being mistaken for a chat model.
+	//
+	// models.dev modality data wins when present: ORing the curated registry in
+	// unconditionally flagged rows models.dev reports as text-only, producing a
+	// row that claimed image output while advertising `output: ["text"]`.
+	if im, ok := imagegen.Lookup(modelID); ok {
+		if len(imagegen.OutputModalities(e.modalities)) > 0 {
+			e.image = imagegen.ImageModality(e.modalities)
+		} else {
+			e.image = true
+			e.modalities = im.ModalitiesJSON()
+		}
+		if e.source == "discovered" {
+			e.source = "image"
+		}
+	}
+	// Curated video-model registry fallback (same precedence rule as images:
+	// models.dev modalities win when present).
+	if vm, ok := videogen.Lookup(modelID); ok {
+		if len(videogen.OutputModalities(e.modalities)) > 0 {
+			e.video = videogen.VideoModality(e.modalities)
+		} else {
+			e.video = true
+			e.modalities = vm.ModalitiesJSON()
+		}
+		if e.source == "discovered" {
+			e.source = "video"
+		}
 	}
 	return e
+}
+
+// seedDecisionModels inserts the curated decision-model registry for a
+// provider that cannot be discovered over /v1/models (Cloudflare Workers AI,
+// or a systemone server with no listing endpoint).
+func (s *Service) seedDecisionModels(p *models.Provider) (int, error) {
+	count := 0
+	for _, dm := range decision.All() {
+		if err := s.upsert(p, rawModel{ID: dm.ID, OwnedBy: p.Name, Decision: true}); err == nil {
+			count++
+		}
+	}
+	if s.Cache != nil && count > 0 {
+		s.Cache.Invalidate("models:")
+	}
+	return count, nil
 }
 
 // List returns provider_models with provider join, filtered
@@ -348,7 +541,7 @@ func (s *Service) List(providerID, q string) ([]models.ProviderModel, error) {
 		like := "%" + q + "%"
 		args = append(args, like, like, like, like)
 	}
-	rows, err := s.db.Query(db.Q(`SELECT pm.id, pm.provider_id, pm.model_id, pm.display_name, pm.owned_by, pm.context_window, pm.max_output, pm.input_cost, pm.output_cost, pm.cache_read_cost, pm.cache_write_cost, pm.reasoning, pm.tool_call, pm.structured_output, pm.attachment, pm.modalities, pm.source, pm.created_at, pm.updated_at, pm.reasoning_type, pm.reasoning_levels, pm.reasoning_output_limits, p.name FROM provider_models pm JOIN providers p ON p.id=pm.provider_id WHERE `+where+` ORDER BY p.name ASC, pm.model_id ASC LIMIT 500`), args...)
+	rows, err := s.db.Query(db.Q(`SELECT pm.id, pm.provider_id, pm.model_id, pm.display_name, pm.owned_by, pm.context_window, pm.max_output, pm.input_cost, pm.output_cost, pm.cache_read_cost, pm.cache_write_cost, pm.reasoning, pm.tool_call, pm.structured_output, pm.attachment, pm.modalities, pm.source, pm.created_at, pm.updated_at, pm.reasoning_type, pm.reasoning_levels, pm.reasoning_output_limits, pm.decision, pm.image, pm.video, p.name FROM provider_models pm JOIN providers p ON p.id=pm.provider_id WHERE `+where+` ORDER BY p.name ASC, pm.model_id ASC LIMIT 500`), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -359,8 +552,9 @@ func (s *Service) List(providerID, q string) ([]models.ProviderModel, error) {
 		var cc, cw sql.NullFloat64
 		var rn, tl, so, at sql.NullBool
 		var rt, rl, rol sql.NullString
+		var dec, img, vid sql.NullInt64
 		var provName string
-		if err := rows.Scan(&pm.ID, &pm.ProviderID, &pm.ModelID, &pm.DisplayName, &pm.OwnedBy, &pm.ContextWindow, &pm.MaxOutput, &pm.InputCost, &pm.OutputCost, &cc, &cw, &rn, &tl, &so, &at, &pm.Modalities, &pm.Source, &pm.CreatedAt, &pm.UpdatedAt, &rt, &rl, &rol, &provName); err != nil {
+		if err := rows.Scan(&pm.ID, &pm.ProviderID, &pm.ModelID, &pm.DisplayName, &pm.OwnedBy, &pm.ContextWindow, &pm.MaxOutput, &pm.InputCost, &pm.OutputCost, &cc, &cw, &rn, &tl, &so, &at, &pm.Modalities, &pm.Source, &pm.CreatedAt, &pm.UpdatedAt, &rt, &rl, &rol, &dec, &img, &vid, &provName); err != nil {
 			continue
 		}
 		if cc.Valid {
@@ -390,6 +584,9 @@ func (s *Service) List(providerID, q string) ([]models.ProviderModel, error) {
 		if rol.Valid {
 			pm.ReasoningOutputLimits = rol.String
 		}
+		pm.Decision = dec.Int64 != 0
+		pm.Image = img.Int64 != 0
+		pm.Video = vid.Int64 != 0
 		pm.ProviderName = provName
 		out = append(out, pm)
 	}
@@ -421,14 +618,14 @@ func (s *Service) Enrich(providerModelID string) error {
 		}
 	}
 	e := s.enrichFor(modelID)
-	_, err = s.db.Exec(db.Q(`UPDATE provider_models SET context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, source=?, updated_at=? WHERE id=?`),
-		e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), providerModelID)
+	_, err = s.db.Exec(db.Q(`UPDATE provider_models SET context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, decision=?, image=?, video=?, source=?, updated_at=? WHERE id=?`),
+		e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, db.BoolInt(e.decision), db.BoolInt(e.image), db.BoolInt(e.video), e.source, time.Now().UTC(), providerModelID)
 	return err
 }
 
 func (s *Service) UpdateManual(id string, upd models.ProviderModel) error {
-	_, err := s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, source=?, updated_at=? WHERE id=?`),
-		upd.DisplayName, upd.OwnedBy, upd.ContextWindow, upd.MaxOutput, upd.InputCost, upd.OutputCost, upd.Reasoning, upd.ToolCall, upd.StructuredOutput, upd.Attachment, upd.Modalities, upd.ReasoningType, upd.ReasoningLevels, upd.ReasoningOutputLimits, "manual", time.Now().UTC(), id)
+	_, err := s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, decision=?, image=?, video=?, source=?, updated_at=? WHERE id=?`),
+		upd.DisplayName, upd.OwnedBy, upd.ContextWindow, upd.MaxOutput, upd.InputCost, upd.OutputCost, upd.Reasoning, upd.ToolCall, upd.StructuredOutput, upd.Attachment, upd.Modalities, upd.ReasoningType, upd.ReasoningLevels, upd.ReasoningOutputLimits, db.BoolInt(upd.Decision), db.BoolInt(upd.Image), db.BoolInt(upd.Video), "manual", time.Now().UTC(), id)
 	return err
 }
 
@@ -488,8 +685,8 @@ func (s *Service) AddManual(providerID, modelID string, upd models.ProviderModel
 		tx.Rollback()
 		return "", err
 	}
-	_, err = tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
-		id, providerID, modelID, upd.DisplayName, upd.OwnedBy, ctx, maxOut, upd.InputCost, upd.OutputCost, upd.CacheReadCost, upd.CacheWriteCost, upd.Reasoning, upd.ToolCall, upd.StructuredOutput, upd.Attachment, upd.Modalities, upd.ReasoningType, upd.ReasoningLevels, upd.ReasoningOutputLimits, "manual", time.Now().UTC(), time.Now().UTC())
+	_, err = tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, decision, image, video, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+		id, providerID, modelID, upd.DisplayName, upd.OwnedBy, ctx, maxOut, upd.InputCost, upd.OutputCost, upd.CacheReadCost, upd.CacheWriteCost, upd.Reasoning, upd.ToolCall, upd.StructuredOutput, upd.Attachment, upd.Modalities, upd.ReasoningType, upd.ReasoningLevels, upd.ReasoningOutputLimits, db.BoolInt(upd.Decision), db.BoolInt(upd.Image), db.BoolInt(upd.Video), "manual", time.Now().UTC(), time.Now().UTC())
 	if err != nil {
 		tx.Rollback()
 		return "", err
@@ -575,8 +772,8 @@ func (s *Service) Restore(exclusionID string) (string, error) {
 		}
 		newID = uuid.NewString()
 		now := time.Now().UTC()
-		_, err = tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, reasoning_routing, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
-			newID, providerID, modelID, snap.DisplayName, snap.OwnedBy, snap.ContextWindow, snap.MaxOutput, snap.InputCost, snap.OutputCost, snap.CacheReadCost, snap.CacheWriteCost, snap.Reasoning, snap.ToolCall, snap.StructuredOutput, snap.Attachment, snap.Modalities, snap.ReasoningType, snap.ReasoningLevels, snap.ReasoningOutputLimits, snap.ReasoningRouting, snap.Source, snap.CreatedAt, now)
+		_, err = tx.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, decision, image, video, reasoning_routing, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+			newID, providerID, modelID, snap.DisplayName, snap.OwnedBy, snap.ContextWindow, snap.MaxOutput, snap.InputCost, snap.OutputCost, snap.CacheReadCost, snap.CacheWriteCost, snap.Reasoning, snap.ToolCall, snap.StructuredOutput, snap.Attachment, snap.Modalities, snap.ReasoningType, snap.ReasoningLevels, snap.ReasoningOutputLimits, db.BoolInt(snap.Decision), db.BoolInt(snap.Image), db.BoolInt(snap.Video), snap.ReasoningRouting, snap.Source, snap.CreatedAt, now)
 	} else {
 		newID, err = s.restoreBare(tx, providerID, modelID)
 	}
@@ -652,4 +849,36 @@ func isMultiProvider(p *models.Provider) bool {
 		}
 	}
 	return false
+}
+
+// seedImageModels inserts the curated image-generation registry for a provider
+// namespace ("google", "xai"). Image models are addressable through
+// /v1/images/generations and bill per generated image.
+func (s *Service) seedImageModels(p *models.Provider, namespace string) (int, error) {
+	count := 0
+	for _, im := range imagegen.ForNamespace(namespace) {
+		if err := s.upsert(p, rawModel{ID: im.ID, OwnedBy: p.Name, Image: true}); err == nil {
+			count++
+		}
+	}
+	if s.Cache != nil && count > 0 {
+		s.Cache.Invalidate("models:")
+	}
+	return count, nil
+}
+
+// seedVideoModels inserts the curated video-generation registry for a provider
+// namespace ("openai", "google", "xai"). Video models are addressable through
+// the async /v1/videos job API and bill per generated second.
+func (s *Service) seedVideoModels(p *models.Provider, namespace string) (int, error) {
+	count := 0
+	for _, vm := range videogen.ForNamespace(namespace) {
+		if err := s.upsert(p, rawModel{ID: vm.ID, OwnedBy: p.Name, Video: true}); err == nil {
+			count++
+		}
+	}
+	if s.Cache != nil && count > 0 {
+		s.Cache.Invalidate("models:")
+	}
+	return count, nil
 }

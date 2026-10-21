@@ -35,13 +35,18 @@ html.light {
   --c-paper: 11 18 32;           /* slate ink text     */
   --c-stone: 226 231 239;
   --c-muted: 91 102 122;
-  --c-danger: 220 38 38;
+  /* red-700 / amber-800 rather than red-500 / amber-600: the mid tones only
+     reach 4.13:1 / 4.39:1 on their own /10 tinted backgrounds, below WCAG AA
+     for normal text. These still read as "danger"/"warning" and clear 4.5:1 on
+     the surface, on their 5% tints and at the 10–11px sizes used in the
+     playground. */
+  --c-danger: 185 28 28;
   --c-good: 4 120 87;
   --c-accent: 79 70 229;         /* indigo-600         */
   --c-onaccent: 255 255 255;
   --c-ink: 17 24 39;             /* plates stay dark   */
   --c-cream: 241 245 249;
-  --c-amber: 180 83 9;
+  --c-amber: 146 64 14;
 
   --shadow-card: 0 1px 2px rgb(11 18 32 / 0.06);
   --shadow-pop: 0 16px 40px -12px rgb(11 18 32 / 0.22);

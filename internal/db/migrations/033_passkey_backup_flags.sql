@@ -1,0 +1,19 @@
+-- 033_passkey_backup_flags.sql — persist WebAuthn backup-eligibility flags.
+--
+-- go-webauthn validates at login (webauthn/login.go "Backup Eligible flag
+-- inconsistency detected during login validation") that the STORED
+-- credential's BackupEligible flag matches the flag in the fresh assertion.
+-- Synced passkeys (iCloud Keychain, 1Password, Bitwarden, Windows Hello
+-- synced to Microsoft account, ...) always set BE=1. The passkey store never
+-- persisted that flag — it hardcoded BackupEligible=false when loading
+-- credentials — so every login with a synced passkey failed with 401.
+--
+-- backup_eligible is new (BE is immutable per spec: set once at creation).
+-- backed_up (BackupState) already existed in the 003 schema but was never
+-- written; it IS mutable (the authenticator's backup state can change), so
+-- the login path refreshes it via UPDATE alongside the signature counter.
+--
+-- Existing rows backfill to backup_eligible=0. Any row enrolled as a synced
+-- passkey before this fix must be re-enrolled (or backfilled from a known
+-- BE=1 assertion) — its true flag value was never recorded.
+ALTER TABLE webauthn_credentials ADD COLUMN backup_eligible INTEGER NOT NULL DEFAULT 0;

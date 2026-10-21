@@ -1,4 +1,8 @@
 # Standby gateway (Podman). Postgres runs natively; Redis runs alongside.
+#
+# Invariant (same as the primary and the local stack): SHUTDOWN_GRACE_SECONDS
+# must be >= IMAGE_TIMEOUT_SECONDS, or a failover/restart cancels in-flight image
+# generations (502 to the client, billing row lost). See deploy/README.md §1.
 services:
   gateway:
     image: ai-gateway:standby
@@ -12,8 +16,23 @@ services:
       - /etc/ai-gateway/env
     environment:
       PORT: 8090
+      # Visible in `compose config`; overridable from /etc/ai-gateway/env.
+      IMAGE_TIMEOUT_SECONDS: ${IMAGE_TIMEOUT_SECONDS:-300}
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-330}
     volumes:
       - gateway-data:/data
+    healthcheck:
+      # Single CMD-SHELL string, not the exec-form list: podman-compose rewrites
+      # a list-form `test:` into `/bin/sh -c <shell-quoted args>` and mangles
+      # ["CMD", "/bin/bash", "-c", ...] into `/bin/sh -c /bin/bash' '-c' '...'`.
+      # dash has no /dev/tcp, so the probe failed and a healthy gateway reported
+      # unhealthy. See deploy/production/podman-compose.prod.yml for the detail.
+      test: ["CMD-SHELL", "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090; printf \"GET /health HTTP/1.0\\r\\n\\r\\n\" >&3; head -1 <&3 | grep -q \" 200 \"'"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    stop_grace_period: 360s
     restart: unless-stopped
 
   redis:

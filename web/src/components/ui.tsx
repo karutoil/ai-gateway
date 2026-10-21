@@ -6,8 +6,9 @@
  * Pages compose primitives; they never hand-roll raw control styling.
  * See ../DESIGN.md for the full spec.
  */
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
+import { createContext, forwardRef, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { create } from 'zustand'
+import { copyText } from '../lib/clipboard'
 
 /* ------------------------------------------------------------------ */
 /* Icons — inline stroke SVGs; no runtime dependency.                  */
@@ -20,7 +21,8 @@ export type IconName =
   | 'search' | 'refresh' | 'menu' | 'logout' | 'shield' | 'zap' | 'lock' | 'external'
   | 'download' | 'sparkles' | 'layers' | 'globe' | 'terminal' | 'sliders'
   | 'arrowRight' | 'activity' | 'wallet' | 'gauge' | 'bell' | 'clock' | 'eye'
-  | 'command' | 'inbox' | 'filter'
+  | 'command' | 'inbox' | 'filter' | 'paperclip' | 'send' | 'stop' | 'image'
+  | 'file' | 'panelLeft' | 'panelRight' | 'maximize' | 'messageSquare' | 'user'
 
 const paths: Record<IconName, ReactNode> = {
   download: (<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></>),
@@ -52,6 +54,16 @@ const paths: Record<IconName, ReactNode> = {
   alert: (<><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></>),
   search: (<><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>),
   filter: (<><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" /></>),
+  paperclip: <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />,
+  send: (<><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></>),
+  stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
+  image: (<><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></>),
+  file: (<><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><polyline points="13 2 13 9 20 9" /></>),
+  panelLeft: (<><rect x="3" y="3" width="18" height="18" rx="2" /><line x1="9" y1="3" x2="9" y2="21" /></>),
+  panelRight: (<><rect x="3" y="3" width="18" height="18" rx="2" /><line x1="15" y1="3" x2="15" y2="21" /></>),
+  maximize: (<><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" /></>),
+  messageSquare: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
+  user: (<><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></>),
   refresh: (<><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></>),
   menu: <><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="18" x2="21" y2="18" /></>,
   logout: (<><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" /></>),
@@ -90,11 +102,13 @@ type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'subtle'
 
 export function Button({
   children, onClick, disabled, variant = 'secondary', size = 'md',
-  className = '', type = 'button', title,
+  className = '', type = 'button', title, buttonRef,
 }: {
   children: ReactNode; onClick?: () => void; disabled?: boolean
   variant?: ButtonVariant; size?: 'sm' | 'md' | 'lg'; className?: string
   type?: 'button' | 'submit'; title?: string
+  /** Lets a caller restore focus to this control (dialogs, drawers). */
+  buttonRef?: React.RefObject<HTMLButtonElement>
 }) {
   const base =
     'inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 disabled:opacity-40 disabled:pointer-events-none select-none active:translate-y-px whitespace-nowrap'
@@ -103,11 +117,11 @@ export function Button({
     primary: 'bg-accent text-onaccent hover:opacity-90 shadow-sm',
     secondary: 'border border-stone bg-surface text-paper hover:bg-raised',
     ghost: 'text-muted hover:text-paper hover:bg-raised',
-    danger: 'bg-danger/10 text-danger border border-danger/30 hover:bg-danger/15',
+    danger: 'bg-danger/5 text-danger border border-danger/30 hover:bg-danger/10',
     subtle: 'bg-accent/10 text-accent border border-accent/25 hover:bg-accent/15',
   }
   return (
-    <button type={type} onClick={onClick} disabled={disabled} title={title}
+    <button ref={buttonRef} type={type} onClick={onClick} disabled={disabled} title={title}
       className={`${base} ${sizes} ${variants[variant]} ${className}`}>
       {children}
     </button>
@@ -153,8 +167,8 @@ export function Badge({ children, tone = 'neutral', dot = false }: {
   const tones = {
     neutral: 'bg-raised text-muted border-stone',
     good: 'bg-good/10 text-good border-good/30',
-    warn: 'bg-amber/10 text-amber border-amber/30',
-    bad: 'bg-danger/10 text-danger border-danger/30',
+    warn: 'bg-amber/5 text-amber border-amber/30',
+    bad: 'bg-danger/5 text-danger border-danger/30',
     info: 'bg-accent/10 text-accent border-accent/25',
     brand: 'bg-accent text-onaccent border-transparent',
   }
@@ -175,24 +189,37 @@ export function HealthDot({ health }: { health?: string | null }) {
   return <span title={`health: ${label}`} className={`inline-block w-2 h-2 rounded-full ${color}`} />
 }
 
-export function Progress({ value, tone = 'accent' }: { value: number; tone?: 'accent' | 'amber' | 'red' }) {
+/**
+ * Decorative-by-default bar, exposed as a real progressbar when labelled.
+ * Callers that render async job progress pass `label` so screen readers get
+ * role/valuenow instead of an unannounced div pair.
+ */
+export function Progress({ value, tone = 'accent', label }: { value: number; tone?: 'accent' | 'amber' | 'red'; label?: string }) {
   const bar = tone === 'accent' ? 'bg-accent' : tone === 'amber' ? 'bg-amber' : 'bg-danger'
+  const clamped = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
   return (
-    <div className="h-1 rounded-full bg-raised overflow-hidden">
-      <div className={`h-full rounded-full ${bar} transition-all duration-500`} style={{ width: `${Math.max(2, Math.min(100, value))}%` }} />
+    <div
+      className="h-1 rounded-full bg-raised overflow-hidden"
+      {...(label
+        ? { role: 'progressbar', 'aria-label': label, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(clamped) }
+        : { 'aria-hidden': true as const })}
+    >
+      <div className={`h-full rounded-full ${bar} transition-all duration-500`} style={{ width: `${Math.max(2, clamped)}%` }} />
     </div>
   )
 }
 
-export function Stat({ icon, title, value, sub, tone = 'neutral', delta }: {
+export function Stat({ icon, title, value, sub, tone = 'neutral', delta, valueTitle }: {
   icon: IconName; title: string; value: ReactNode; sub?: string
   tone?: 'neutral' | 'good' | 'warn' | 'bad'; delta?: string
+  /** Exact figure for the value's tooltip, when `value` is abbreviated. */
+  valueTitle?: string
 }) {
   const tones: Record<string, string> = {
     neutral: 'bg-raised text-muted border-stone',
     good: 'bg-good/10 text-good border-good/30',
-    warn: 'bg-amber/10 text-amber border-amber/30',
-    bad: 'bg-danger/10 text-danger border-danger/30',
+    warn: 'bg-amber/5 text-amber border-amber/30',
+    bad: 'bg-danger/5 text-danger border-danger/30',
   }
   return (
     <Card className="group hover:border-muted/40 transition-colors duration-150">
@@ -204,7 +231,10 @@ export function Stat({ icon, title, value, sub, tone = 'neutral', delta }: {
       </div>
       <div className="mt-3">
         <div className="text-xs text-muted font-medium">{title}</div>
-        <div className="text-2xl leading-none font-semibold tabular-nums -tracking-tight mt-1.5 truncate">{value}</div>
+        {/* `title` keeps the exact figure reachable: a 9-digit token count is
+            clipped to "11,446,7…" in a 6-up KPI grid with no way to read it. */}
+        <div className="text-2xl leading-none font-semibold tabular-nums -tracking-tight mt-1.5 truncate"
+          title={valueTitle ?? (typeof value === 'string' || typeof value === 'number' ? String(value) : undefined)}>{value}</div>
         {sub && <div className="text-xs text-muted mt-1.5">{sub}</div>}
       </div>
     </Card>
@@ -228,9 +258,9 @@ export function Field({ label, hint, children, className = '' }: { label: string
   )
 }
 
-export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
-  return <input {...props} className={`${fieldCls} ${props.className || ''}`} />
-}
+export const Input = forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(function Input(props, ref) {
+  return <input {...props} ref={ref} className={`${fieldCls} ${props.className || ''}`} />
+})
 
 export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   return <select {...props} className={`${fieldCls} ${props.className || ''}`} />
@@ -243,29 +273,6 @@ export function Textarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement
 /* ------------------------------------------------------------------ */
 /* Copyable value                                                      */
 /* ------------------------------------------------------------------ */
-
-function copyText(value: string): Promise<'copied' | 'failed'> {
-  if (navigator.clipboard?.writeText) {
-    return navigator.clipboard.writeText(value).then(() => 'copied' as const, () => legacyCopy(value))
-  }
-  return Promise.resolve(legacyCopy(value))
-}
-
-function legacyCopy(value: string): 'copied' | 'failed' {
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = value
-    ta.setAttribute('readonly', '')
-    ta.style.position = 'fixed'
-    ta.style.left = '-9999px'
-    document.body.appendChild(ta)
-    ta.select()
-    ta.setSelectionRange(0, value.length)
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok ? 'copied' : 'failed'
-  } catch { return 'failed' }
-}
 
 export function CopyButton({ value, label, size = 'sm' }: { value: string; label?: string; size?: 'sm' | 'md' }) {
   const [done, setDone] = useState(false)
@@ -348,8 +355,10 @@ export function EmptyState({ icon = 'box', title, hint, action }: { icon?: IconN
 
 export function ErrorNote({ message }: { message: string }) {
   if (!message) return null
+  // Solid surface behind text-danger: the danger/10 tint measured 4.13:1 in the
+  // light theme, below AA for normal text.
   return (
-    <div className="flex items-start gap-2.5 text-sm text-danger bg-danger/10 border border-danger/25 rounded-lg px-3.5 py-3">
+    <div className="flex items-start gap-2.5 text-sm text-danger bg-surface border border-danger/30 rounded-lg px-3.5 py-3" role="alert">
       <Icon name="alert" size={15} className="mt-0.5 shrink-0" />
       <span className="leading-relaxed">{message}</span>
     </div>
@@ -360,21 +369,90 @@ export function ErrorNote({ message }: { message: string }) {
 /* Modal                                                               */
 /* ------------------------------------------------------------------ */
 
+const FOCUSABLE = [
+  'a[href]', 'button:not([disabled])', 'input:not([disabled])', 'select:not([disabled])',
+  'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])',
+].join(',')
+
+/**
+ * Last element focused outside a dialog — i.e. the control that opened it.
+ *
+ * Reading `document.activeElement` inside the modal's own effect is too late:
+ * a dialog whose first field is `autoFocus` (most of them are) has already
+ * moved focus inside by the time the effect runs, so "restore focus" restored
+ * focus to a node that was about to be unmounted and the keyboard user landed
+ * on <body>. Tracking focusin while no dialog is open captures the real
+ * trigger.
+ */
+let lastFocusOutsideDialog: HTMLElement | null = null
+let focusTrackerInstalled = false
+function installFocusTracker() {
+  if (focusTrackerInstalled || typeof document === 'undefined') return
+  focusTrackerInstalled = true
+  document.addEventListener('focusin', (e) => {
+    const t = e.target as HTMLElement | null
+    if (!t || t === document.body || typeof t.closest !== 'function') return
+    if (t.closest('[role="dialog"]')) return
+    lastFocusOutsideDialog = t
+  }, true)
+}
+// Installed at module load (not on first dialog open): the trigger has already
+// received focus by then, and we need to have seen that focusin.
+installFocusTracker()
+
 export function Modal({ open, onClose, title, children, width = 'max-w-lg' }: {
   open: boolean; onClose: () => void; title: string; children: ReactNode; width?: string
 }) {
-  useEffect(() => {
+  const restoreRef = useRef<HTMLElement | null>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  // useLayoutEffect, not useEffect: a passive-effect cleanup runs AFTER React
+  // has already removed the dialog from the DOM, so the focused control inside
+  // it was gone and focus fell to <body> before the restore could run. Layout
+  // cleanups fire before the mutation phase, so the trigger is still there.
+  useLayoutEffect(() => {
     if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    installFocusTracker()
+    // Remember the trigger so closing restores focus instead of dropping the
+    // keyboard user on <body>.
+    restoreRef.current = lastFocusOutsideDialog
+      || (document.activeElement && document.activeElement !== document.body ? document.activeElement as HTMLElement : null)
+    const dialog = dialogRef.current
+    // Move focus into the dialog so the keyboard is not left behind the scrim.
+    const raf = requestAnimationFrame(() => {
+      const first = dialog?.querySelector<HTMLElement>(FOCUSABLE)
+      ;(first || dialog)?.focus()
+    })
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { closeRef.current(); return }
+      if (e.key !== 'Tab' || !dialog) return
+      const items = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(el => el.offsetParent !== null)
+      if (items.length === 0) { e.preventDefault(); dialog.focus(); return }
+      const first = items[0]
+      const last = items[items.length - 1]
+      const active = document.activeElement as HTMLElement | null
+      if (!e.shiftKey && active === last) { e.preventDefault(); first.focus() }
+      else if (e.shiftKey && (active === first || !dialog.contains(active))) { e.preventDefault(); last.focus() }
+    }
     document.addEventListener('keydown', onKey)
+    const previousOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
-    return () => { document.removeEventListener('keydown', onKey); document.body.style.overflow = '' }
-  }, [open, onClose])
+    return () => {
+      cancelAnimationFrame(raf)
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = previousOverflow
+      const restore = restoreRef.current
+      restoreRef.current = null
+      if (restore && document.contains(restore)) restore.focus()
+    }
+  }, [open])
   if (!open) return null
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/60 animate-fade" onClick={onClose} />
-      <div role="dialog" aria-modal="true" aria-label={title} className={`relative w-full ${width} rounded-xl border border-stone bg-surface shadow-pop animate-modal max-h-[88vh] flex flex-col overflow-hidden`}>
+      <div className="absolute inset-0 bg-black/60 animate-fade" onClick={onClose} aria-hidden="true" />
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}
+        className={`relative w-full ${width} rounded-xl border border-stone bg-surface shadow-pop animate-modal max-h-[88vh] flex flex-col overflow-hidden outline-none`}>
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-stone shrink-0">
           <h2 className="font-semibold text-[15px] -tracking-tight">{title}</h2>
           <button onClick={onClose} aria-label="Close"

@@ -121,7 +121,7 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
       <PageHeader
         eyebrow="Govern · Collaboration"
         title="Teams"
-        description="Organizations with role-scoped members. Invite from the user directory — duplicates are rejected."
+        description="Organizations with role-scoped members. Invite existing accounts from the user directory — duplicates are rejected."
         actions={isAdmin ? (
           <Button variant="primary" onClick={openCreate} disabled={loading}>
             <Icon name="plus" size={15}/>New organization
@@ -232,7 +232,7 @@ export default function Teams({ role = 'admin' }: { role?: string }) {
                       <EmptyState icon="users"
                         title={filterRole==='all' ? 'No members yet' : `No ${filterRole}s`}
                         hint={filterRole==='all'
-                          ? 'Invite teammates by user id or email to get started.'
+                          ? 'Invite an existing account from the user directory — there are no email invitations.'
                           : `Nobody has the "${filterRole}" role in this organization.`}/>
                     </td></tr>
                   )}

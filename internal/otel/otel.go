@@ -10,7 +10,12 @@ import (
 )
 
 type Metrics interface {
+	// IncRequests counts one completed request. endpoint should be one of the
+	// Endpoint* constants; see EndpointLabel for the closed set and
+	// internal/otel/README.md for the full label contract.
 	IncRequests(provider, model, endpoint string, status int)
+	// ObserveLatency records the end-to-end latency of one request for a
+	// (provider, endpoint) pair. Same endpoint label set as IncRequests.
 	ObserveLatency(provider, endpoint string, d time.Duration)
 	IncCacheHit(hit bool)
 	// IncZeroCost records a completed request whose recorded cost is $0, by
@@ -22,6 +27,63 @@ type Metrics interface {
 	// ObserveRequest records the cost, token, TTFT and cache-disposition
 	// instruments for one completed request.
 	ObserveRequest(rm RequestMetrics)
+}
+
+// Endpoint names. These are the values carried on the endpoint label of every
+// per-request instrument (gateway_requests_total, gateway_latency_ms,
+// gateway_cost_usd_total, gateway_tokens_total) and on request_logs.endpoint.
+//
+// The set is CLOSED: EndpointLabel folds anything else to "other", so a new
+// route cannot silently create unbounded label values, and an operator can
+// write an alert for one endpoint without guessing the spelling. When adding a
+// route, add the constant here — that is the whole contract.
+const (
+	EndpointChatCompletions = "chat.completions"
+	EndpointMessages        = "messages"  // Anthropic-native surface
+	EndpointResponses       = "responses" // OpenAI Responses surface
+	EndpointEmbeddings      = "embeddings"
+	EndpointImagesGen       = "images.generations"
+	EndpointImagesEdits     = "images.edits"
+	EndpointSystemOne       = "systemone"
+	EndpointVideos          = "videos"         // POST /v1/videos (create a job)
+	EndpointVideosPoll      = "videos.poll"    // GET  /v1/videos/{id}
+	EndpointVideosList      = "videos.list"    // GET  /v1/videos
+	EndpointVideosContent   = "videos.content" // GET  /v1/videos/{id}/content
+	EndpointVideosDelete    = "videos.delete"  // DELETE /v1/videos/{id}
+	EndpointOther           = "other"
+)
+
+// endpointLabels is the closed set used by EndpointLabel. Keep in sync with
+// the constants above; a value missing here is folded to "other".
+var endpointLabels = map[string]struct{}{
+	EndpointChatCompletions: {},
+	EndpointMessages:        {},
+	EndpointResponses:       {},
+	EndpointEmbeddings:      {},
+	EndpointImagesGen:       {},
+	EndpointImagesEdits:     {},
+	EndpointSystemOne:       {},
+	EndpointVideos:          {},
+	EndpointVideosPoll:      {},
+	EndpointVideosList:      {},
+	EndpointVideosContent:   {},
+	EndpointVideosDelete:    {},
+}
+
+// EndpointLabel normalises an endpoint value to the closed set above.
+//
+// Cardinality: provider × model × endpoint × status is already multiplied by
+// client-influenced model names, so the endpoint dimension must stay bounded
+// by construction rather than by convention. Unknown values fold to "other",
+// which matches IncZeroCost's reason handling and resilience.IncBillableRetrySkip.
+//
+// Non-breaking: every value the gateway emits today is in the set, so existing
+// dashboards and recording rules keep the same series names and labels.
+func EndpointLabel(endpoint string) string {
+	if _, ok := endpointLabels[endpoint]; ok {
+		return endpoint
+	}
+	return EndpointOther
 }
 
 // Token types emitted on gateway_tokens_total. Input is split by cache
@@ -74,9 +136,14 @@ var (
 		Help: "Total gateway requests by provider, model, endpoint, status",
 	}, []string{"provider", "model", "endpoint", "status"})
 	latencyHist = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "gateway_latency_ms",
-		Help:    "Gateway latency in milliseconds",
-		Buckets: []float64{5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000},
+		Name: "gateway_latency_ms",
+		Help: "Gateway latency in milliseconds",
+		// 5ms…10s covers chat/embeddings. Image generations and video content
+		// downloads legitimately run for tens of seconds (the image budget is
+		// 300s), so the 30s/60s/2m/5m/10m buckets exist or every image request
+		// would land in +Inf and p99 would be unreadable. The boundaries below
+		// 10s are unchanged, so existing queries keep their meaning.
+		Buckets: []float64{5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000, 300000, 600000},
 	}, []string{"provider", "endpoint"})
 	cacheHits = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "gateway_cache_hits_total",
@@ -133,7 +200,7 @@ func NewMetrics() Metrics {
 }
 
 func (m *PrometheusMetrics) IncRequests(provider, model, endpoint string, status int) {
-	requestsTotal.WithLabelValues(promLabel(provider), promLabel(model), promLabel(endpoint), prometheusLabel(status)).Inc()
+	requestsTotal.WithLabelValues(promLabel(provider), promLabel(model), EndpointLabel(endpoint), prometheusLabel(status)).Inc()
 	if m.meter != nil {
 		counter, _ := m.meter.Int64Counter("gateway.requests.total")
 		if counter != nil {
@@ -143,7 +210,7 @@ func (m *PrometheusMetrics) IncRequests(provider, model, endpoint string, status
 }
 
 func (m *PrometheusMetrics) ObserveLatency(provider, endpoint string, d time.Duration) {
-	latencyHist.WithLabelValues(promLabel(provider), promLabel(endpoint)).Observe(float64(d.Milliseconds()))
+	latencyHist.WithLabelValues(promLabel(provider), EndpointLabel(endpoint)).Observe(float64(d.Milliseconds()))
 }
 
 // ObserveRequest exports the money, token and TTFT view of one request.
@@ -154,7 +221,8 @@ func (m *PrometheusMetrics) ObserveLatency(provider, endpoint string, d time.Dur
 // Cache disposition therefore rides on the new cost counter, which is the
 // query that actually matters ("what is the cache saving us").
 func (m *PrometheusMetrics) ObserveRequest(rm RequestMetrics) {
-	provider, model, endpoint := promLabel(rm.Provider), promLabel(rm.Model), promLabel(rm.Endpoint)
+	provider, model := promLabel(rm.Provider), promLabel(rm.Model)
+	endpoint := EndpointLabel(rm.Endpoint)
 
 	if rm.CostUSD != 0 {
 		costUSD.WithLabelValues(provider, model, endpoint, cacheStatusLabel(rm.CacheStatus)).Add(rm.CostUSD)

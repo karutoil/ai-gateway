@@ -177,7 +177,7 @@ export default function Settings({ role = 'admin' }: { role?: string }) {
                           )}
                         </Td>
                         <Td>
-                          <Input value={v} onChange={e=>setDraft({...draft,[k]:e.target.value})} className="font-mono text-xs h-9" spellCheck={false} autoComplete="off" disabled={!isAdmin} />
+                          <Input value={v} onChange={e=>setDraft({...draft,[k]:e.target.value})} className="font-mono text-xs h-9" spellCheck={false} autoComplete="off" disabled={!isAdmin} aria-label={`Value for ${k}`} />
                         </Td>
                         <Td className="text-center">
                           {isAdmin && (

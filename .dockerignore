@@ -1,0 +1,58 @@
+# Docker build context filter (sits next to the Dockerfile).
+#
+# Without this file `docker build .` ships the whole working tree, including
+# web/node_modules (~93 MB), local SQLite databases under data/, backups/, the
+# deploy host's live state (deploy/production/data, .swarm) and any local .env
+# with real secrets. None of it is needed to build the image, and some of it
+# must never enter an image layer.
+#
+# Build inputs are exactly: go.mod/go.sum, the Go sources, web/ sources and
+# web/package-lock.json. Everything else below is regenerated or irrelevant.
+
+# VCS / agent tooling metadata
+.git
+.github
+.opencode
+.pi
+.swarm
+.serena
+.dsh-code-index
+.catalyst-code
+
+# Secrets and local state — must never reach a build layer
+.env
+.env.*
+token
+data/
+backups/
+
+# Host-specific deployment state (the image needs nothing from deploy/)
+deploy/
+
+# Build outputs and scratch files
+bin/
+/gateway
+models_test_output.json
+reasoning_update.json
+ai-gateway-playground*.html
+*.bak
+*.log
+
+# Node: installed deps and generated configs. The Dockerfile's `web` stage runs
+# `npm ci` itself, and host node_modules carry platform-specific esbuild/rollup
+# binaries that would override the linux ones.
+web/node_modules
+web/dist
+web/*.tsbuildinfo
+web/vite.config.d.ts
+web/vite.config.js
+
+# The embedded UI is produced by the `web` stage and copied into the builder
+# stage, so a committed copy must not shadow it.
+cmd/gateway/web
+
+# Caches / editor noise
+vendor/
+**/__pycache__
+**/*.pyc
+**/.DS_Store

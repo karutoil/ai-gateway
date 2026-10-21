@@ -3,6 +3,8 @@ export default {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   darkMode: 'class',
   theme: {
+    // Ultrawide: the playground can use a wider reading column on 1440p+.
+    screens: { sm:'640px', md:'768px', lg:'1024px', xl:'1280px', '2xl':'1536px', '3xl':'1800px' },
     extend: {
       colors: {
         graphite: "rgb(var(--c-graphite) / <alpha-value>)",

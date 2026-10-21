@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/models"
+
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
@@ -649,7 +651,7 @@ type streamedHistoryCall struct {
 //   - every terminal pre-commit failure writes one clean
 //     `event: response.failed` frame instead of an HTTP-shaped JSON blob;
 //   - after commit there are no retries, ever.
-func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Request, targetURL, apiKey string, upstreamBody []byte, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool, ttfb *ttfbController, prevID string) {
+func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Request, provider *models.Provider, targetURL, apiKey string, upstreamBody []byte, model, keyPrefix, providerID string, start time.Time, isAnthropicUpstream bool, ttfb *ttfbController, prevID string) {
 	retry := h.retryOrDefault()
 
 	ctx := r.Context()
@@ -670,7 +672,7 @@ func (h *Handler) streamTranslatedResponses(w http.ResponseWriter, r *http.Reque
 		if ttfb.expired() && !ttfb.headersCommitted() {
 			ttfb.commitKeepalive(w, nil)
 		}
-		req, err := h.newUpstreamRequest(ctx, r, targetURL, apiKey, upstreamBody, true, isAnthropicUpstream)
+		req, err := h.newUpstreamRequest(ctx, r, provider, targetURL, apiKey, upstreamBody, true, isAnthropicUpstream, "")
 		if err != nil {
 			if ttfb.headersCommitted() {
 				ttfb.stop()

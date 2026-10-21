@@ -4,6 +4,24 @@
 # The gateway itself also auto-loads ./.env at startup, but compose passes env_file
 # explicitly so container-side values win consistently.
 #
+# ── Deployment invariant: SHUTDOWN_GRACE_SECONDS >= IMAGE_TIMEOUT_SECONDS ────
+# Image generation and video content downloads are legitimately slow: the image
+# first-byte budget defaults to 300s (IMAGE_TIMEOUT_SECONDS, unset/-1 = 300,
+# 0 = disabled, N = N seconds), while SHUTDOWN_GRACE_SECONDS defaults to 90s.
+# A rolling deploy / `compose up` recreates the container: the orchestrator sends
+# SIGTERM, the gateway drains in-flight requests for SHUTDOWN_GRACE_SECONDS, and
+# anything still running when that expires is force-closed. With 90 < 300 an
+# in-flight image generation dies mid-flight — the client gets a 502 and the
+# request_logs billing row is lost (the DB is closed right after the drain).
+#
+# Keep the grace window at or above the image budget, and give the orchestrator
+# at least that long before it SIGKILLs:
+#     SHUTDOWN_GRACE_SECONDS=330   # 300s image budget + 30s slack
+#     stop_grace_period: 360s      # compose/podman kill deadline (below)
+# If you lower IMAGE_TIMEOUT_SECONDS, the grace window may come down too — never
+# the other way round. cmd/gateway/main.go logs a WARNING at boot when the two
+# disagree (see deploy/README.md).
+#
 # Optional Redis (shared cache + distributed rate limiting): uncomment the redis
 # service below and set REDIS_URL in .env or uncomment the override here:
 #   REDIS_URL: redis://redis:6379
@@ -28,14 +46,40 @@ services:
       DATABASE_URL: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
       # Optional shared cache / rate limiter — uncomment with the redis service:
       # REDIS_URL: redis://redis:6379
+
+      # ── Slow-endpoint knobs (see the invariant in the header) ──────────────
+      # Image first-byte budget in seconds. Tri-state:
+      #   unset / -1 -> built-in default (300s)   ← recommended
+      #   0          -> watchdog DISABLED (an upstream hang blocks until the
+      #                 client or a proxy times out; do not use in production)
+      #   N > 0      -> N seconds
+      # Set explicitly here so the value is discoverable in `compose config`
+      # rather than only in the binary's defaults.
+      IMAGE_TIMEOUT_SECONDS: ${IMAGE_TIMEOUT_SECONDS:-300}
+      # Graceful drain window. Must be >= IMAGE_TIMEOUT_SECONDS (see header).
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-330}
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./data:/data
-    # No built-in healthcheck: the image ships without curl/wget and the
-    # binary exposes no self-probe flag. Probe GET /health or /ready from
-    # your orchestrator/load balancer instead.
+    # Explicit healthcheck rather than relying on the Dockerfile's HEALTHCHECK:
+    # podman's default OCI output format drops that instruction, and this stack is
+    # used with both runtimes. /bin/bash's /dev/tcp needs no curl/wget.
+    healthcheck:
+      # Single CMD-SHELL string, not the exec-form list: podman-compose rewrites
+      # a list-form `test:` into `/bin/sh -c <shell-quoted args>`, which mangled
+      # ["CMD", "/bin/bash", "-c", ...] into `/bin/sh -c /bin/bash' '-c' '...'`.
+      # dash has no /dev/tcp, so the probe always failed. The string form works
+      # under both docker compose and podman-compose.
+      test: ["CMD-SHELL", "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /health HTTP/1.0\\r\\n\\r\\n\" >&3; head -1 <&3 | grep -q \" 200 \"'"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    # Give the gateway its full drain window before compose/podman SIGKILLs it.
+    # Must be > SHUTDOWN_GRACE_SECONDS.
+    stop_grace_period: 360s
     restart: unless-stopped
 
   # Postgres primary. First boot auto-creates the gateway database;

@@ -181,6 +181,10 @@ const TYPE_META: Record<string, { blurb: string }> = {
   azure: { blurb: 'Azure OpenAI deployment' },
   antigravity: { blurb: 'Google OAuth flow' },
   devin: { blurb: 'Devin OAuth flow' },
+  systemone: { blurb: 'System One / decision models (Jev, Kev, llama.cpp)' },
+  cloudflare: { blurb: 'Cloudflare Workers AI (Clef decision models)' },
+  google: { blurb: 'Google Gemini API — Nano Banana image generation' },
+  xai: { blurb: 'xAI Grok — [OI]-compatible chat + images' },
 }
 
 export default function Providers({ role = 'admin' }: { role?: string }){
@@ -345,6 +349,10 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <option value="azure">azure</option>
                 <option value="antigravity">antigravity (OAuth)</option>
                 <option value="devin">devin (OAuth)</option>
+                <option value="systemone">systemone (decision models)</option>
+                <option value="cloudflare">cloudflare (Workers AI)</option>
+                <option value="google">google (Gemini image / Nano Banana)</option>
+                <option value="xai">xai (Grok images)</option>
               </Select>
             </Field>
             <Field label="Base URL" hint="Optional. Leave blank to use the provider's official endpoint.">
@@ -355,7 +363,9 @@ export default function Providers({ role = 'admin' }: { role?: string }){
                 <Input placeholder="OAuth — no key required" value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" disabled />
               </Field>
             ) : (
-              <Field label="API Key"><Input placeholder="sk-..." value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" className="font-mono" /></Field>
+              <Field label="API Key" hint={type === 'systemone' ? 'Optional for a local Kev / llama.cpp server.' : undefined}>
+                <Input placeholder="sk-..." value={key} onChange={e=>setKey(e.target.value)} type="password" autoComplete="off" className="font-mono" />
+              </Field>
             )}
           </div>
           {err && <div className="mt-3"><ErrorNote message={err} /></div>}
