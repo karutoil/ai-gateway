@@ -67,10 +67,8 @@ func TestEmbeddedOpenAPILooksLikeOpenAPI(t *testing.T) {
 	if !bytes.Contains(embeddedOpenAPI, []byte("paths:")) {
 		t.Fatal("embedded spec has no `paths:` section")
 	}
-	// The YAML scanner error that shipped had an unquoted comma inside a flow
-	// mapping in a response description; the symptom was that the file did not
-	// parse at all. Guard the specific regression shape cheaply.
-	if bytes.Contains(embeddedOpenAPI, []byte(", 400: ")) {
-		t.Fatal("embedded spec contains an unquoted comma in a mapping key — invalid YAML")
-	}
+	// The unquoted-comma-in-a-flow-mapping regression is guarded properly by
+	// TestEmbeddedOpenAPIHasNoSplitFlowMappingValues in openapi_flowmap_test.go.
+	// (A literal `", 400: "` substring check used to live here; it could never
+	// match a real split value, so it looked like coverage without being any.)
 }
