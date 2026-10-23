@@ -219,37 +219,49 @@ func NewGatewayTransport(responseHeaderTimeout time.Duration, blockMetadata bool
 // Authorization/Cookie natively but NOT custom headers like x-api-key, which
 // carries decrypted upstream provider keys here).
 func GatewayHTTPClient(transport *http.Transport) *http.Client {
-	block := true
 	return &http.Client{
-		Transport: transport,
-		Timeout:   0, // handled via per-request contexts and TimeoutsConfig
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return errors.New("stopped after 3 redirects")
-			}
-			if block && req.URL != nil && req.URL.Hostname() != "" {
-				ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
-				_, err := resolveAndCheck(ctx, req.URL.Hostname(), true)
-				cancel()
-				if err != nil {
-					var me metadataError
-					if errors.As(err, &me) {
-						return err
-					}
+		Transport:     transport,
+		Timeout:       0, // handled via per-request contexts and TimeoutsConfig
+		CheckRedirect: RedirectPolicy(),
+	}
+}
+
+// RedirectPolicy is the shared outbound redirect policy: at most 3 hops, never
+// onto a cloud-metadata address, and credentials stripped on a host change.
+//
+// It is exported so EVERY client that attaches a provider credential shares it.
+// The provider health probe and the discovery fetch each built a bare
+// &http.Client{Timeout:…}, i.e. Go's default policy: 10 hops, stripping only
+// Authorization/Cookie — so the same base_url that is safe on /v1/* leaked the
+// decrypted x-api-key/api-key header to any host a 302 pointed at, on a timer
+// (health runs every 5 minutes).
+func RedirectPolicy() func(req *http.Request, via []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return errors.New("stopped after 3 redirects")
+		}
+		if req.URL != nil && req.URL.Hostname() != "" {
+			ctx, cancel := context.WithTimeout(req.Context(), 3*time.Second)
+			_, err := resolveAndCheck(ctx, req.URL.Hostname(), true)
+			cancel()
+			if err != nil {
+				var me metadataError
+				if errors.As(err, &me) {
+					return err
 				}
 			}
-			if len(via) > 0 {
-				prev := via[len(via)-1]
-				if prev.URL.Host != req.URL.Host {
-					req.Header.Del("Authorization")
-					req.Header.Del("x-api-key")
-					req.Header.Del("api-key")
-					req.Header.Del("Cookie")
-					req.Header.Del("Cookie2")
-				}
+		}
+		if len(via) > 0 {
+			prev := via[len(via)-1]
+			if prev.URL.Host != req.URL.Host {
+				req.Header.Del("Authorization")
+				req.Header.Del("x-api-key")
+				req.Header.Del("api-key")
+				req.Header.Del("Cookie")
+				req.Header.Del("Cookie2")
 			}
-			return nil
-		},
+		}
+		return nil
 	}
 }
 

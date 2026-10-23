@@ -280,44 +280,67 @@ func (s *Store) SetRecoveryCode(userID, code string) error {
 	return tx.Commit()
 }
 
+// VerifyRecoveryCode checks a recovery code and, when it matches, consumes it.
+//
+// Single-use is enforced ATOMICALLY. The previous implementation did a bcrypt
+// compare (≈50-100 ms) and then an unconditional `UPDATE … SET
+// recovery_code_hash=NULL`, so two concurrent requests carrying the same code
+// both read the live hash, both compared successfully and both minted a 24h
+// session. The consume is now a conditional UPDATE whose RowsAffected decides
+// the winner.
 func (s *Store) VerifyRecoveryCode(userID, code string) (bool, error) {
 	var hash sql.NullString
 	err := s.db.QueryRow(db.Q(`SELECT recovery_code_hash FROM dashboard_users WHERE id=?`), userID).Scan(&hash)
 	if err != nil {
 		return false, err
 	}
-	consumed := false
 	if hash.Valid && hash.String != "" && auth.VerifyPasswordHash(hash.String, code) {
-		// Single-use semantics enforced at verification time, independent of
-		// caller discipline: burn the code wherever it is found.
-		s.db.Exec(db.Q(`UPDATE dashboard_users SET recovery_code_hash=NULL WHERE id=?`), userID)
-		s.db.Exec(db.Q(`UPDATE recovery_codes SET used=1 WHERE user_id=?`), userID)
-		consumed = true
-	}
-	// also check recovery_codes table (single-use history rows)
-	rows, _ := s.db.Query(db.Q(`SELECT id, code_hash FROM recovery_codes WHERE user_id=? AND used=0`), userID)
-	if rows == nil {
-		if consumed {
+		// Only the request whose UPDATE actually clears the hash wins.
+		res, uerr := s.db.Exec(db.Q(`UPDATE dashboard_users SET recovery_code_hash=NULL WHERE id=? AND recovery_code_hash=?`), userID, hash.String)
+		if uerr != nil {
+			return false, uerr
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			s.db.Exec(db.Q(`UPDATE recovery_codes SET used=1 WHERE user_id=?`), userID)
 			return true, nil
 		}
+		// Lost the race: another request already consumed this code.
 		return false, nil
 	}
-	defer rows.Close()
+
+	// Fallback: an unused row in the recovery_codes history table.
+	rows, rerr := s.db.Query(db.Q(`SELECT id, code_hash FROM recovery_codes WHERE user_id=? AND used=0`), userID)
+	if rerr != nil {
+		return false, rerr
+	}
+	matchID := ""
 	for rows.Next() {
 		var id, ch string
 		if err := rows.Scan(&id, &ch); err != nil {
 			continue
 		}
 		if auth.VerifyPasswordHash(ch, code) {
-			// Consume immediately.
-			if _, err := s.db.Exec(db.Q(`UPDATE recovery_codes SET used=1 WHERE id=?`), id); err == nil && !consumed {
-				s.db.Exec(db.Q(`UPDATE dashboard_users SET recovery_code_hash=NULL WHERE id=?`), userID)
-				return true, nil
-			}
+			matchID = id
 			break
 		}
 	}
-	return consumed, nil
+	errRows := rows.Err()
+	rows.Close()
+	if errRows != nil {
+		return false, errRows
+	}
+	if matchID == "" {
+		return false, nil
+	}
+	res, cerr := s.db.Exec(db.Q(`UPDATE recovery_codes SET used=1 WHERE id=? AND used=0`), matchID)
+	if cerr != nil {
+		return false, cerr
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, nil // lost the race
+	}
+	s.db.Exec(db.Q(`UPDATE dashboard_users SET recovery_code_hash=NULL WHERE id=?`), userID)
+	return true, nil
 }
 
 func (s *Store) ConsumeRecoveryCode(userID string) error {

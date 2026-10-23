@@ -1,37 +1,50 @@
-
-backups/
-*.bak
-bin/
-# Build artifacts
-.catalyst-code/
-# Compiled gateway binary at repo root (anchored: never ignore cmd/gateway/)
-data/
-# Database backups (live snapshots; root backups/ and deploy/backups/)
-# Dependencies
-.dsh-code-index/
-.DS_Store
-# Editor / AI tool state
+# ── Secrets and local data ────────────────────────────────────────────────
 .env
-.env.bak*
-.env.*.local
 .env.local
-/gateway
-h2.txt
-# Local data & secrets
-# Misc scratch
-models_test_output.json
-node_modules/
-.opencode/
-.pi/
-pi-harness-test/hello-pi.txt
-__pycache__/
-# Python scratch
-.review/
-.serena/
-.swarm/
-# Test scratch output
+.env.*.local
+.env.bak*
 token
+data/
+# Live database snapshots (root backups/, deploy/backups/)
+backups/
+
+# ── Build artifacts ──────────────────────────────────────────────────────
+# Compiled gateway binary at the repo root. Anchored: never ignore cmd/gateway/
+/gateway
+bin/
 *.tsbuildinfo
 vite.config.d.ts
 vite.config.js
 web/dist/
+# NOTE: cmd/gateway/web/ is TRACKED — it is the //go:embed input for
+# cmd/gateway/main.go. Do not ignore it.
+
+# ── Dependencies ─────────────────────────────────────────────────────────
+node_modules/
+
+# ── Editor / AI tool state ───────────────────────────────────────────────
+.DS_Store
+.catalyst-code/
+.dsh-code-index/
+.kilo/
+.kilocode/
+.opencode/
+.pi/
+.serena/
+.swarm/
+
+# ── Misc scratch / test output ───────────────────────────────────────────
+h2.txt
+models_test_output.json
+reasoning_update.json
+ai-gateway-playground*.html
+pi-harness-test/hello-pi.txt
+.review*/
+coverage.out
+*.prof
+*.test
+*.log
+*.bak
+
+# ── Python scratch ───────────────────────────────────────────────────────
+__pycache__/

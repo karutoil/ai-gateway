@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/rs/zerolog/log"
@@ -53,6 +54,13 @@ type Config struct {
 	ShutdownGraceSecs         int // graceful drain window for in-flight streams
 	TTFBTimeoutSecs           int // client-facing first-byte budget; -1 = default, 0 = disabled
 	MaxProxyBodyMB            int // proxy request-body cap in MiB (0 = unlimited)
+
+	// SessionMonthlyBudgetUSD caps what a dashboard SESSION may spend on the
+	// proxy plane. A session JWT is accepted on /v1/*, and a session has no
+	// gateway key of its own, so without this a logged-in user could spend
+	// without limit while every API key stayed under its own cap. 0 = uncapped
+	// (the historical behaviour).
+	SessionMonthlyBudgetUSD float64
 
 	CacheTTLSeconds int
 	// CacheStreams extends the exact-match response cache to STREAMING
@@ -127,6 +135,20 @@ type Config struct {
 
 // getInt reads an integer env var with default fallback. Digits only: it is
 // used by knobs where a negative value has no meaning.
+// getFloat reads a non-negative decimal setting. A malformed or negative value
+// falls back to def so a typo cannot silently disable a cap.
+func getFloat(name string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return def
+	}
+	return f
+}
+
 func getInt(name string, def int) int {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -441,7 +463,8 @@ func Load() (*Config, error) {
 
 		// Proxy request-body cap in MiB (413 beyond). Large agentic CLI
 		// sessions legitimately exceed the old fixed 64 MiB; 0 disables.
-		MaxProxyBodyMB: getInt("MAX_PROXY_BODY_MB", 64),
+		MaxProxyBodyMB:          getInt("MAX_PROXY_BODY_MB", 64),
+		SessionMonthlyBudgetUSD: getFloat("SESSION_MONTHLY_BUDGET_USD", 0),
 
 		CacheTTLSeconds: getInt("CACHE_TTL_SECONDS", 10),
 		CacheStreams:    getBool("CACHE_STREAMS"),

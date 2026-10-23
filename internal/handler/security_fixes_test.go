@@ -264,6 +264,13 @@ func TestOrgReadRoutesRequirePermission(t *testing.T) {
 		ctx = auth.WithSubject(ctx, username)
 		return req.WithContext(ctx)
 	}
+	// Scoped caller: member of org-1. Org reads are tenant-scoped (an
+	// unscoped non-admin only sees orgs while none exist), so the positive
+	// cases carry the caller's verified org claim.
+	reqScoped := func(username, path string) *http.Request {
+		req := reqAs(username, path)
+		return req.WithContext(auth.WithOrgID(req.Context(), orgID))
+	}
 
 	// Without orgs:read: both reads are refused.
 	rec := httptest.NewRecorder()
@@ -277,16 +284,25 @@ func TestOrgReadRoutesRequirePermission(t *testing.T) {
 		t.Errorf("GET /orgs/{id}/members without orgs:read = %d, want 403", rec.Code)
 	}
 
-	// With orgs:read: both succeed.
+	// With orgs:read, scoped to the caller's org: both succeed.
 	rec = httptest.NewRecorder()
-	router.ServeHTTP(rec, reqAs("somebody", "/orgs"))
+	router.ServeHTTP(rec, reqScoped("somebody", "/orgs"))
 	if rec.Code != http.StatusOK {
 		t.Errorf("GET /orgs with orgs:read = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 	}
 	rec = httptest.NewRecorder()
-	router.ServeHTTP(rec, reqAs("somebody", "/orgs/"+orgID+"/members"))
+	router.ServeHTTP(rec, reqScoped("somebody", "/orgs/"+orgID+"/members"))
 	if rec.Code != http.StatusOK {
 		t.Errorf("GET /orgs/{id}/members with orgs:read = %d, want 200", rec.Code)
+	}
+
+	// With orgs:read but a DIFFERENT org: the membership list of another
+	// tenant must not be readable (user ids + roles), and the org list must
+	// not enumerate it.
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, reqScoped("somebody", "/orgs/org-other/members"))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /orgs/org-other/members from another org = %d, want 404", rec.Code)
 	}
 }
 

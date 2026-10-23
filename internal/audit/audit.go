@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
@@ -70,6 +71,28 @@ func ShouldAudit(r *http.Request) bool {
 	return true
 }
 
+// auditMetaMaxBytes bounds the attacker-influenced fields of an audit row.
+//
+// The middleware runs on the ROOT router, ahead of every auth gate, so the path
+// is whatever an unauthenticated caller typed. Go accepts a request line of up
+// to ~1 MiB, and the row stores the path TWICE (target_id and meta): without a
+// cap, `POST /api/<900KB>` writes ~2 MB per request with no credentials and no
+// rate limit — a disk-exhaustion primitive that takes request_logs (billing)
+// and the audit trail itself down with it.
+const auditMetaMaxBytes = 512
+
+// truncateForAudit bounds s to n bytes on a rune boundary.
+func truncateForAudit(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
 // targetFromPath derives a coarse target type from the URL path.
 func targetFromPath(p string) string {
 	switch {
@@ -104,6 +127,11 @@ func targetFromPath(p string) string {
 //
 // The X-Actor / X-Gateway-Actor request headers are deliberately NOT trusted:
 // any client could previously attribute its writes to another user.
+//
+// Only requests that reached an AUTHENTICATED handler are recorded. This
+// middleware is installed on the root router, so without that predicate every
+// unauthenticated probe (401/403/404) wrote a row: the trail was flooded with
+// "anonymous" noise that buries a real incident, and the write was free.
 func Middleware(rec Recorder) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -111,14 +139,50 @@ func Middleware(rec Recorder) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			// Serve first so we only audit successful routing (still logs even on error for traceability).
-			next.ServeHTTP(w, r)
-			actor := actorFor(r)
+			sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			// Install the actor box BEFORE the chain runs: the auth middleware is
+			// BELOW this one, and Go's chain passes a new *http.Request down, so
+			// an identity verified there is otherwise invisible here. Without the
+			// box every control-plane mutation was attributed to "anonymous".
+			ctx, actorFn := auth.WithActorBox(r.Context())
+			next.ServeHTTP(sr, r.WithContext(ctx))
+			// Only an authenticated, non-error mutation is a real control-plane
+			// action: an unauthenticated probe (401/403) must not write a row.
+			actor := actorFn()
+			if actor == "" {
+				actor = actorFor(r)
+			}
+			if actor == "anonymous" || sr.status == http.StatusUnauthorized || sr.status == http.StatusForbidden {
+				return
+			}
 			targetType := targetFromPath(r.URL.Path)
-			meta := r.Method + " " + r.URL.Path
-			_ = rec.Log(actor, strings.ToLower(r.Method), targetType, r.URL.Path, meta)
+			path := truncateForAudit(r.URL.Path, auditMetaMaxBytes)
+			meta := truncateForAudit(r.Method+" "+r.URL.Path, auditMetaMaxBytes)
+			_ = rec.Log(actor, strings.ToLower(r.Method), targetType, path, meta)
 		})
 	}
+}
+
+// statusRecorder captures the response status without altering the response.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wrote {
+		s.status = code
+		s.wrote = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.wrote = true
+	}
+	return s.ResponseWriter.Write(b)
 }
 
 // actorFor resolves the acting identity from VERIFIED context only.

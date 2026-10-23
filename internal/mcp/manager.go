@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"ai-gateway/internal/netguard"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog/log"
@@ -31,6 +34,9 @@ type Manager struct {
 
 	mu    sync.Mutex
 	conns map[string]*serverConn
+	// connecting is the per-server single-flight guard for session(): a server
+	// id maps to a channel closed when its in-flight connect finishes.
+	connecting map[string]chan struct{}
 
 	closed bool
 }
@@ -112,6 +118,13 @@ func (h *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func (m *Manager) transportFor(srv *Server) (sdk.Transport, error) {
 	switch srv.Transport {
 	case TransportHTTP, TransportSSE:
+		// SSRF guard: the URL is operator-supplied, so refuse to fetch private
+		// address space on its behalf (production default). The check runs at
+		// CONNECT time, not only at validate time, so a DNS record that later
+		// changes to a private address is still caught.
+		if err := netguard.CheckURLHost(srv.URL, AllowPrivateUpstreams()); err != nil {
+			return nil, fmt.Errorf("mcp server %q: %w", srv.Name, err)
+		}
 		client := *m.httpClient
 		client.Transport = &headerTransport{
 			base:    m.httpClient.Transport,
@@ -137,10 +150,7 @@ func (m *Manager) transportFor(srv *Server) (sdk.Transport, error) {
 		}, nil
 	case TransportStdio:
 		cmd := exec.Command(srv.Command, srv.Args...)
-		cmd.Env = os.Environ()
-		for k, v := range srv.Env {
-			cmd.Env = append(cmd.Env, k+"="+v)
-		}
+		cmd.Env = childEnv(srv.Env)
 		return &sdk.CommandTransport{Command: cmd}, nil
 	default:
 		return nil, fmt.Errorf("unsupported mcp transport %q", srv.Transport)
@@ -222,6 +232,13 @@ func (m *Manager) connect(ctx context.Context, srv *Server) (*sdk.ClientSession,
 
 // session returns a live session, reconnecting when needed and honoring the
 // per-server backoff after failures.
+//
+// CONCURRENCY: exactly one goroutine performs the connect. Without this
+// single-flight, N goroutines that need a cold server all ran the full
+// handshake and each one closed the session the previous one had just
+// installed, so callers holding the "winner" got
+// `client is closing` on their first tool call. Measured before the fix: 8
+// parallel calls to a server whose cache had been dropped produced 4 failures.
 func (m *Manager) session(ctx context.Context, srv *Server) (*sdk.ClientSession, error) {
 	m.mu.Lock()
 	if m.closed {
@@ -238,9 +255,39 @@ func (m *Manager) session(ctx context.Context, srv *Server) (*sdk.ClientSession,
 		m.mu.Unlock()
 		return nil, fmt.Errorf("mcp server %q is in reconnect backoff for %s", srv.Slug, wait.Round(time.Second))
 	}
+	// Single-flight: if a connect for this server is already running, wait for
+	// it instead of starting a second handshake that would close the first.
+	if ch, inflight := m.connecting[srv.ID]; inflight {
+		m.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		m.mu.Lock()
+		c := m.conns[srv.ID]
+		if c != nil && c.session != nil {
+			s := c.session
+			m.mu.Unlock()
+			return s, nil
+		}
+		m.mu.Unlock()
+		return nil, fmt.Errorf("mcp server %q failed to connect", srv.Slug)
+	}
+	if m.connecting == nil {
+		m.connecting = make(map[string]chan struct{})
+	}
+	done := make(chan struct{})
+	m.connecting[srv.ID] = done
 	m.mu.Unlock()
 
 	session, err := m.connect(ctx, srv)
+
+	m.mu.Lock()
+	delete(m.connecting, srv.ID)
+	m.mu.Unlock()
+	close(done)
+
 	if err != nil {
 		m.recordFailure(srv.ID, err)
 		return nil, err
@@ -474,18 +521,42 @@ func (m *Manager) callOnce(ctx context.Context, srv *Server, toolName string, ar
 	return session.CallTool(callCtx, &sdk.CallToolParams{Name: toolName, Arguments: args})
 }
 
+// isConnectionError reports whether err is a TRANSPORT failure that provably
+// happened before the request reached the server, i.e. a case where retrying
+// cannot duplicate a side effect.
+//
+// SECURITY/CORRECTNESS: this used to substring-match the whole error string for
+// words like "session", "connection", "closed" and "reset". The error text
+// includes the UPSTREAM'S OWN JSON-RPC message, so any MCP server that words a
+// tool failure with one of those words ("upstream session expired while
+// writing") turned a failed-but-committed write into a guaranteed SECOND
+// execution — two issues filed, two charges, two emails. The decision must be
+// made on error TYPES raised by the transport, never on upstream prose.
 func isConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A caller cancellation or a deadline is never retried: the work may have
+	// completed and the client is gone anyway.
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return false // caller cancelled; retrying would be wrong
+		return false
 	}
-	s := strings.ToLower(err.Error())
-	for _, needle := range []string{"connection", "broken pipe", "eof", "closed", "session", "transport", "refused", "reset"} {
-		if strings.Contains(s, needle) {
-			return true
-		}
+	// Only genuine I/O-level failures qualify. A *jsonrpc2 or *mcp error value
+	// (the upstream answering with an error) is deliberately NOT in this set.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) {
+		return true
+	}
+	// The SDK reports a session that is already closed with a sentinel that is
+	// not an I/O error; it is still a safe pre-execution retry because the
+	// request never left the client.
+	if errors.Is(err, sdk.ErrConnectionClosed) {
+		return true
 	}
 	return false
 }

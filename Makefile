@@ -166,5 +166,16 @@ e2e-live:
 smoke: build
 	./scripts/smoke.sh
 
+# `cmd/gateway/web` is TRACKED SOURCE, not build output: it is the
+# `//go:embed all:web` input for cmd/gateway/main.go. Deleting it from `clean`
+# made `make build`/`make smoke`/`make run` fail with
+# "pattern all:web: no matching files found" and left the tree dirty with
+# deleted tracked files. `data/` is the developer's local SQLite database
+# (keys, providers, request logs) — also not something a clean should eat.
 clean:
-	rm -rf bin data web/dist cmd/gateway/web
+	rm -rf bin web/dist
+
+# Destructive: also removes the embedded bundle and the local database. Run
+# `make web` afterwards before building again.
+clean-all: clean
+	rm -rf data cmd/gateway/web

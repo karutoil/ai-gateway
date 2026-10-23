@@ -10,7 +10,7 @@ func TestValidCatalog(t *testing.T) {
 	knownResources := map[string]bool{
 		"keys": true, "providers": true, "logs": true, "analytics": true,
 		"routing": true, "catalog": true, "orgs": true, "users": true,
-		"mcp": true, "audit": true, "settings": true,
+		"mcp": true, "audit": true, "settings": true, "proxy": true,
 	}
 	for _, p := range All {
 		if !Valid(p) {

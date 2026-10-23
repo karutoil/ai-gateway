@@ -208,7 +208,10 @@ func (h *Handler) candidateProvidersWithRuleContextAndRule(ctx context.Context, 
 			if key == "" {
 				continue
 			}
-			if rule := h.LB.RuleForModel(key); rule != nil {
+			// Org-aware resolution: a tenant's own rule wins, the global rule is
+			// the fallback. Without the org argument every key resolved the one
+			// global rule, so an org-scoped rule could not exist at all.
+			if rule := h.LB.RuleForModelOrg(key, keyOrg); rule != nil {
 				quotaEligible := make(map[string]bool, len(rule.Members))
 				for _, member := range rule.Members {
 					p, err := h.ProviderStore.GetByID(member.ProviderID)
@@ -232,10 +235,24 @@ func (h *Handler) candidateProvidersWithRuleContextAndRule(ctx context.Context, 
 					return nil, rule
 				}
 				// Org-scoped keys may only route to providers their org
-				// owns (or global ones).
+				// owns (or global ones), AND each member must satisfy the
+				// endpoint's capability predicate.
+				//
+				// SECURITY/CORRECTNESS: the rule branch used to skip `pred`
+				// entirely — pred was only applied inside consider(), which the
+				// hint/pin/legacy tiers use. So a rule for a System One model
+				// that listed an OpenAI provider sent the decision body to
+				// /chat/completions, and a rule for an image model that listed
+				// an Anthropic member posted a Gemini/OpenAI image body to
+				// /v1/messages: an opaque upstream error, a wasted (and on
+				// metered providers billable) round trip, and a violation of the
+				// capability isolation the endpoint guards exist to enforce.
 				eligible := make([]lb.Candidate, 0, len(ordered))
 				for _, cand := range ordered {
 					if !orgAllows(keyOrg, cand.Provider) {
+						continue
+					}
+					if pred != nil && !pred(cand.Provider) {
 						continue
 					}
 					eligible = append(eligible, cand)
@@ -289,7 +306,17 @@ func quotaRuleMemberKey(m lb.Member) string {
 	return strings.ToLower(strings.TrimSpace(m.ProviderID)) + "\x00" + strings.ToLower(strings.TrimSpace(m.ModelOverride))
 }
 
-type prepareFn func(p *models.Provider, body []byte) (target, apiKey string, outBody []byte, isAnth bool, contentType string, err error)
+// prepareFn builds one upstream attempt. `candModel` is the model id the
+// gateway has RESOLVED for this candidate (the lb_rules model_override when the
+// member pins one, otherwise the requested/aliased model).
+//
+// It is passed explicitly because the body cannot be trusted to carry it: the
+// override is applied with replaceModelInBody, a JSON rewriter, so a MULTIPART
+// request (POST /v1/images/edits) comes through unchanged. A prepare closure
+// that re-derived the model from the body therefore sent the client's alias
+// upstream and billed it as the alias while the log recorded the override — the
+// exact split that made edits ignore lb_rules.model_override.
+type prepareFn func(p *models.Provider, body []byte, candModel string) (target, apiKey string, outBody []byte, isAnth bool, contentType string, err error)
 
 // shouldFailoverFrom reports whether a status justifies trying the next
 // candidate provider. The old rule stopped at ANY <500 — including 429 quota
@@ -473,8 +500,15 @@ func (h *Handler) effectiveRetry(extra proxyCandidatesOpts) resilience.RetryPoli
 
 // mcpRound reports whether this request is one iteration of the gateway-side
 // MCP tool loop (see proxy/mcp.go). Such rounds bypass the response cache.
+//
+// SECURITY: the marker lives in the request CONTEXT, never in a header. It used
+// to be `X-Gateway-MCP-Round: 1`, which is fully client-controlled, and acting
+// on it re-enabled retries on billable image creates (double billing) and
+// silently forced stream:true requests down the buffered path, where the SSE
+// usage envelope is never parsed — i.e. an unmetered completion for anyone who
+// set one extra header.
 func mcpRound(r *http.Request) bool {
-	return r.Header.Get("X-Gateway-MCP-Round") == "1"
+	return isMCPRound(r.Context())
 }
 
 func (h *Handler) proxyCandidates(w http.ResponseWriter, r *http.Request, body []byte, isStream bool, model, endpoint, keyPrefix string, start time.Time, candidates []lb.Candidate, rule *lb.Rule, prepare prepareFn) {
@@ -573,7 +607,7 @@ func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request
 			candBody = replaceModelInBody(body, override)
 			candModel = override
 		}
-		target, apiKey, outBody, isAnth, candContentType, err := prepare(p, candBody)
+		target, apiKey, outBody, isAnth, candContentType, err := prepare(p, candBody, candModel)
 		if err != nil {
 			continue
 		}
@@ -590,10 +624,14 @@ func (h *Handler) proxyCandidatesWithOpts(w http.ResponseWriter, r *http.Request
 		// MCP tool rounds always run buffered and must bypass the response
 		// cache: replaying a cached pre-tool answer inside the loop would
 		// feed the model its own previous output as if it were new.
+		//
+		// NOTE: `extra.noRetry` is deliberately NOT cleared here. A tool round
+		// is a normal chat/messages/responses call, which never sets it; the
+		// only callers that do are the billable media creates, and clearing it
+		// would re-enable the exact double-billing retry that noRetry exists to
+		// prevent.
 		if mcpRound(r) {
 			extra.noCache = true
-			extra.noRetry = false
-			isStream = false
 		}
 		callOpts := proxyOpts{
 			fallbackFrom:     fallbackName,

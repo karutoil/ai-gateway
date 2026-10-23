@@ -633,3 +633,177 @@ func TestLegacyDatabaseGetsImageVideoAndShortID(t *testing.T) {
 		t.Error("legacy-recreated video_jobs was not pruned")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Retention sweep regression tests.
+//
+// The sweeps are the only thing that stops request_logs / audit_logs /
+// mcp_tool_calls / video_jobs from growing without bound, and a wrong age
+// predicate silently deletes live billing data (or deletes nothing at all).
+// These pin the age bound and the batching for every sweep.
+// ---------------------------------------------------------------------------
+
+func insertRequestLog(t *testing.T, d *sql.DB, id string, created time.Time) {
+	t.Helper()
+	if _, err := d.Exec(Q(`INSERT INTO request_logs
+		(id, key_prefix, provider_id, model, endpoint, status, latency_ms, created_at, prompt_tokens, completion_tokens, total_tokens, cost_usd)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`),
+		id, "sk-gw-test", "prov-1", "gpt-4o", "chat.completions", 200, 10, created, 1, 1, 2, 0.01); err != nil {
+		t.Fatalf("insert request log %s: %v", id, err)
+	}
+}
+
+func countRows(t *testing.T, d *sql.DB, table string) int {
+	t.Helper()
+	var n int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// TestPruneRequestLogsHonoursCutoff is the mutation gate for the age predicate:
+// flipping the comparison (or dropping the WHERE) would delete live billing rows
+// and no other test in the repo would notice.
+func TestPruneRequestLogsHonoursCutoff(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	now := time.Now().UTC()
+	insertRequestLog(t, d, "old-1", now.Add(-40*24*time.Hour))
+	insertRequestLog(t, d, "old-2", now.Add(-31*24*time.Hour))
+	insertRequestLog(t, d, "keep-1", now.Add(-2*24*time.Hour))
+	insertRequestLog(t, d, "keep-2", now)
+
+	cutoff := now.Add(-30 * 24 * time.Hour)
+	n, err := PruneRequestLogs(context.Background(), d, cutoff, 1) // batchSize 1 exercises the loop
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("prune deleted %d rows, want 2 (only rows older than the cutoff)", n)
+	}
+	if got := countRows(t, d, "request_logs"); got != 2 {
+		t.Fatalf("request_logs has %d rows after prune, want 2 (live rows must survive)", got)
+	}
+	var kept int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE id IN ('keep-1','keep-2')`).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 2 {
+		t.Fatalf("live rows were deleted: %d/2 survive", kept)
+	}
+}
+
+func TestPruneRequestLogsIsBatchedAndStops(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	now := time.Now().UTC()
+	const total = 7
+	for i := 0; i < total; i++ {
+		insertRequestLog(t, d, "old-"+string(rune('a'+i)), now.Add(-48*time.Hour))
+	}
+	n, err := PruneRequestLogs(context.Background(), d, now.Add(-24*time.Hour), 3)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if int(n) != total {
+		t.Fatalf("prune deleted %d, want %d", n, total)
+	}
+	if got := countRows(t, d, "request_logs"); got != 0 {
+		t.Fatalf("%d rows remain, want 0", got)
+	}
+	// Second run is a no-op.
+	if n2, err := PruneRequestLogs(context.Background(), d, now.Add(-24*time.Hour), 3); err != nil || n2 != 0 {
+		t.Fatalf("second prune = (%d, %v), want (0, nil)", n2, err)
+	}
+}
+
+func TestPruneAuditLogsHonoursCutoff(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	now := time.Now().UTC()
+	for _, row := range []struct {
+		id string
+		at time.Time
+	}{
+		{"a-old", now.Add(-400 * 24 * time.Hour)},
+		{"a-new", now.Add(-time.Hour)},
+	} {
+		if _, err := d.Exec(Q(`INSERT INTO audit_logs(id,actor,action,target_type,target_id,meta,created_at) VALUES(?,?,?,?,?,?,?)`),
+			row.id, "ops", "update", "key", "k1", "{}", row.at); err != nil {
+			t.Fatalf("insert audit %s: %v", row.id, err)
+		}
+	}
+	n, err := PruneAuditLogs(context.Background(), d, now.Add(-365*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("prune audit: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("prune audit deleted %d, want 1", n)
+	}
+	if got := countRows(t, d, "audit_logs"); got != 1 {
+		t.Fatalf("audit_logs has %d rows, want 1", got)
+	}
+}
+
+// TestAbandonNonTerminalVideoJobs pins the abandoned-job transition: a job the
+// client never polled must become terminal (so the existing sweep can reclaim
+// it) but an in-flight job must never be touched.
+func TestAbandonNonTerminalVideoJobs(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	now := time.Now().UTC()
+	insertVideoJob(t, d, "stale-queued", "queued", now.Add(-48*time.Hour), nil)
+	insertVideoJob(t, d, "stale-running", "in_progress", now.Add(-48*time.Hour), nil)
+	insertVideoJob(t, d, "fresh-running", "in_progress", now.Add(-time.Minute), nil)
+	insertVideoJob(t, d, "stale-done", "completed", now.Add(-48*time.Hour), nil)
+
+	n, err := AbandonNonTerminalVideoJobs(context.Background(), d, 100, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("abandon: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("abandoned %d jobs, want 2", n)
+	}
+
+	var status string
+	if err := d.QueryRow(`SELECT status FROM video_jobs WHERE id='fresh-running'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "in_progress" {
+		t.Fatalf("a fresh in-flight job was transitioned to %q — an active generation must never be abandoned", status)
+	}
+	if err := d.QueryRow(`SELECT status FROM video_jobs WHERE id='stale-done'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "completed" {
+		t.Fatalf("a terminal job was re-transitioned to %q", status)
+	}
+
+	// Abandoned rows are now reclaimable by the terminal-only sweep. The jobs
+	// are 48h old, so a 1h retention window (rather than the 7d default) makes
+	// the retention predicate — not the provider-expiry one — the trigger.
+	res, err := PruneVideoJobs(context.Background(), d, 100, time.Hour)
+	if err != nil {
+		t.Fatalf("prune after abandon: %v", err)
+	}
+	if res.Retention < 2 {
+		t.Fatalf("retention sweep reclaimed %d abandoned jobs, want >= 2", res.Retention)
+	}
+}

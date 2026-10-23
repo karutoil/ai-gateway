@@ -59,6 +59,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The live e2e suite is behind `//go:build live`, so a plain build/vet
+      # never compiles it: it could rot for months and only break when someone
+      # needed it during an incident. Compile-only, no gateway required.
+      - name: Vet (live e2e tags compile)
+        run: go vet -tags=live ./internal/e2e
+
       # Full-tree race suite, matching `make test-race` / `make ci`. The
       # Postgres dialect suite lives in its own job (needs a service container)
       # and self-skips here, which is why the guard there matters.
@@ -77,7 +83,9 @@ jobs:
       postgres:
         # Pin a minor version: a floating tag means the dialect under test can
         # change without a commit in this repo.
-        image: postgres:16.10-alpine
+        # Keep in lockstep with the compose/stacks, which deploy postgres:17-alpine.
+        # A dialect suite on a different major than production tests the wrong server.
+        image: postgres:17-alpine
         env:
           POSTGRES_USER: gateway
           POSTGRES_PASSWORD: gateway

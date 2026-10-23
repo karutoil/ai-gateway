@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ai-gateway/internal/devin"
+	"ai-gateway/internal/netguard"
 
 	gatewaydb "ai-gateway/internal/db"
 
@@ -40,7 +41,13 @@ func checkAll(db *sql.DB, store *Store) {
 		log.Error().Err(err).Msg("health: list providers failed")
 		return
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	// Hardened client: the probe attaches the provider's decrypted key, and Go's
+	// default redirect policy follows up to 10 hops while stripping only
+	// Authorization/Cookie — NOT x-api-key/api-key. A provider (or a compromised
+	// base_url) answering 302 to an attacker host would receive the credential.
+	// GatewayHTTPClient caps redirects and strips credentials on host change,
+	// the same policy the /v1 proxy path already uses.
+	client := netguard.HardenedClient(5 * time.Second)
 	for _, p := range providers {
 		status := "unknown"
 		msg := ""

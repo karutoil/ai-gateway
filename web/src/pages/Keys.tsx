@@ -43,6 +43,30 @@ function ago(iso?: string | null): string {
   return new Date(iso).toLocaleDateString()
 }
 
+/**
+ * toLocalInput converts an RFC3339 UTC instant into the "YYYY-MM-DDTHH:mm"
+ * wall-clock string a <input type="datetime-local"> expects, in the browser's
+ * timezone. Empty/invalid input yields ''.
+ */
+function toLocalInput(iso?: string | null): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/**
+ * fromLocalInput converts a <input type="datetime-local"> value (local
+ * wall-clock) into an RFC3339 UTC instant for the API. The handler parses
+ * RFC3339 first, so the zone is carried explicitly instead of being assumed UTC.
+ */
+function fromLocalInput(v: string): string {
+  const d = new Date(v) // datetime-local strings are parsed as local time
+  if (Number.isNaN(d.getTime())) return ''
+  return d.toISOString()
+}
+
 function keyBadges(k: any): React.ReactNode[] {
   const badges: React.ReactNode[] = []
   if (k.expires_at) {
@@ -292,7 +316,12 @@ export default function Keys({ role = 'admin' }: { role?: string }){
       allowed: Array.isArray(k.allowed_models) ? [...k.allowed_models] : [],
       owner: k.created_by || '',
       originalOwner: k.created_by || '',
-      expiresAt: k.expires_at ? String(k.expires_at).slice(0, 16) : '',
+      // The API returns an RFC3339 UTC instant. A `datetime-local` input shows
+      // and accepts LOCAL wall-clock, so slicing the UTC string displayed the
+      // wrong time by the browser offset — and the value the operator then
+      // picked was stored as if it were UTC, shifting the deadline by the same
+      // offset (a UTC+9 operator's "17:00" expired at 02:00 local the next day).
+      expiresAt: toLocalInput(k.expires_at),
       ipAllowlist: k.ip_allowlist || '',
       monthlyBudget: k.monthly_usd_budget ? String(k.monthly_usd_budget) : '',
     })
@@ -328,7 +357,11 @@ export default function Keys({ role = 'admin' }: { role?: string }){
       const tpm = parseIntField(editModal.tpm)
       if(tpm !== undefined) payload['rate_limit_tpm'] = tpm
       payload['allowed_models'] = editModal.allowed
-      payload['expires_at'] = editModal.expiresAt || null
+      // Empty string is the explicit "no expiry" value the handler accepts
+      // (`*string` decodes JSON null to nil = "unchanged", so `null` could never
+      // clear a deadline). A filled value is converted from local wall-clock to
+      // an RFC3339 UTC instant, which the handler parses as its first layout.
+      payload['expires_at'] = editModal.expiresAt ? fromLocalInput(editModal.expiresAt) : ''
       payload['ip_allowlist'] = editModal.ipAllowlist
       payload['monthly_budget_usd'] = Number(editModal.monthlyBudget || 0)
       await api.keys.setLimits(editModal.id, payload)

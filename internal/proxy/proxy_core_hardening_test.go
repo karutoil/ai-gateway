@@ -189,7 +189,7 @@ func TestProxyCandidatesNoFailoverStopsChain(t *testing.T) {
 		{Provider: &models.Provider{ID: "p1", Name: "p1", Type: models.ProviderXAI, BaseURL: primary.URL}},
 		{Provider: &models.Provider{ID: "p2", Name: "p2", Type: models.ProviderXAI, BaseURL: secondary.URL}},
 	}
-	prepare := func(p *models.Provider, in []byte) (string, string, []byte, bool, string, error) {
+	prepare := func(p *models.Provider, in []byte, candModel string) (string, string, []byte, bool, string, error) {
 		return p.BaseURL + "/images/generations", "k", in, false, "", nil
 	}
 

@@ -180,6 +180,14 @@ export default function Playground() {
   /* Model eligibility                                                 */
   /* ---------------------------------------------------------------- */
 
+  // Capability isolation, mirrored from the server.
+  //
+  // `image_only` / `video_only` exist ONLY on the /v1/models payload, which needs
+  // a gateway key and is not what this page calls — so those two predicates were
+  // permanently false here and every text-mode picker offered pure generators
+  // (sora-2, veo-*, imagen-*) that the gateway then rejected with a 400. The
+  // server's own rule is simpler and is what we encode: a model flagged
+  // image/video is not a text model, and a video model is not an image model.
   const isImageModel = (m: CatalogModel) => m.image === true || m.kind === 'image'
   const isImageOnly = (m: CatalogModel) => m.image_only === true
   const isVideoModel = (m: CatalogModel) => m.video === true || m.kind === 'video'
@@ -187,9 +195,15 @@ export default function Playground() {
 
   const eligible = useCallback((m: CatalogModel, api: Mode) => {
     if (api === 'video') return isVideoModel(m)
-    if (isVideoOnly(m)) return false
+    // No video model is a text model, and /v1/images/* never serves one — the
+    // server enforces both (proxy/images.go), so filter on the capability flag
+    // rather than only on video_only.
+    if (isVideoModel(m)) return false
     if (api === 'images') return isImageModel(m)
-    if (isImageOnly(m)) return false
+    // image_only separates a pure generator from a model that also chats
+    // (gpt-4o, gemini-2.5-flash). Both fields now come from
+    // /api/provider-models (models.ProviderModel.ImageOnly / VideoOnly).
+    if (isImageOnly(m) || isVideoOnly(m)) return false
     return api === 'systemone' ? !!m.decision : !m.decision
   }, [])
 

@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"sort"
@@ -21,17 +22,81 @@ import (
 	"time"
 
 	"ai-gateway/internal/db"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 type DBDispatch struct {
-	db      *sql.DB
-	client  *http.Client
+	db     *sql.DB
+	client *http.Client
+
 	mu      sync.Mutex
 	started bool
+	// inflight bounds concurrent deliveries. The previous Emit spawned one
+	// goroutine per (event x webhook) with no ceiling: a budget-exhaustion storm
+	// (billing.over_quota is emitted once per REJECTED request) plus a slow sink
+	// produced goroutines proportional to rate x sink-latency — measured 18 ->
+	// 198 goroutines from 60 audited mutations against a 9s sink. Overflow is
+	// dropped and counted rather than queued without bound.
+	inflight chan struct{}
+	wg       sync.WaitGroup
+	closed   bool
+	// cache holds the enabled-webhook set so a storm does not run one SELECT per
+	// event on the single SQLite connection.
+	cacheAt   time.Time
+	cacheRows []webhookRow
+	// dropped counts deliveries shed under load (exported for operators).
+	dropped int64
+	// env is the env-configured dispatcher (WEBHOOK_URL). It is invoked IN
+	// ADDITION to the DB rows so the documented env path actually delivers.
+	env Dispatcher
 }
 
+// maxInflightDeliveries bounds concurrent webhook POSTs process-wide.
+const maxInflightDeliveries = 64
+
 func NewDBDispatch(database *sql.DB) *DBDispatch {
-	return &DBDispatch{db: database, client: &http.Client{Timeout: 10 * time.Second}}
+	return &DBDispatch{
+		db:       database,
+		client:   &http.Client{Timeout: 10 * time.Second},
+		inflight: make(chan struct{}, maxInflightDeliveries),
+	}
+}
+
+// SetEnvDispatcher attaches the env-configured dispatcher so WEBHOOK_URL and
+// the `webhooks` table both receive events. main() previously replaced the env
+// dispatcher outright, so an operator who set WEBHOOK_URL per ARCHITECTURE.md
+// got silence with no warning.
+func (d *DBDispatch) SetEnvDispatcher(env Dispatcher) { d.env = env }
+
+// InvalidateCache drops the cached webhook row set (call on any CRUD write).
+func (d *DBDispatch) InvalidateCache() {
+	d.mu.Lock()
+	d.cacheRows = nil
+	d.cacheAt = time.Time{}
+	d.mu.Unlock()
+}
+
+// Stop waits (bounded) for in-flight deliveries so shutdown does not drop the
+// events emitted just before SIGTERM.
+func (d *DBDispatch) Stop() {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	done := make(chan struct{})
+	go func() { d.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+	}
+}
+
+// Dropped reports how many deliveries were shed under load.
+func (d *DBDispatch) Dropped() int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.dropped
 }
 
 type webhookRow struct {
@@ -44,7 +109,34 @@ type webhookRow struct {
 }
 
 // matchingWebhooks returns enabled webhooks subscribed to event (or to all).
+//
+// The row set is cached for a few seconds: Emit is called from the request hot
+// path (audit writes, exports, and once per REJECTED request for
+// billing.over_quota), and a SELECT per event on the single SQLite connection
+// competes with the /v1 path it is trying to report on. The TTL is short so an
+// out-of-band row edit is still observed; webhook CRUD calls InvalidateCache.
 func (d *DBDispatch) matching(event string) []webhookRow {
+	all := d.enabledRows()
+	out := make([]webhookRow, 0, len(all))
+	for _, w := range all {
+		if webhookWants(w.events, event) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+const webhookCacheTTL = 10 * time.Second
+
+func (d *DBDispatch) enabledRows() []webhookRow {
+	d.mu.Lock()
+	if d.cacheRows != nil && time.Since(d.cacheAt) < webhookCacheTTL {
+		rows := d.cacheRows
+		d.mu.Unlock()
+		return rows
+	}
+	d.mu.Unlock()
+
 	rows, err := d.db.Query(db.Q(`SELECT id, url, COALESCE(secret,''), COALESCE(events,''), COALESCE(format,'json'), enabled FROM webhooks WHERE enabled = 1`))
 	if err != nil {
 		return nil
@@ -61,14 +153,21 @@ func (d *DBDispatch) matching(event string) []webhookRow {
 		// Auto-detect platform formats from the URL unless an explicit
 		// non-default format was chosen.
 		if w.format == "" || w.format == "json" {
-			if d := detectFormat(w.url); d != "json" {
-				w.format = d
+			if f := detectFormat(w.url); f != "json" {
+				w.format = f
 			}
 		}
-		if w.enabled && webhookWants(w.events, event) {
+		if w.enabled {
 			out = append(out, w)
 		}
 	}
+	if rows.Err() != nil {
+		return out
+	}
+	d.mu.Lock()
+	d.cacheRows = out
+	d.cacheAt = time.Now()
+	d.mu.Unlock()
 	return out
 }
 
@@ -102,13 +201,42 @@ func webhookWants(eventsCSV, event string) bool {
 // Emit delivers the event to every matching webhook asynchronously; the
 // caller's hot path never blocks on webhook delivery.
 func (d *DBDispatch) Emit(event string, payload any) {
+	// The env-configured dispatcher (WEBHOOK_URL) is an ADDITIONAL target, not a
+	// replacement: it has its own bounded queue and HMAC signing.
+	if d.env != nil {
+		d.env.Emit(event, payload)
+	}
 	targets := d.matching(event)
 	if len(targets) == 0 {
 		return
 	}
 	body := marshalEvent(event, payload)
 	for _, t := range targets {
-		go d.deliver(t, event, body)
+		d.mu.Lock()
+		if d.closed {
+			d.mu.Unlock()
+			return
+		}
+		d.mu.Unlock()
+		select {
+		case d.inflight <- struct{}{}:
+			d.wg.Add(1)
+			go func(t webhookRow) {
+				defer d.wg.Done()
+				defer func() { <-d.inflight }()
+				d.deliver(t, event, body)
+			}(t)
+		default:
+			// Shed rather than queue without bound. Counted so the loss is
+			// visible instead of silent.
+			d.mu.Lock()
+			d.dropped++
+			dropped := d.dropped
+			d.mu.Unlock()
+			if dropped == 1 || dropped%100 == 0 {
+				log.Warn().Str("event", event).Int64("dropped_total", dropped).Msg("webhook delivery shed: too many in flight")
+			}
+		}
 	}
 }
 
@@ -794,25 +922,49 @@ func prettyTimestamp(ts string) string {
 	return ""
 }
 
+// deliveryID is the stable idempotency key for one delivery attempt series. A
+// consumer needs it to dedupe the retries this dispatcher performs.
+func deliveryID(event string) string {
+	return uuid.NewString()
+}
+
 func (d *DBDispatch) deliver(w webhookRow, event string, body []byte) {
 	body = platformBody(w.format, event, body)
-	req, err := http.NewRequest(http.MethodPost, w.url, bytes.NewReader(body))
-	if err != nil {
-		d.record(w.id, "invalid URL: "+err.Error())
-		return
+	id := deliveryID(event)
+	var lastStatus string
+	// Retry 429/5xx with backoff: a sink that rate-limits or briefly 5xxes used
+	// to lose the event permanently (any HTTP response counted as success).
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+		req, err := http.NewRequest(http.MethodPost, w.url, bytes.NewReader(body))
+		if err != nil {
+			d.record(w.id, "invalid URL: "+err.Error())
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Webhook-Event", event)
+		req.Header.Set("X-Webhook-Id", id)
+		if w.secret != "" {
+			req.Header.Set("X-Webhook-Signature", SignPayload(w.secret, body))
+		}
+		resp, err := d.client.Do(req)
+		if err != nil {
+			lastStatus = "error: " + err.Error()
+			continue
+		}
+		// Drain before Close so the connection is reusable; otherwise every
+		// delivery opens a new TCP connection (and TLS handshake).
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		resp.Body.Close()
+		lastStatus = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			d.record(w.id, lastStatus)
+			return
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Webhook-Event", event)
-	if w.secret != "" {
-		req.Header.Set("X-Webhook-Signature", SignPayload(w.secret, body))
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		d.record(w.id, "error: "+err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	d.record(w.id, fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode)))
+	d.record(w.id, lastStatus)
 }
 
 func (d *DBDispatch) record(id, status string) {

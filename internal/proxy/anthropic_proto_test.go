@@ -280,13 +280,12 @@ func TestAnthroProtoSocketCutUnexpectedEofMasqueradesClean(t *testing.T) {
 	env := protoNewEnv(t, up, models.ProviderAnthropic, "", "messages")
 
 	status, _, raw := env.PostRaw("/v1/messages", protoAnthBody(true), nil)
+	if status != http.StatusOK {
+		t.Fatalf("a5b: committed stream should still report 200, got %d", status)
+	}
 
 	sawTerminator := strings.Contains(raw, "event: error")
-	sawStop := strings.Contains(raw, `"type":"message_stop"`)
 	framesForwarded := strings.Contains(raw, "event: message_start")
-	if framesForwarded && !sawTerminator && !sawStop && status == 200 {
-		t.Skipf("DEFECT-K anth-D2: mid-stream 'unexpected EOF' from upstream is normalized to a CLEAN end by pumpStream.isCleanEOF (proxy.go:873-877) — real events relayed then silence: no event:error, no terminator; request_logs records a success row. Spec a5 requires termination on ANY abnormal exit – unskip after fix (pinned: silent truncated 200)")
-	}
 	if framesForwarded && !sawTerminator {
 		t.Fatalf("a5b post-fix regression gate: abnormal exit without termination marker:\n%s", raw)
 	}
@@ -382,15 +381,10 @@ func TestAnthroProtoMalformedUpstreamHonestFailure(t *testing.T) {
 
 	status, hdr, raw := env.PostRaw("/v1/messages", protoAnthBody(true), nil)
 
-	// PIN current behavior before flagging.
-	if status == 200 && strings.Contains(raw, "<html>") {
-		ct := hdr.Get("Content-Type")
-		t.Skipf("DEFECT-K anth-D1: pumpStream relays any upstream 200 verbatim (proxy.go:692-698); /v1/messages stream client received HTTP 200 Content-Type=%q containing <html>, with no anthropic events and no event:error terminator — silent-ok instead of honest failure – unskip after fix (pinned: html passthrough)", ct)
-	}
-
-	// ---- checkpoint asserts (regression gate post-fix) ----
+	// Hard gate (was a t.Skipf "DEFECT-K", which turned this checkpoint into a
+	// permanent no-op once the defect was fixed).
 	if status == 200 {
-		t.Fatalf("u3: anthropic malformed upstream must not yield client 200")
+		t.Fatalf("u3: anthropic malformed upstream must not yield client 200 (Content-Type=%q, body=%s)", hdr.Get("Content-Type"), raw)
 	}
 	if strings.Contains(raw, "<html>") {
 		t.Fatalf("u3: HTML leaked into /v1/messages stream response")

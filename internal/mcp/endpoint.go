@@ -3,11 +3,15 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"ai-gateway/internal/apikey"
 	"ai-gateway/internal/middleware"
+	"ai-gateway/internal/models"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog/log"
@@ -43,9 +47,21 @@ func NewEndpoint(store *Store, manager *Manager, keys *apikey.Store) *Endpoint {
 		// Stateful sessions: MCP clients (Pi, OpenCode, Claude Code) negotiate
 		// once and reuse the session id; the SDK keeps the session map.
 		JSONResponse: false,
+		// Sessions MUST expire. With the zero value the SDK documents that
+		// "idle sessions are never closed", so every authenticated
+		// `initialize` leaked one server object (with the key's full tool
+		// list and its transport goroutines) for the process lifetime: a
+		// cheap app key looping initialize is an unbounded-memory DoS that
+		// takes the whole gateway down for every tenant. Five minutes is far
+		// longer than any client's gap between tool calls and short enough
+		// that an abandoned session is reclaimed.
+		SessionTimeout: mcpSessionTimeout,
 	})
 	return e
 }
+
+// mcpSessionTimeout bounds the idle lifetime of a /mcp session. See NewEndpoint.
+const mcpSessionTimeout = 5 * time.Minute
 
 // Auth authenticates MCP clients with a gateway key. MCP traffic prefers
 // x-litellm-api-key (LiteLLM convention) so Authorization stays free for
@@ -178,6 +194,27 @@ func (e *Endpoint) NotFound(w http.ResponseWriter, msg string) {
 	writeMCPAuthError(w, http.StatusNotFound, msg)
 }
 
+// authorizeCall re-checks a single tool invocation against the key's CURRENT
+// grants. It returns a non-nil error when the call must be refused.
+//
+// This is the call-time gate that makes grant edits take effect immediately on
+// an already-established MCP session (see the closure in serverForRequest).
+func (e *Endpoint) authorizeCall(key *models.GatewayKey, binding Tool) error {
+	if key == nil {
+		return errors.New("no gateway key")
+	}
+	access, err := e.Store.AccessForKey(key)
+	if err != nil {
+		return errors.New("authorization unavailable")
+	}
+	for _, t := range access.Tools {
+		if t.ServerID == binding.ServerID && t.Name == binding.Name {
+			return nil
+		}
+	}
+	return fmt.Errorf("this key no longer has access to %s on server %s", binding.Name, binding.ServerSlug)
+}
+
 func (e *Endpoint) serverForRequest(r *http.Request) *sdk.Server {
 	key, ok := middleware.GatewayKeyFromContext(r.Context())
 	if !ok || key == nil {
@@ -204,6 +241,22 @@ func (e *Endpoint) serverForRequest(r *http.Request) *sdk.Server {
 			Description: binding.Description,
 			InputSchema: schema,
 		}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+			// AUTHORIZE AT CALL TIME, not at session-creation time.
+			//
+			// The bindings above are a snapshot taken when the session was
+			// created. Sessions live for minutes to hours, and the operator's
+			// whole point in editing key permissions is that the change takes
+			// effect NOW: previously revoking a key's access to a server (or
+			// narrowing it to read-only tools) left the live session calling
+			// the old tools indefinitely while /api/keys/{id}/mcp showed the
+			// grant as removed. Re-resolving costs two indexed queries and
+			// closes that window completely.
+			if err := e.authorizeCall(key, binding); err != nil {
+				return &sdk.CallToolResult{
+					IsError: true,
+					Content: []sdk.Content{&sdk.TextContent{Text: "tool access denied: " + err.Error()}},
+				}, nil
+			}
 			args := map[string]any{}
 			if req != nil && req.Params != nil && len(req.Params.Arguments) > 0 {
 				_ = json.Unmarshal(req.Params.Arguments, &args)
@@ -225,9 +278,19 @@ func (e *Endpoint) serverForRequest(r *http.Request) *sdk.Server {
 }
 
 func requestedServers(r *http.Request) map[string]bool {
-	raw := strings.TrimSpace(r.Header.Get("x-mcp-servers"))
+	// The PATH is authoritative. `/<server>/mcp` and `/mcp/<server>` are how an
+	// operator (or a fronting reverse proxy) pins a client to one server, so the
+	// path-derived selection must not be overridable by a request header.
+	//
+	// The header used to win, which made the documented narrowing advisory: a
+	// client configured with baseURL=/github/mcp could send
+	// `x-mcp-servers: filesystem` and get the filesystem tools at the github
+	// URL — the exact sandbox the path was supposed to provide. ServeHTTP
+	// rewrites the path into ?servers=; the header is now only honoured when
+	// the path carries no selection at all.
+	raw := strings.TrimSpace(r.URL.Query().Get("servers"))
 	if raw == "" {
-		raw = strings.TrimSpace(r.URL.Query().Get("servers"))
+		raw = strings.TrimSpace(r.Header.Get("x-mcp-servers"))
 	}
 	if raw == "" {
 		return nil

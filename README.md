@@ -117,6 +117,8 @@ curl http://localhost:8080/v1/systemone \
 
 Answers come back keyed by the same question ids (`answers.urgent.noul`, `answers.team.choice`, `answers.severity.score`). Decision models bill **input tokens only** — output tokens are free — and the gateway prices them from the catalog like any other model. The endpoint is always available (like the other protocol endpoints); it is unroutable until a decision-capable provider exists, and decision providers are never selected for chat/completions/embeddings while text providers are never selected for `/v1/systemone`.
 
+A provider is decision-capable when it is typed `systemone`/`cloudflare` **or** when its own model listing marks a model as a decision model — the latter covers Jev resellers (Surplus Intelligence and friends) that speak the protocol on their own path. `GET /v1/models` and the capability guards read the same `provider_models` row, so they cannot disagree about an id. Decision traffic goes to `/v1/systemone` for `systemone`-typed providers (llama.cpp, Kev) and to `/v1/decisions` for everyone else (the Jev dialect); override a provider with the `provider.<name>.decision_path` setting. See `docs/images-videos-systemone.md`.
+
 > `/v1/systemone` is a *gateway-defined* endpoint speaking the System One wire protocol
 > (TypeSafe Jev / Cloudflare Workers AI). It is not an OpenAI API; there is no OpenAI SDK
 > mode for it.

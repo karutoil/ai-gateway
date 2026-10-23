@@ -54,8 +54,8 @@ func TestFreshDatabaseMigratesToLatest(t *testing.T) {
 	// embed list (or vice versa) makes this fail. Bump it in the SAME commit as
 	// the new migration file — that is the point (it once went stale for two
 	// migrations, which is why this assertion exists).
-	if n != 34 {
-		t.Fatalf("LatestMigrationVersion() = %d, expected the schema to be at 34 (add your migration to migrationsList and bump this literal)", n)
+	if n != 37 {
+		t.Fatalf("LatestMigrationVersion() = %d, expected the schema to be at 37 (add your migration to migrationsList and bump this literal)", n)
 	}
 	if dirty != 0 {
 		t.Fatalf("%d migrations left dirty", dirty)

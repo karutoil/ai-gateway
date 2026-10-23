@@ -180,6 +180,18 @@ func (s *Store) ReplaceRule(model, strategy string, members []RuleMemberInput) e
 // ReplaceRuleWithQuota atomically swaps a rule and its optional consumed-quota
 // threshold. Keeping ReplaceRule as a wrapper preserves older API callers.
 func (s *Store) ReplaceRuleWithQuota(model, strategy string, members []RuleMemberInput, quotaThresholdPct *int) error {
+	return s.ReplaceRuleWithQuotaOrg(model, "", strategy, members, quotaThresholdPct)
+}
+
+// ReplaceRuleWithQuotaOrg is ReplaceRuleWithQuota scoped to an organization.
+// orgID == "" writes the GLOBAL rule (shared by every tenant); a non-empty orgID
+// writes a rule only that org's keys resolve. lb_rules used to be a single global
+// table while the admin API accepted org-scoped callers and validated only their
+// provider ids — so a tenant admin's PUT re-pointed EVERY tenant's traffic for
+// that model at their own provider (and their credential served other tenants'
+// prompts). Rules are now partitioned by org_id and resolution prefers the
+// caller's org before falling back to the global rule.
+func (s *Store) ReplaceRuleWithQuotaOrg(model, orgID, strategy string, members []RuleMemberInput, quotaThresholdPct *int) error {
 	if s.DB == nil {
 		return fmt.Errorf("lb store unavailable")
 	}
@@ -202,7 +214,7 @@ func (s *Store) ReplaceRuleWithQuota(model, strategy string, members []RuleMembe
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(db.Q(`DELETE FROM lb_rules WHERE model=?`), model); err != nil {
+	if _, err := tx.Exec(db.Q(`DELETE FROM lb_rules WHERE model=? AND COALESCE(org_id,'')=?`), model, orgID); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
@@ -215,8 +227,12 @@ func (s *Store) ReplaceRuleWithQuota(model, strategy string, members []RuleMembe
 		if weight < MinWeight {
 			weight = MinWeight
 		}
-		if _, err := tx.Exec(db.Q(`INSERT INTO lb_rules(id,model,provider_id,position,created_at,strategy,model_override,weight,quota_threshold_pct) VALUES(?,?,?,?,?,?,?,?,?)`),
-			uuid.NewString(), model, m.ProviderID, pos, now, strategy, m.ModelOverride, weight, quotaThresholdValue(quotaThresholdPct)); err != nil {
+		var orgVal any
+		if orgID != "" {
+			orgVal = orgID
+		}
+		if _, err := tx.Exec(db.Q(`INSERT INTO lb_rules(id,model,org_id,provider_id,position,created_at,strategy,model_override,weight,quota_threshold_pct) VALUES(?,?,?,?,?,?,?,?,?,?)`),
+			uuid.NewString(), model, orgVal, m.ProviderID, pos, now, strategy, m.ModelOverride, weight, quotaThresholdValue(quotaThresholdPct)); err != nil {
 			return err
 		}
 	}
@@ -237,9 +253,16 @@ func quotaThresholdValue(v *int) any {
 	return *v
 }
 
-// DeleteRule removes the rule for a model entirely.
+// DeleteRule removes the GLOBAL rule for a model entirely.
 func (s *Store) DeleteRule(model string) error {
-	_, err := s.DB.Exec(db.Q(`DELETE FROM lb_rules WHERE model=?`), normalizeModel(model))
+	return s.DeleteRuleOrg(model, "")
+}
+
+// DeleteRuleOrg removes one org's rule for a model (orgID == "" = the global
+// rule). Scoping the delete is what stops one tenant from silently degrading
+// routing for every other tenant.
+func (s *Store) DeleteRuleOrg(model, orgID string) error {
+	_, err := s.DB.Exec(db.Q(`DELETE FROM lb_rules WHERE model=? AND COALESCE(org_id,'')=?`), normalizeModel(model), orgID)
 	return err
 }
 
@@ -248,8 +271,24 @@ func (s *Store) DeleteRule(model string) error {
 // them); if every member is down the full set returns and lets normal
 // retry/failure handling report honestly.
 func (s *Store) RuleForModel(model string) *Rule {
+	return s.ruleForModelOrg(model, "")
+}
+
+// RuleForModelOrg resolves a model's rule for a caller in orgID: the org's own
+// rule wins, and the global rule (org_id NULL) is the fallback. That ordering is
+// what makes a tenant-specific route possible without letting it leak sideways.
+func (s *Store) RuleForModelOrg(model, orgID string) *Rule {
+	if orgID != "" {
+		if r := s.ruleForModelOrg(model, orgID); r != nil {
+			return r
+		}
+	}
+	return s.ruleForModelOrg(model, "")
+}
+
+func (s *Store) ruleForModelOrg(model, orgID string) *Rule {
 	model = normalizeModel(model)
-	rows, err := s.DB.Query(db.Q(`SELECT lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE lr.model=? ORDER BY lr.position ASC`), model)
+	rows, err := s.DB.Query(db.Q(`SELECT lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE lr.model=? AND COALESCE(lr.org_id,'')=? ORDER BY lr.position ASC`), model, orgID)
 	if err != nil {
 		return nil
 	}
@@ -289,7 +328,19 @@ func (s *Store) RuleForModel(model string) *Rule {
 // AllRules lists every configured rule with joined provider metadata,
 // ordered by model then position.
 func (s *Store) AllRules() ([]Rule, error) {
-	rows, err := s.DB.Query(db.Q(`SELECT lr.model, lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id ORDER BY lr.model ASC, lr.position ASC`))
+	return s.AllRulesForOrg("")
+}
+
+// AllRulesForOrg lists the rules visible to a caller in orgID: its own org's
+// rules plus the global ones. orgID == "" lists only global rules.
+func (s *Store) AllRulesForOrg(orgID string) ([]Rule, error) {
+	var rows *sql.Rows
+	var err error
+	if orgID == "" {
+		rows, err = s.DB.Query(db.Q(`SELECT lr.model, lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE COALESCE(lr.org_id,'')='' ORDER BY lr.model ASC, lr.position ASC`))
+	} else {
+		rows, err = s.DB.Query(db.Q(`SELECT lr.model, lr.provider_id, p.name, p.type, lr.position, lr.strategy, lr.model_override, lr.weight, p.health_status, lr.quota_threshold_pct FROM lb_rules lr JOIN providers p ON p.id = lr.provider_id WHERE COALESCE(lr.org_id,'') IN ('', ?) ORDER BY lr.model ASC, lr.position ASC`), orgID)
+	}
 	if err != nil {
 		return nil, err
 	}

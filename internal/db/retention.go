@@ -15,6 +15,18 @@ import (
 // expiry-driven pruning cover the rest.
 const DefaultVideoJobRetention = 7 * 24 * time.Hour
 
+// DefaultAbandonedJobLifetime is how long a NON-terminal video job may sit
+// without ever reaching a terminal state before it is declared abandoned.
+//
+// The gateway deliberately runs no background poller (028_video_jobs.sql), so a
+// client that POSTs /v1/videos and never polls leaves a `queued`/`in_progress`
+// row forever. PruneVideoJobs only deletes TERMINAL rows — correctly, since
+// deleting an in-flight job turns a slow generation into a 404 — so without this
+// transition the table is still unbounded, and each abandoned row carries the
+// full prompt text and a signed download URL (the two fields retention exists to
+// age out). No real generation runs for a day.
+const DefaultAbandonedJobLifetime = 24 * time.Hour
+
 // videoJobTerminalStatuses are the statuses after which a job can never change
 // again. A row in any other state is still owned by an in-flight request and is
 // never pruned, however old it looks: deleting it would turn a slow generation
@@ -32,6 +44,10 @@ var videoJobTerminalStatuses = []string{"completed", "failed", "expired", "cance
 type VideoJobPruneResult struct {
 	Expired   int64
 	Retention int64
+	// Abandoned is how many non-terminal rows were transitioned to failed
+	// because they outlived DefaultAbandonedJobLifetime. They are deleted by a
+	// later sweep, not this one.
+	Abandoned int64
 	// Batches is how many DELETE statements ran. A sweep stops as soon as a
 	// batch deletes fewer rows than the limit, so steady state costs one
 	// statement per predicate.
@@ -154,9 +170,175 @@ func PruneVideoJobs(ctx context.Context, database *sql.DB, batchSize int, retent
 		log.Info().
 			Int64("expired", res.Expired).
 			Int64("retention", res.Retention).
+			Int64("abandoned", res.Abandoned).
 			Int("batches", res.Batches).
 			Dur("retention_window", retention).
 			Msg("video job retention sweep")
 	}
 	return res, nil
+}
+
+// AbandonNonTerminalVideoJobs transitions video jobs that have been
+// non-terminal for longer than maxAge into `failed`/`abandoned`, so the existing
+// terminal-only sweep can reclaim them.
+//
+// Transitioning (not deleting) preserves the invariant PruneVideoJobs documents:
+// an in-flight job is never removed from under a polling client. It only becomes
+// reclaimable once it is provably dead — nothing generates a video for a day.
+func AbandonNonTerminalVideoJobs(ctx context.Context, database *sql.DB, batchSize int, maxAge time.Duration) (int64, error) {
+	if database == nil {
+		return 0, fmt.Errorf("abandon video jobs: nil database")
+	}
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	if maxAge <= 0 {
+		maxAge = DefaultAbandonedJobLifetime
+	}
+	cutoff := time.Now().UTC().Add(-maxAge)
+	terminalList := strings.TrimSuffix(strings.Repeat("?,", len(videoJobTerminalStatuses)), ",")
+	q := Rebind(`UPDATE video_jobs
+	   SET status = 'failed', error_code = 'abandoned',
+	       error_message = 'the job was never polled to completion and has been abandoned',
+	       updated_at = ?
+	 WHERE id IN (
+	   SELECT id FROM video_jobs
+	    WHERE created_at < ? AND status NOT IN (` + terminalList + `)
+	    LIMIT ?)`)
+
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		args := make([]any, 0, len(videoJobTerminalStatuses)+3)
+		args = append(args, time.Now().UTC(), cutoff)
+		for _, s := range videoJobTerminalStatuses {
+			args = append(args, s)
+		}
+		args = append(args, batchSize)
+		r, err := database.ExecContext(ctx, q, args...)
+		if err != nil {
+			return total, fmt.Errorf("abandon video jobs: %w", err)
+		}
+		n, _ := r.RowsAffected()
+		total += n
+		if n < int64(batchSize) {
+			break
+		}
+	}
+	if total > 0 {
+		log.Info().Int64("abandoned", total).Dur("max_age", maxAge).Msg("video jobs abandoned (never polled to completion)")
+	}
+	return total, nil
+}
+
+// PruneAuditLogs deletes audit_logs rows older than the given cutoff in bounded
+// batches.
+//
+// audit_logs receives one row per mutating control-plane request and nothing
+// ever pruned it: the trail grew forever, and its own unbounded size is what
+// makes an operator's audit query slow exactly when they need it. Batched for
+// the same reason as PruneRequestLogs (one unbounded DELETE holds SQLite's only
+// connection and balloons the WAL).
+func PruneAuditLogs(ctx context.Context, database *sql.DB, cutoff time.Time, batchSize int) (int64, error) {
+	if database == nil {
+		return 0, fmt.Errorf("prune audit logs: nil database")
+	}
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	q := Rebind(`DELETE FROM audit_logs WHERE id IN (
+		SELECT id FROM audit_logs WHERE created_at < ? LIMIT ?)`)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		r, err := database.ExecContext(ctx, q, cutoff, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("prune audit logs: %w", err)
+		}
+		n, _ := r.RowsAffected()
+		total += n
+		if n < int64(batchSize) {
+			break
+		}
+	}
+	return total, nil
+}
+
+// PruneMCPToolCalls deletes mcp_tool_calls rows older than the given cutoff in
+// bounded batches. Same class as the video_jobs leak: the table is written
+// synchronously on every tool round and never pruned, so an auto-executing
+// deployment accumulates millions of rows that nothing reads.
+func PruneMCPToolCalls(ctx context.Context, database *sql.DB, cutoff time.Time, batchSize int) (int64, error) {
+	if database == nil {
+		return 0, fmt.Errorf("prune mcp tool calls: nil database")
+	}
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	q := Rebind(`DELETE FROM mcp_tool_calls WHERE id IN (
+		SELECT id FROM mcp_tool_calls WHERE created_at < ? LIMIT ?)`)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		r, err := database.ExecContext(ctx, q, cutoff, batchSize)
+		if err != nil {
+			// A deployment that never enabled MCP has no such table; that is not
+			// an error worth logging on every sweep.
+			if strings.Contains(strings.ToLower(err.Error()), "no such table") ||
+				strings.Contains(strings.ToLower(err.Error()), "does not exist") {
+				return total, nil
+			}
+			return total, fmt.Errorf("prune mcp tool calls: %w", err)
+		}
+		n, _ := r.RowsAffected()
+		total += n
+		if n < int64(batchSize) {
+			break
+		}
+	}
+	return total, nil
+}
+
+// PruneRequestLogs deletes request_logs rows older than the given cutoff in
+// bounded batches.
+//
+// The previous implementation was ONE unbounded `DELETE FROM request_logs WHERE
+// created_at < ?`. LOG_RETENTION_DAYS defaults to 0 (disabled), so the first
+// purge an operator enables runs against the ENTIRE history accumulated while it
+// was off: the statement builds a WAL segment roughly the size of the deleted
+// data and holds SQLite's single writer — and, because the pool is pinned to one
+// connection, the single reader too — so every concurrent request blocks for the
+// duration instead of failing fast. Batching keeps the write transaction small
+// and lets the sweeper yield between batches.
+func PruneRequestLogs(ctx context.Context, database *sql.DB, cutoff time.Time, batchSize int) (int64, error) {
+	if database == nil {
+		return 0, fmt.Errorf("prune request logs: nil database")
+	}
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	q := Rebind(`DELETE FROM request_logs WHERE id IN (
+		SELECT id FROM request_logs WHERE created_at < ? LIMIT ?)`)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		r, err := database.ExecContext(ctx, q, cutoff, batchSize)
+		if err != nil {
+			return total, fmt.Errorf("prune request logs: %w", err)
+		}
+		n, _ := r.RowsAffected()
+		total += n
+		if n < int64(batchSize) {
+			break
+		}
+	}
+	return total, nil
 }

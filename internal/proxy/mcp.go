@@ -77,6 +77,22 @@ func forceNonStream(body []byte) []byte {
 	return out
 }
 
+// mcpRoundKey marks a request as one iteration of the gateway-side MCP tool
+// loop. It is a context key on purpose: the marker must not be reachable from
+// the wire (see mcpRound in fallback.go).
+type mcpRoundKey struct{}
+
+// withMCPRound tags ctx as an internal MCP tool round.
+func withMCPRound(ctx context.Context) context.Context {
+	return context.WithValue(ctx, mcpRoundKey{}, true)
+}
+
+// isMCPRound reports whether ctx belongs to an internal MCP tool round.
+func isMCPRound(ctx context.Context) bool {
+	v, _ := ctx.Value(mcpRoundKey{}).(bool)
+	return v
+}
+
 // mcpPrepareOutcome is the tri-state result of resolving MCP references. It
 // exists so "no references" (forward unchanged) can never be confused with
 // "references were invalid, the response is already written" (stop).
@@ -158,7 +174,7 @@ func (h *Handler) runMCPLoop(w http.ResponseWriter, r *http.Request, body []byte
 func (h *Handler) mcpRound(ctx context.Context, r *http.Request, body []byte, proto mcp.Protocol, endpoint string) mcp.RoundResponse {
 	roundBody := forceNonStream(body)
 	bw := newBufferedResponseWriter()
-	rr := r.Clone(ctx)
+	rr := r.Clone(withMCPRound(ctx))
 	rr.Body = io.NopCloser(bytes.NewReader(roundBody))
 	rr.ContentLength = int64(len(roundBody))
 	rr.Header = r.Header.Clone()
@@ -166,7 +182,7 @@ func (h *Handler) mcpRound(ctx context.Context, r *http.Request, body []byte, pr
 	rr.Header.Del("Accept")
 	// A round must never consult or populate the response cache: the same body
 	// repeated in a loop would otherwise replay a stale pre-tool answer.
-	rr.Header.Set("X-Gateway-MCP-Round", "1")
+	rr.Header.Del("X-Gateway-MCP-Round")
 
 	switch proto {
 	case mcp.ProtocolAnthropic:

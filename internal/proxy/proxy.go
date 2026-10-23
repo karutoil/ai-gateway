@@ -88,7 +88,8 @@ type Handler struct {
 	StreamUsageInject bool
 
 	// MaxBodyBytes bounds how much of a client request body the gateway
-	// buffers (413 beyond). Zero/negative = DefaultMaxProxyRequestBodyBytes.
+	// buffers (413 beyond). Negative = DefaultMaxProxyRequestBodyBytes;
+	// ZERO = the cap is DISABLED (unlimited), matching MAX_PROXY_BODY_MB=0.
 	MaxBodyBytes int64
 
 	// MaxResponseBytes bounds how much of an upstream RESPONSE body the
@@ -157,6 +158,21 @@ func NewWithCatalog(ps *provider.Store, cs *catalog.Store, db *sql.DB) *Handler 
 	return h
 }
 
+// ApplyTimeouts installs the operator-configured timeouts and REBUILDS the
+// outbound client so the transport actually observes them.
+//
+// The transport's ResponseHeaderTimeout is fixed at construction, and main()
+// used to overwrite Handler.Timeouts AFTER proxy.New had already baked the
+// defaults into Handler.Client. UPSTREAM_HEADER_TIMEOUT_SECONDS was therefore
+// inert: measured, a 3s setting still waited the full 120s default against a
+// hung upstream (which also exceeds the 85s first-byte budget, so the request
+// was guaranteed to end in the TTFB path instead of the clean 504 the operator
+// configured for).
+func (h *Handler) ApplyTimeouts(tc TimeoutsConfig) {
+	h.Timeouts = tc
+	h.Client = GatewayHTTPClient(NewGatewayTransport(tc.UpstreamHeader, true))
+}
+
 func (h *Handler) resolveAlias(model string) string {
 	// direct alias
 	if h.DB != nil {
@@ -200,10 +216,20 @@ func (h *Handler) enforceModelAllowlist(w http.ResponseWriter, r *http.Request, 
 // client as a misleading upstream 400.
 func (h *Handler) readProxyBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	limit := h.MaxBodyBytes
-	if limit <= 0 {
+	// MaxBodyBytes < 0 means "unset": fall back to the documented default.
+	// MaxBodyBytes == 0 is the documented "cap disabled" value (see
+	// MAX_PROXY_BODY_MB and Handler.MaxBodyBytes) and MUST mean unlimited —
+	// the previous `limit <= 0 → default` collapsed the two, so an operator
+	// who set 0 to allow 100 MiB agentic contexts still got a hard 413 at
+	// 64 MiB pointing at a knob set to 0.
+	var reader io.Reader = r.Body
+	if limit < 0 {
 		limit = DefaultMaxProxyRequestBodyBytes
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if limit > 0 {
+		reader = http.MaxBytesReader(w, r.Body, limit)
+	}
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		httperr.Write(w, http.StatusRequestEntityTooLarge,
 			fmt.Sprintf("request body exceeds %d byte limit (MAX_PROXY_BODY_MB)", limit), httperr.TypeInvalid)
@@ -669,6 +695,22 @@ func extractUsageDetailFromMap(m map[string]interface{}) (prompt, completion int
 	if usage, ok := m["usage"].(map[string]interface{}); ok {
 		prompt, completion = readUsageTokens(usage)
 		d = usageDetailFromMap(usage)
+	} else if msg, ok := m["message"].(map[string]interface{}); ok {
+		// Anthropic's message_start frame nests usage one level down:
+		//   {"type":"message_start","message":{"usage":{"input_tokens":N,
+		//    "cache_read_input_tokens":X,"cache_creation_input_tokens":Y}}}
+		// This branch was missing, so the CACHE fields never reached the detail
+		// used to PRICE the stream (they only reached the log row via the
+		// body-capture path, and only when LOG_BODIES was on). harvestAnthropic
+		// Tokens folds cache tokens into prompt_tokens, so streamSplit charged
+		// every cache-read token at the full input rate: a cached agentic turn
+		// with 100k cache-read + 1k fresh billed ~9x the real price and fired
+		// budget_exceeded early — while the row's cache_read_tokens column said
+		// 0 (or disagreed with cost_usd).
+		if usage, ok := msg["usage"].(map[string]interface{}); ok {
+			prompt, completion = readUsageTokens(usage)
+			d = usageDetailFromMap(usage)
+		}
 	} else if resp, ok := m["response"].(map[string]interface{}); ok {
 		// responses API frames wrap usage + status under "response".
 		if usage, ok := resp["usage"].(map[string]interface{}); ok {
@@ -893,6 +935,21 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// copyHeaderTruncated copies upstream response headers for a relay whose body
+// was read through a LimitReader, then drops the framing headers that describe
+// the ORIGINAL body.
+//
+// Relaying a truncated body under the upstream's Content-Length makes Go's
+// server abort the connection after the short write, so the client sees
+// `unexpected EOF` instead of the error the gateway meant to deliver — and a
+// Content-Encoding header over a partial gzip body is unparseable. Every
+// bounded relay path must use this instead of copyHeader.
+func copyHeaderTruncated(dst, src http.Header) {
+	copyHeader(dst, src)
+	dst.Del("Content-Length")
+	dst.Del("Content-Encoding")
 }
 
 func (h *Handler) serveCacheHit(w http.ResponseWriter, body []byte, status int, headers http.Header) {
@@ -1565,7 +1622,7 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 				h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), 0, 0, 0, true)
 				return attemptOutcome{committed: true, status: resp.StatusCode}
 			}
-			copyHeader(w.Header(), resp.Header)
+			copyHeaderTruncated(w.Header(), resp.Header)
 			applyFallbackHeader(w.Header())
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(errBody)
@@ -1580,8 +1637,20 @@ func (h *Handler) proxyWithMetricsOpts(w http.ResponseWriter, r *http.Request, t
 			if ttfbTimer != nil {
 				ttfbTimer.Stop()
 			}
-			h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader, ttfb, streamCache, cacheStatus)
+			pumped := h.pumpStream(w, r, req.Context(), resp, model, keyPrefix, providerID, endpoint, start, isAnthropicUpstream, applyFallbackHeader, ttfb, streamCache, cacheStatus)
 			ttfb.stop()
+			// A pump that failed before committing any byte must be reported as
+			// such: hard-coding committed=true stopped the candidate chain from
+			// failing over to a healthy provider even though the client had
+			// received nothing, and (with the old in-band terminator) answered
+			// `200 text/plain` full of SSE frames.
+			if pumped.midStreamFailure && !pumped.committed && !pumped.clientGone {
+				status := pumped.status
+				if status == 0 {
+					status = http.StatusBadGateway
+				}
+				return attemptOutcome{committed: false, status: status, retriable: pumped.retriable}
+			}
 			return attemptOutcome{committed: true, status: lastStatus}
 		}
 
@@ -1979,6 +2048,14 @@ type streamPumpResult struct {
 	midStreamFailure bool
 	clientGone       bool
 	capture          *streamCapture // assembled-text capture; nil when body logging is off
+	// committed reports whether any byte reached the client. A mid-stream
+	// failure that happened BEFORE the first byte is a plain pre-commit
+	// failure: it must not be reported as committed, or the candidate chain
+	// stops failing over even though the client received nothing.
+	committed bool
+	// status/retriable describe the pre-commit failure for the caller.
+	status    int
+	retriable bool
 }
 
 // streamCapture accumulates the assistant-visible content of a stream into a
@@ -2446,6 +2523,13 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		capture = newStreamCapture(h.BodyLogMaxBytes)
 	}
 
+	// terminalSeen records that the assistant turn COMPLETED: a finish_reason,
+	// the OpenAI [DONE] sentinel, or an anthropic message_stop reached this
+	// process. It is what separates "the client hung up because it was done"
+	// from "the client vanished mid-response", which are both observed as
+	// r.Context().Done() but must not be reported the same way.
+	terminalSeen := false
+
 	harvest := func(frame []byte) {
 		events := parseSSEEvents(frame)
 		for _, ev := range events {
@@ -2462,6 +2546,7 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 				sample.Write(snapshot)
 			}
 			if bytes.Equal(bytes.TrimSpace(ev.data), []byte("[DONE]")) {
+				terminalSeen = true
 				continue
 			}
 			var evMap map[string]interface{}
@@ -2489,6 +2574,12 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 			}
 			if pd.FinishReason != "" {
 				liveDetail.FinishReason = pd.FinishReason
+				terminalSeen = true
+			}
+			// Anthropic has no finish_reason on the wire: its terminal event
+			// is `event: message_stop`.
+			if ev.name == "message_stop" {
+				terminalSeen = true
 			}
 			if pd.CacheRead > 0 || pd.CacheWrite > 0 {
 				anthropicCache := pd.CacheWrite // cache_write is anthropic-only
@@ -2540,6 +2631,22 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 			logStatus = 499 // nginx convention: client closed request
 		}
 		if !clientGone {
+			// If nothing has been committed yet, NOTHING reached the client, so
+			// this is a plain pre-commit failure: answering an in-band SSE
+			// terminator here made Go write an implicit `200 text/plain`
+			// containing `data:` frames (strict SDKs raise a parse error instead
+			// of retrying) AND marked the attempt committed, which stopped the
+			// candidate chain from failing over to a healthy provider. Report it
+			// as uncommitted and let the caller answer/retry properly.
+			if !ttfb.sent.Load() {
+				res.committed = false
+				res.status = http.StatusBadGateway
+				res.retriable = true
+				log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Msg("stream failed before any bytes; not committed, eligible for failover")
+				h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
+				h.logRequestStreamed(r.Context(), keyPrefix, providerID, model, endpoint, logStatus, time.Since(start).Milliseconds(), ttftMs, promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
+				return res
+			}
 			writeStreamTerminator(w, flusher, clientDialectAnthropic, reason)
 		}
 		log.Error().Str("model", model).Str("provider", providerID).Str("reason", reason).Bool("client_gone", clientGone).Msg("mid-stream failure terminated")
@@ -2577,11 +2684,41 @@ func (h *Handler) pumpStream(w http.ResponseWriter, r *http.Request, upstreamCtx
 		return res
 	}
 
+	// finishDelivered records a response the CLIENT received in full, whose
+	// connection it then closed before the upstream's EOF. That is the normal
+	// behaviour of every SSE client (read to the terminator, hang up) and the
+	// single largest source of the gateway's 499 rows: ~95% of production 499s
+	// carried finish_reason=tool_calls AND a billed cost, i.e. the turn had
+	// completed. It is a success, so it is logged with the upstream status and
+	// billed normally — but the stream cache is deliberately NOT committed: the
+	// byte stream is short of its tail, and replaying it would truncate every
+	// later identical request.
+	finishDelivered := func() streamPumpResult {
+		if len(pending) > 0 {
+			harvest(pending)
+			pending = nil
+		}
+		res.promptTokens, res.completionTokens = promptTok, completeTok
+		res.bodySnapshot = sample.Bytes()
+		res.capture = capture
+		res.committed = true
+		cost := h.costForModel(model, streamSplit(promptTok, completeTok, liveDetail))
+		h.recordUsage(keyPrefix, r, promptTok+completeTok, cost)
+		h.logRequestStreamed(r.Context(), keyPrefix, providerID, model, endpoint, resp.StatusCode, time.Since(start).Milliseconds(), ttftMs, promptTok, completeTok, cost, sample.Bytes(), capture, cacheStatus, liveDetail)
+		return res
+	}
+
 	for {
 		select {
 		case <-r.Context().Done():
 			resp.Body.Close()
 			drainChan(chunks)
+			// terminalSeen is only ever set from a frame this loop ALREADY
+			// relayed to the client, so it is proof the turn was delivered —
+			// not an inference from a chunk that happened to be queued.
+			if terminalSeen {
+				return finishDelivered()
+			}
 			return fail("gateway client disconnected", true)
 
 		case <-umbraC:
@@ -2963,11 +3100,28 @@ func hasResponsesOutput(body []byte) bool {
 
 // recordUsage forwards real usage to the budget ledger sink when wired.
 func (h *Handler) recordUsage(keyPrefix string, r *http.Request, tokens int, costUSD float64) {
+	if r == nil {
+		h.recordUsageCtx(context.Background(), keyPrefix, tokens, costUSD)
+		return
+	}
+	h.recordUsageCtx(r.Context(), keyPrefix, tokens, costUSD)
+}
+
+// recordUsageCtx is recordUsage for call sites that only carry a context (the
+// OAuth transports thread ctx, not *http.Request, through their helpers).
+//
+// This is the ONLY live writer into spend_counters, which is what
+// budget.DBlimiter.Check reads. The Antigravity and Devin transports used to
+// call logRequestExtended alone — so their spend appeared in request_logs and
+// the dashboards but never reached the ledger, leaving daily/monthly key caps
+// and org budgets unenforced for those providers (and only repaired at boot by
+// backfillFromRequestLogs). Every successful completion must call this.
+func (h *Handler) recordUsageCtx(ctx context.Context, keyPrefix string, tokens int, costUSD float64) {
 	if h.Usage == nil || (tokens == 0 && costUSD == 0) {
 		return
 	}
 	var orgPtr *string
-	if k, ok := middleware.GatewayKeyFromContext(r.Context()); ok && k != nil && k.OrgID != nil {
+	if k, ok := middleware.GatewayKeyFromContext(ctx); ok && k != nil && k.OrgID != nil {
 		orgPtr = k.OrgID
 	}
 	h.Usage.RecordUsage(keyPrefix, orgPtr, tokens, costUSD, time.Now().UTC())
@@ -3691,6 +3845,18 @@ func (h *Handler) incBillableRetry(endpoint string, status int) {
 	resilience.IncBillableRetrySkip(endpoint, status)
 }
 
+// settingString reads a string system_config key ("" when unset).
+func (h *Handler) settingString(key string) string {
+	if h.DB == nil {
+		return ""
+	}
+	var v sql.NullString
+	if err := h.DB.QueryRow(db.Q(`SELECT value FROM system_config WHERE key=?`), key).Scan(&v); err != nil || !v.Valid {
+		return ""
+	}
+	return strings.TrimSpace(v.String)
+}
+
 // settingFloat reads a numeric system_config key ("" / unparseable → 0).
 func (h *Handler) settingFloat(key string) float64 {
 	if h.DB == nil {
@@ -3871,7 +4037,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.rejectImageModelOnText(w, model, "/v1/chat/completions") {
 		return
 	}
-	if rejectDecisionModelOnText(w, model, "/v1/chat/completions") {
+	if h.rejectDecisionModelOnText(w, model, "/v1/chat/completions") {
 		return
 	}
 	if h.rejectVideoModelOnText(w, model, "/v1/chat/completions") {
@@ -3956,7 +4122,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.proxyDevin(w, r, body, isStream, model, "chat.completions", keyPrefix, start, p0)
 		return
 	}
-	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, string, error) {
+	h.proxyCandidates(w, r, body, isStream, model, "chat.completions", keyPrefix, start, candidates, rule, func(p *models.Provider, body []byte, candModel string) (string, string, []byte, bool, string, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
 			return "", "", nil, false, "", err
@@ -3988,8 +4154,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 // Completions handles POST /v1/completions
-
-// Completions handles POST /v1/completions
 func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	body, bodyOK := h.readProxyBody(w, r)
 	if !bodyOK {
@@ -4018,7 +4182,7 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 	if h.rejectImageModelOnText(w, model, "/v1/completions") {
 		return
 	}
-	if rejectDecisionModelOnText(w, model, "/v1/completions") {
+	if h.rejectDecisionModelOnText(w, model, "/v1/completions") {
 		return
 	}
 	if h.rejectVideoModelOnText(w, model, "/v1/completions") {
@@ -4169,10 +4333,22 @@ func (h *Handler) Completions(w http.ResponseWriter, r *http.Request) {
 		translated, _, err := translate.OpenAIToAnthropic(body)
 		if err == nil {
 			body = translated
-			target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+			target = joinUpstreamPath(p.BaseURL, "/v1/messages")
 		}
 	}
 	start := time.Now()
+	// Billing accuracy: a streamed legacy completion carries no usage unless the
+	// caller asked for stream_options.include_usage, so an OpenAI-shaped upstream
+	// emits no usage frame at all and the whole request meters at 0 tokens / $0 —
+	// an unmetered path on a fully registered route. Inject it into the FINAL
+	// body (post-translation, so it lands on whatever is actually sent upstream);
+	// it is a no-op for the Anthropic dialect, which reports usage on
+	// message_start/message_delta unconditionally.
+	if isStream && h.StreamUsageInject {
+		if b2, changed := injectStreamUsage(body); changed {
+			body = b2
+		}
+	}
 	out := h.proxyWithMetricsOpts(w, r, target, apiKey, body, isStream, model, p.ID, r.Header.Get("X-Gateway-Key-Prefix"), "completions", start, isAnthropic, proxyOpts{provider: p})
 	if !out.committed {
 		// Client-caused upstream 5xx: relay the upstream's verdict (the
@@ -4223,7 +4399,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if h.rejectImageModelOnText(w, model, "/v1/embeddings") {
 		return
 	}
-	if rejectDecisionModelOnText(w, model, "/v1/embeddings") {
+	if h.rejectDecisionModelOnText(w, model, "/v1/embeddings") {
 		return
 	}
 	if h.rejectVideoModelOnText(w, model, "/v1/embeddings") {
@@ -4246,7 +4422,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	h.proxyCandidates(w, r, body, false, model, "embeddings", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, string, error) {
+	h.proxyCandidates(w, r, body, false, model, "embeddings", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte, candModel string) (string, string, []byte, bool, string, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
 			return "", "", nil, false, "", err
@@ -4743,7 +4919,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if h.rejectImageModelOnText(w, model, "/v1/messages") {
 		return
 	}
-	if rejectDecisionModelOnText(w, model, "/v1/messages") {
+	if h.rejectDecisionModelOnText(w, model, "/v1/messages") {
 		return
 	}
 	if h.rejectVideoModelOnText(w, model, "/v1/messages") {
@@ -4842,7 +5018,7 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte) (string, string, []byte, bool, string, error) {
+	h.proxyCandidates(w, r, body, isStream, model, "messages", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule, func(p *models.Provider, body []byte, candModel string) (string, string, []byte, bool, string, error) {
 		apiKey, err := h.ProviderStore.DecryptKey(p)
 		if err != nil {
 			return "", "", nil, false, "", err
@@ -4855,14 +5031,38 @@ func (h *Handler) AnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		if upstream != bodyModel {
 			out = replaceModelInBody(body, upstream)
 		}
-		target := strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+		target := joinUpstreamPath(p.BaseURL, "/v1/messages")
 		if strings.HasSuffix(p.BaseURL, "/v1/messages") {
 			target = p.BaseURL
 		} else if strings.Contains(p.BaseURL, "anthropic.com") && !strings.Contains(target, "/v1/messages") {
-			target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+			target = joinUpstreamPath(p.BaseURL, "/v1/messages")
 		}
 		return target, apiKey, out, true, "", nil
 	})
+}
+
+// joinUpstreamPath appends an API path to a provider base URL without
+// duplicating a version segment.
+//
+// normalizeBaseURL only trims a trailing slash, so a provider configured as
+// `https://api.anthropic.com/v1` (the form every Anthropic SDK uses as
+// base_url) produced `/v1/v1/messages` on every request: a 404 from the
+// provider that looks like a bad key. The suffix check keeps an operator who
+// pasted the full endpoint working too.
+func joinUpstreamPath(baseURL, path string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	path = "/" + strings.TrimLeft(path, "/")
+	if base == "" {
+		return path
+	}
+	if strings.HasSuffix(strings.ToLower(base), strings.ToLower(path)) {
+		return base
+	}
+	// Drop a duplicated version segment: base ".../v1" + path "/v1/messages".
+	if strings.HasSuffix(strings.ToLower(base), "/v1") && strings.HasPrefix(strings.ToLower(path), "/v1/") {
+		return base + path[len("/v1"):]
+	}
+	return base + path
 }
 
 // hasPreviousResponseID reports whether a /v1/responses body carries
@@ -4900,7 +5100,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	if h.rejectImageModelOnText(w, model, "/v1/responses") {
 		return
 	}
-	if rejectDecisionModelOnText(w, model, "/v1/responses") {
+	if h.rejectDecisionModelOnText(w, model, "/v1/responses") {
 		return
 	}
 	if h.rejectVideoModelOnText(w, model, "/v1/responses") {
@@ -5111,7 +5311,12 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 					if !nativeSSE && jsonOK && noHTML && !hasResponsesOutput(bodyBytes) {
 						log.Info().Str("model", model).Str("provider", p.ID).Msg("native responses JSON missing output; falling through to translated path")
 					} else if (jsonOK && noHTML) || nativeSSE {
-						copyHeader(w.Header(), resp.Header)
+						// bodyBytes came through a bounded read, so the upstream's
+						// framing headers describe a different body length: relaying
+						// them verbatim makes the server abort the connection on the
+						// short write (client sees `unexpected EOF` instead of the
+						// payload). copyHeaderTruncated drops them.
+						copyHeaderTruncated(w.Header(), resp.Header)
 						w.WriteHeader(resp.StatusCode)
 						w.Write(bodyBytes)
 						pt, ct2 := extractUsage(bodyBytes)
@@ -5134,7 +5339,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				if resp.StatusCode == http.StatusTooManyRequests {
 					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 					resp.Body.Close()
-					copyHeader(w.Header(), resp.Header)
+					copyHeaderTruncated(w.Header(), resp.Header)
 					if w.Header().Get("Retry-After") == "" {
 						w.Header().Set("Retry-After", "2")
 					}
@@ -5159,7 +5364,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				log.Info().Str("model", model).Str("provider", p.ID).Int("status", resp.StatusCode).Str("err", errSnippet(errBody)).Msg("native responses probe rejected; falling through to translated path")
 				resp.Body.Close()
 				if responsesOnly {
-					copyHeader(w.Header(), resp.Header)
+					copyHeaderTruncated(w.Header(), resp.Header)
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(resp.StatusCode)
 					if len(errBody) > 0 {
@@ -5219,7 +5424,7 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		upstreamBody = translated2
-		target = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+		target = joinUpstreamPath(p.BaseURL, "/v1/messages")
 		isAnthropicUpstream = true
 	} else {
 		// The translated chat body goes to an OpenAI-compat upstream: apply

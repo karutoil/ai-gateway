@@ -453,3 +453,73 @@ func TestImageCreateDoesNotFailOver(t *testing.T) {
 		t.Fatalf("secondary was billed for a failed create (%d hits); failover must be disabled", hitsB)
 	}
 }
+
+// TestImageEditsModelOverrideReachesUpstream is the edits mirror of
+// TestImageModelOverrideReachesUpstream.
+//
+// The override travels on the candidate and is applied with replaceModelInBody,
+// a JSON rewriter — which is a no-op on a MULTIPART body. The edits prepare
+// closure therefore re-derived the upstream model from the (unmodified) form and
+// sent the client's alias, so /v1/images/edits silently ignored
+// lb_rules.model_override while /v1/images/generations honoured it: the provider
+// answered 400 for the alias, and when the alias happened to be a valid id the
+// request was priced from the alias (unpriced → $0) while the log recorded the
+// override. The fix threads the router-resolved candidate model into prepareFn.
+func TestImageEditsModelOverrideReachesUpstream(t *testing.T) {
+	var gotModel string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(8 << 20); err == nil {
+			gotModel = r.FormValue("model")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"created": 1, "data": []map[string]any{{"b64_json": tinyPNG}}})
+	}))
+	defer upstream.Close()
+
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ps := provider.NewStore(database, make([]byte, 32))
+	ks := apikey.NewStore(database)
+	p, err := ps.Create("xaip", models.ProviderXAI, upstream.URL+"/v1", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lbs := lb.NewStore(database)
+	if err := lbs.ReplaceRule("img-alias", "", []lb.RuleMemberInput{
+		{ProviderID: p.ID, ModelOverride: "grok-imagine-image-2.0"},
+	}); err != nil {
+		t.Fatalf("replace rule: %v", err)
+	}
+	k, _ := ks.Create("img-edit-key")
+	h := newLegacyHandler(ps, database)
+	h.LB = lbs
+	r := chi.NewRouter()
+	r.Post("/v1/images/edits", h.ImageEdits)
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	buf, ct := buildEdit(t, [][2]string{
+		{"model", "img-alias"}, {"prompt", "add a hat"},
+	}, []editFile{{"image", "a.png", "image/png", decodeB64(t, tinyPNG)}})
+	resp, body := postMultipart(t, srv.URL+"/v1/images/edits", k.Key, buf, ct)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	if gotModel != "grok-imagine-image-2.0" {
+		t.Fatalf("upstream model = %q, want the rule's model_override (multipart body was not rewritten)", gotModel)
+	}
+	var loggedModel string
+	var cost float64
+	if err := database.QueryRow(`SELECT model, COALESCE(cost_usd,0) FROM request_logs ORDER BY created_at DESC LIMIT 1`).Scan(&loggedModel, &cost); err != nil {
+		t.Fatalf("request_logs: %v", err)
+	}
+	if loggedModel != "grok-imagine-image-2.0" {
+		t.Fatalf("billed model = %q, want the override", loggedModel)
+	}
+	if cost <= 0 {
+		t.Fatalf("cost = %v, want the override's per-image price", cost)
+	}
+}

@@ -47,6 +47,25 @@ fi
 # Counter file may be corrupt/truncated — never let it break arithmetic.
 [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
 
+# A MISSING PROBE TOOL IS NOT AN OUTAGE.
+#
+# pg_isready/ping/curl used to run as bare commands, so "binary not on PATH"
+# (exit 127) was indistinguishable from "primary unreachable" and incremented the
+# failure counter — three rounds of a missing `pg_isready` promoted the standby
+# while the primary was still accepting writes (two writable primaries; the
+# later failback then wipes the old primary's rows). Refuse to run at all
+# instead, without touching FAIL_FILE.
+for tool in curl pg_isready; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "watchdog: required tool '$tool' not found on PATH — refusing to judge primary health" >&2
+    exit 2
+  fi
+done
+if [[ "$SKIP_PING" != true ]] && ! command -v ping >/dev/null 2>&1; then
+  echo "watchdog: required tool 'ping' not found on PATH (set SKIP_PING=true to skip ICMP)" >&2
+  exit 2
+fi
+
 check_ok=true
 if [[ -n "$PRIMARY_DB_HOST" ]]; then
   if pg_isready -h "$PRIMARY_DB_HOST" -p "$PRIMARY_DB_PORT" >/dev/null 2>&1; then
@@ -96,7 +115,14 @@ if [[ "$fails" -ge "$FAIL_THRESHOLD" ]]; then
     echo "watchdog: threshold reached, promoting"
     PROMOTE="$(dirname "$0")/promote.sh"
     [[ -x "$PROMOTE" ]] || PROMOTE="/opt/ai-gateway/deploy/failover/promote.sh"
-    if "$PROMOTE" --force; then
+    # NO --force. --force is precisely the flag that skips promote.sh's own
+    # primary-liveness re-check, and this watchdog's inputs can be stale (a
+    # tunnel blip, a false ICMP negative, a public-health false alarm). Promoting
+    # while the primary is alive produces two writable primaries; the later
+    # failback re-bases the old primary and destroys everything written to it in
+    # the meantime. The re-check is the only split-brain guard in the stack, so
+    # auto-promotion must never disable it.
+    if "$PROMOTE"; then
       touch "$PROMOTED_FILE"
       echo 0 >"$FAIL_FILE"
     else

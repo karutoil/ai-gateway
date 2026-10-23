@@ -14,6 +14,8 @@ import (
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/db"
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/middleware"
+	"ai-gateway/internal/rbac"
 	"ai-gateway/internal/webhook"
 
 	"github.com/go-chi/chi/v5"
@@ -60,11 +62,19 @@ func validEventName(e string) bool {
 }
 
 func (h *WebhookHandler) Routes(r chi.Router) {
-	r.Get("/webhooks", h.List)
-	r.With(h.RequireSettingsWrite()).Post("/webhooks", h.Create)
-	r.With(h.RequireSettingsWrite()).Put("/webhooks/{id}", h.Update)
-	r.With(h.RequireSettingsWrite()).Delete("/webhooks/{id}", h.Delete)
-	r.With(h.RequireSettingsWrite()).Post("/webhooks/{id}/test", h.Test)
+	// A webhook URL embeds the delivery token (Slack/Discord/Teams), so it is a
+	// credential, not metadata: reading it is gated on the same permission as
+	// mutating it. It used to be readable with logs:read (a default for member
+	// and support), which let any member exfiltrate the URL and post arbitrary
+	// content into the operator's channel.
+	//
+	// RequirePerm (not the handler-local check) so the RBAC middleware caches
+	// the caller's effective set and per-user grants/revokes are honoured.
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Get("/webhooks", h.List)
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Post("/webhooks", h.Create)
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Put("/webhooks/{id}", h.Update)
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Delete("/webhooks/{id}", h.Delete)
+	r.With(middleware.RequirePerm(rbac.PermSettingsWrite)).Post("/webhooks/{id}/test", h.Test)
 }
 
 // RequireSettingsWrite returns a tiny middleware using the handler's own
@@ -82,12 +92,9 @@ func (h *WebhookHandler) RequireSettingsWrite() func(http.Handler) http.Handler 
 }
 
 func (h *WebhookHandler) List(w http.ResponseWriter, r *http.Request) {
-	if !requirePermFor(r, "settings:read") {
-		// settings:read isn't in the catalog; treat logs:read as the read gate
-		if !requirePermFor(r, "logs:read") && !requirePermFor(r, "settings:write") {
-			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
-			return
-		}
+	if !requirePermFor(r, rbac.PermSettingsWrite) {
+		httperr.Forbidden(w, "settings:write required to read webhook endpoints")
+		return
 	}
 	rows, err := h.DB.Query(db.Q(`SELECT id, name, url, COALESCE(events,''), COALESCE(format,'json'), enabled, created_at, updated_at, COALESCE(last_status,''), last_delivery FROM webhooks ORDER BY created_at DESC`))
 	if err != nil {

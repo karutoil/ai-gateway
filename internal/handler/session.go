@@ -38,6 +38,15 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	})
 }
 
+// SetSessionCookie is the exported form of setSessionCookie, for authentication
+// surfaces that live outside this package (passkey/recovery login). Every path
+// that mints a dashboard JWT MUST set this cookie: the SPA never persists a
+// token from a response body, so a login that only returns JSON leaves the
+// browser unauthenticated.
+func SetSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	setSessionCookie(w, r, token)
+}
+
 // clearSessionCookie removes the session cookie (logout).
 func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{

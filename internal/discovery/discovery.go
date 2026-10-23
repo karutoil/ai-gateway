@@ -16,6 +16,7 @@ import (
 	"ai-gateway/internal/decision"
 	"ai-gateway/internal/imagegen"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/netguard"
 	"ai-gateway/internal/provider"
 	"ai-gateway/internal/videogen"
 
@@ -33,7 +34,10 @@ type Service struct {
 func New(db *sql.DB, ps *provider.Store, cs *catalog.Store) *Service {
 	return &Service{
 		db: db, providerStore: ps, catalogStore: cs,
-		client: &http.Client{Timeout: 15 * time.Second},
+		// Hardened client: discovery sends the provider's decrypted key, and the
+		// default redirect policy would forward x-api-key/api-key to any host a
+		// 302 named (see netguard.HardenedClient).
+		client: netguard.HardenedClient(15 * time.Second),
 	}
 }
 

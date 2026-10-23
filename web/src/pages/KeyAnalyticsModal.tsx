@@ -104,9 +104,17 @@ export default function KeyAnalyticsModal({ keyId, onClose }: { keyId: string | 
   useEffect(() => {
     if (!keyId) { setData(null); setError(''); return }
     setLoading(true); setError('')
+    // Clear the previous key's/range's data AND guard ordering. Without the
+    // reset the modal rendered key A's prefix, request count and spend under
+    // "Key performance" while key B loaded (hundreds of ms on a busy log
+    // table), so an operator attributed one key's cost to another; without the
+    // id guard a slow 7d response could land after a 30d one.
+    setData(null)
+    let live = true
     api.keys.analytics(keyId, range)
-      .then(d => { setData(d as KeyAnalytics); setLoading(false) })
-      .catch((e: any) => { setError(e?.message || String(e)); setLoading(false) })
+      .then(d => { if (live) { setData(d as KeyAnalytics); setLoading(false) } })
+      .catch((e: any) => { if (live) { setError(e?.message || String(e)); setLoading(false) } })
+    return () => { live = false }
   }, [keyId, range, reload])
 
   return (

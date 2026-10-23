@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -794,9 +795,33 @@ func backoffSegment(slug string) string {
 // getByContains matches dated or suffixed catalog variants of a slug,
 // preferring priced rows then the shortest (closest-version) ID.
 // Case-insensitive: reseller slugs do not always match snapshot casing.
+//
+// The result is memoized (both hits and misses) because this is the LAST-RESORT
+// tier: `WHERE LOWER(id) LIKE '%slug%' ORDER BY (CASE …), LENGTH(id), id` is a
+// full table scan with a temp B-tree sort (EXPLAIN QUERY PLAN: `SCAN
+// models_catalog` + `USE TEMP B-TREE FOR ORDER BY`). It runs for every dated
+// variant and for every model the catalog does not contain at all — the
+// documented fallback-pricing case — and on the default SQLite dialect the pool
+// is a single connection, so a 6 ms scan per request also serialises every
+// request_logs insert and budget lookup behind it.
 func (s *Store) getByContains(slug string) (*models.CatalogModel, error) {
+	key := "contains:" + strings.ToLower(slug)
+	if m, found, ok := s.cache.get(key); ok {
+		if !found {
+			return nil, sql.ErrNoRows
+		}
+		return m, nil
+	}
 	pat := "%" + escapeLike(slug) + "%"
-	return scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), LENGTH(id), id LIMIT 1`), pat))
+	m, err := scanCatalogModel(s.db.QueryRow(db.Q(`SELECT `+catalogColumns+` FROM models_catalog WHERE LOWER(id) LIKE LOWER(?) ESCAPE '\' ORDER BY (CASE WHEN input_cost>0 OR output_cost>0 THEN 0 ELSE 1 END), LENGTH(id), id LIMIT 1`), pat))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			s.cache.putMiss(key)
+		}
+		return nil, err
+	}
+	s.cache.put(key, m)
+	return m, nil
 }
 
 func (s *Store) FetchAndSync() (int, error) {
@@ -980,7 +1005,22 @@ func (s *Store) syncFromProviders(providers map[string]RawProvider) (int, error)
 			} else {
 				isImage = imagegen.IsImageModel(fullID)
 			}
-			isVideo := videogen.VideoModality(string(modalitiesBytes))
+			// `video` needs the SAME curated fallback `image` has. Without it, a
+			// models.dev entry for a curated video id that carries no modality
+			// data (or reports `output:["text"]`, which is what a brand-new
+			// listing looks like) overwrote the seeded video=1 with 0. Because
+			// the curated seeds are insert-only, nothing could restore the flag:
+			// the video model silently became a TEXT model, so /v1/videos started
+			// answering 400 AND the row became eligible for chat traffic — the
+			// exact capability-isolation violation the image/video flags exist to
+			// prevent. A curated id is by construction a video model, so it wins
+			// outright; otherwise defer to the modality tag when present.
+			var isVideo bool
+			if videogen.IsVideoModel(fullID) {
+				isVideo = true
+			} else if len(videogen.OutputModalities(string(modalitiesBytes))) > 0 {
+				isVideo = videogen.VideoModality(string(modalitiesBytes))
+			}
 			if _, err := stmt.Exec(fullID, provID, m.Name, m.Description, m.Family, ctx, out, m.Cost.Input, m.Cost.Output, m.Cost.CacheRead, m.Cost.CacheWrite, m.Reasoning, m.ToolCall, m.StructuredOutput, m.Attachment, string(modalitiesBytes), m.OpenWeights, m.Knowledge, now, reasoningType, reasoningLevelsJSON, reasoningLimitsJSON, db.BoolInt(isDecision), db.BoolInt(isImage), db.BoolInt(isVideo), db.ShortID(fullID)); err != nil {
 				return count, err
 			}

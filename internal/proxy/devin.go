@@ -389,6 +389,9 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 		h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, 0, false)
+		// Devin bills $0 (subscription quota) but the TOKENS still count against a
+		// key's daily/monthly token budget; without this the ledger never sees them.
+		h.recordUsage(keyPrefix, r, prompt+completion, 0)
 		if h.Metrics != nil {
 			h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 		}
@@ -487,6 +490,7 @@ func (h *Handler) serveDevinChat(w http.ResponseWriter, r *http.Request, resp *h
 	}
 	st.Close()
 	h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, 0, true)
+	h.recordUsage(keyPrefix, r, st.prompt+st.completion, 0)
 	if h.Metrics != nil {
 		h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 	}

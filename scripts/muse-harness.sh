@@ -32,7 +32,7 @@ if ! curl -sf $GATEWAY_URL/health > /dev/null 2>&1; then
       cat /tmp/gateway-muse.log | tail -n 30
       exit 1
     fi
-    echo "  Gateway started (pid \$(ss -tlnp | grep $PORT | head -n1))"
+    echo "  Gateway started (pid $(ss -tlnp | grep $PORT | head -n1))"
   else
     echo "  bin/gateway not found, run: make build"
     exit 1
@@ -45,17 +45,17 @@ fi
 echo ""
 echo "── Provider Setup ─────────────────────────────────"
 ADMIN_TOKEN=$(curl -s -X POST $GATEWAY_URL/api/auth/login -H "Content-Type: application/json" -d "{\"password\":\"$ADMIN_PASSWORD\"}" | jq -r .token)
-if [ -z "\$ADMIN_TOKEN" ] || [ "\$ADMIN_TOKEN" = "null" ]; then
+if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   ADMIN_TOKEN=$(curl -s -X POST $GATEWAY_URL/api/auth/login -H "Content-Type: application/json" -d '{"username":"admin","password":"'"$ADMIN_PASSWORD"'"}' | jq -r .token)
 fi
-if [ -z "\$ADMIN_TOKEN" ] || [ "\$ADMIN_TOKEN" = "null" ]; then
+if [ -z "$ADMIN_TOKEN" ] || [ "$ADMIN_TOKEN" = "null" ]; then
   echo "  ✗ Admin login failed"
   exit 1
 fi
 echo "  ✓ Admin login"
 
 EXISTING=$(curl -s $GATEWAY_URL/api/providers -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r ".[] | select(.name==\"$PROVIDER\" or .name==\"ckff\") | .name" | head -n1)
-if [ -n "\$EXISTING" ]; then
+if [ -n "$EXISTING" ]; then
   echo "  ✓ Provider exists: $EXISTING"
   PROV_ID=$(curl -s $GATEWAY_URL/api/providers -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r ".[] | select(.name==\"$EXISTING\") | .id" | head -n1)
   echo "    id: $PROV_ID"
@@ -64,7 +64,7 @@ else
   RESP=$(curl -s -X POST $GATEWAY_URL/api/providers -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d "{\"name\":\"$PROVIDER\",\"type\":\"anthropic\",\"base_url\":\"https://ckff.dev\",\"api_key\":\"$CKFF_API_KEY\"}")
   echo "    $RESP" | jq . 2>/dev/null || echo "    $RESP"
   PROV_ID=$(echo "$RESP" | jq -r .id 2>/dev/null)
-  if [ -n "\$PROV_ID" ] && [ "\$PROV_ID" != "null" ]; then
+  if [ -n "$PROV_ID" ] && [ "$PROV_ID" != "null" ]; then
     echo "  Discovering models for $PROV_ID..."
     curl -s -X POST $GATEWAY_URL/api/providers/$PROV_ID/discover -H "Authorization: Bearer $ADMIN_TOKEN" | jq . 2>/dev/null | head -n 20
   fi
@@ -74,7 +74,7 @@ fi
 echo ""
 echo "  Checking model $MODEL in provider_models..."
 FOUND=$(curl -s "$GATEWAY_URL/api/provider-models?limit=100" -H "Authorization: Bearer $ADMIN_TOKEN" | grep -c "$MODEL" || true)
-if [ "\$FOUND" -gt 0 ]; then
+if [ "$FOUND" -gt 0 ]; then
   echo "  ✓ Model found in provider_models"
 else
   echo "  ⚠ Model not found in provider_models (may need manual discover)"
@@ -96,11 +96,11 @@ fi
 echo ""
 echo "── Run Harness (Real Provider: $MODEL) ────────────"
 GATEWAY_URL=$GATEWAY_URL MODEL=$MODEL PROVIDER=$PROVIDER ADMIN_PASSWORD=$ADMIN_PASSWORD /tmp/harness-muse
-HARNESS_EXIT=\$?
-if [ \$HARNESS_EXIT -ne 0 ]; then
+HARNESS_EXIT=$?
+if [ $HARNESS_EXIT -ne 0 ]; then
   echo ""
   echo "✗ Harness failed with exit $HARNESS_EXIT"
-  exit \$HARNESS_EXIT
+  exit $HARNESS_EXIT
 fi
 
 # 5. Also run Python official SDK harness if available
@@ -119,7 +119,7 @@ else
 fi
 
 # 6. Run go live e2e if requested
-if [ "\$1" = "--with-go-e2e" ]; then
+if [ "$1" = "--with-go-e2e" ]; then
   echo ""
   echo "── Go Live E2E (internal/e2e) ─────────────────────"
   GATEWAY_URL=$GATEWAY_URL go test -tags=live -run TestMuseLive -v ./internal/e2e 2>&1 | tail -n 100

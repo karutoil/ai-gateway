@@ -15,6 +15,7 @@ import (
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/db"
+	"ai-gateway/internal/handler"
 	"ai-gateway/internal/user"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -467,6 +468,11 @@ func (h *Handler) FinishLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"failed to create token"}`, http.StatusInternalServerError)
 		return
 	}
+	// The SPA never persists a token from a response body (see
+	// web/src/App.tsx loginWithToken); the session cookie IS the session. A
+	// passkey login that only returned JSON left the dashboard unauthenticated
+	// while still exposing the JWT to any body-logging proxy.
+	handler.SetSessionCookie(w, r, token)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": token, "username": waUser.Username, "role": string(waUser.Role)})
 }
@@ -510,6 +516,7 @@ func (h *Handler) VerifyRecovery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"failed to create token"}`, http.StatusInternalServerError)
 		return
 	}
+	handler.SetSessionCookie(w, r, token)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"token": token, "username": u.Username, "role": string(u.Role), "recovery": true})
 }

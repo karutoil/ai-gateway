@@ -171,7 +171,14 @@ tried:
 			if lastStatus == 401 {
 				if fresh, _, _, rerr := h.refreshAntigravityNow(ctx, p); rerr == nil {
 					access = fresh
-					req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(ep, "/")+"/v1internal:streamGenerateContent?alt=sse", bytes.NewReader(bodyForTry))
+					req2, errReq2 := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(ep, "/")+"/v1internal:streamGenerateContent?alt=sse", bytes.NewReader(bodyForTry))
+					if errReq2 != nil {
+						// A discarded error here left req2 nil and client.Do
+						// dereferenced it — a panic in the request goroutine for a
+						// malformed ANTIGRAVITY_BASE_URL, instead of an error.
+						lastErrText = "invalid upstream endpoint: " + errReq2.Error()
+						continue
+					}
 					for k, v := range antigravity.Headers(access) {
 						req2.Header.Set(k, v)
 					}
@@ -522,6 +529,7 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 		h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.recordUsage(keyPrefix, r, prompt+completion, cost)
 		if h.Metrics != nil {
 			h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 		}
@@ -565,6 +573,7 @@ func (h *Handler) serveAntigravityAsOpenAI(w http.ResponseWriter, r *http.Reques
 	st.Close()
 	cost := antigravityCost(publicID, st.prompt, st.completion)
 	h.logRequestExtended(r.Context(), keyPrefix, providerID, model, "chat.completions", http.StatusOK, time.Since(start).Milliseconds(), st.prompt, st.completion, cost, true)
+	h.recordUsage(keyPrefix, r, st.prompt+st.completion, cost)
 	if h.Metrics != nil {
 		h.Metrics.IncRequests(providerID, model, "chat.completions", http.StatusOK)
 	}
@@ -778,6 +787,7 @@ func (h *Handler) serveChunksAsAnthropic(ctx context.Context, w http.ResponseWri
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
 		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.recordUsageCtx(ctx, keyPrefix, prompt+completion, cost)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -810,6 +820,7 @@ func (h *Handler) serveChunksAsAnthropic(ctx context.Context, w http.ResponseWri
 	emit("message_delta", mustJSONString(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": finish}, "usage": map[string]any{"output_tokens": completion}}))
 	emit("message_stop", mustJSONString(map[string]any{"type": "message_stop"}))
 	h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
+	h.recordUsageCtx(ctx, keyPrefix, prompt+completion, cost)
 }
 
 // serveAntigravityAsResponses renders Antigravity output in OpenAI Responses dialect.
@@ -865,6 +876,7 @@ func (h *Handler) serveChunksAsResponses(ctx context.Context, w http.ResponseWri
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
 		h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, false)
+		h.recordUsageCtx(ctx, keyPrefix, prompt+completion, cost)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -902,4 +914,5 @@ func (h *Handler) serveChunksAsResponses(ctx context.Context, w http.ResponseWri
 	}
 	emit(map[string]any{"type": "response.completed", "response": map[string]any{"id": respID, "model": model, "status": "completed", "output": output, "usage": map[string]any{"input_tokens": prompt, "output_tokens": completion, "total_tokens": prompt + completion}}})
 	h.logRequestExtended(ctx, keyPrefix, providerID, model, endpoint, http.StatusOK, time.Since(start).Milliseconds(), prompt, completion, cost, true)
+	h.recordUsageCtx(ctx, keyPrefix, prompt+completion, cost)
 }

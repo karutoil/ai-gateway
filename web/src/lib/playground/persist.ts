@@ -12,7 +12,41 @@
 import { uid } from './format'
 import type { Msg, RenderKind, Session, VideoState } from './types'
 
-const STORE_KEY = 'gw_playground_sessions'
+/**
+ * Storage key for the transcript.
+ *
+ * The transcript is raw conversation text (prompts AND model answers), so it is
+ * namespaced by the signed-in account: the dashboard is explicitly multi-user
+ * (Users page, per-user keys, audit trail) and one workstation is routinely
+ * shared. A single unnamespaced key meant user B saw user A's prompts and
+ * answers in the tab strip after A logged out — `logout()` only clears the
+ * session cookie, never localStorage. `restore()` for a different account now
+ * finds nothing.
+ */
+const STORE_PREFIX = 'gw_playground_sessions'
+let scopedUser = ''
+
+/** scopeTranscript binds persistence to the current account (called on login). */
+export function scopeTranscript(username: string) {
+  scopedUser = (username || '').trim().toLowerCase()
+}
+
+function storeKey() {
+  return scopedUser ? `${STORE_PREFIX}:${scopedUser}` : STORE_PREFIX
+}
+
+/**
+ * clearTranscript removes the persisted transcript for the CURRENT account (and
+ * the legacy unnamespaced key). Called on logout and on a 401 so the previous
+ * user's prompts do not survive their session.
+ */
+export function clearTranscript() {
+  try {
+    localStorage.removeItem(storeKey())
+    // Legacy key written before per-user scoping.
+    localStorage.removeItem(STORE_PREFIX)
+  } catch { /* private mode */ }
+}
 
 /** Max serialized size of a decision body worth keeping (probabilities only). */
 const MAX_DECISION_BYTES = 8 * 1024
@@ -87,7 +121,7 @@ export function persist(sessions: Session[], activeId: string) {
       // the storage quota, and the inspector labels them as such.
       calls: s.calls.slice(0, 20).map(c => ({ ...c, request: undefined, response: undefined, headers: undefined })),
     }))
-    localStorage.setItem(STORE_KEY, JSON.stringify({ sessions: slim, activeId }))
+    localStorage.setItem(storeKey(), JSON.stringify({ sessions: slim, activeId }))
   } catch { /* quota or private mode — persistence is a nicety, not a requirement */ }
 }
 
@@ -98,7 +132,7 @@ export function persist(sessions: Session[], activeId: string) {
  */
 export function restore(): { sessions: Session[]; activeId: string } | null {
   try {
-    const raw = localStorage.getItem(STORE_KEY)
+    const raw = localStorage.getItem(storeKey())
     if (!raw) return null
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed?.sessions) || parsed.sessions.length === 0) return null
@@ -129,4 +163,4 @@ export function restore(): { sessions: Session[]; activeId: string } | null {
   } catch { return null }
 }
 
-export { STORE_KEY }
+export { STORE_PREFIX }

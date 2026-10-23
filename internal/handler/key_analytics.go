@@ -117,15 +117,19 @@ func (h *AdminHandler) KeyAnalytics(w http.ResponseWriter, r *http.Request) {
 			rbac.Has(perms, rbac.PermLogsRead) == false &&
 			keyCreatedBy != "" && keyCreatedBy == h.callerUserID(r)
 	}
-	if auth.GetRole(r) != "admin" && !ownScopedOwner {
-		claim := auth.GetOrgID(r)
-		if claim == "" {
-			if !h.globalScopeAllowed() {
-				httperr.Forbidden(w, "org scope required")
-				return
-			}
-		} else if claim != keyOrgID {
+	// Tenant scope applies to EVERY caller whose token carries an org claim,
+	// admins included (see oauth.go:providerInCallerScope and
+	// TestAdminOrgScopeSymmetry). The old `role != "admin"` guard meant a
+	// tenant-scoped admin could read any org's spend, top models and error
+	// samples from GET /api/keys/{id}/analytics.
+	if claim := auth.GetOrgID(r); claim != "" {
+		if claim != keyOrgID && !ownScopedOwner {
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+	} else if auth.GetRole(r) != "admin" && !ownScopedOwner {
+		if !h.globalScopeAllowed() {
+			httperr.Forbidden(w, "org scope required")
 			return
 		}
 	}

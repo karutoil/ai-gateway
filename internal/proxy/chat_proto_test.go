@@ -4,9 +4,15 @@ package proxy
 //
 // Contract: httptest mock upstreams feed REAL chi-wired handlers through
 // middleware.GatewayAuth (setup idiom borrowed from lb_route_test.go).
-// Checkpoints encode CURRENT behavior; segments that violate their spec
-// checkpoint are wrapped with t.Skipf("DEFECT-K ...") so the suite is green
-// today and becomes a hard regression gate once fixed.
+// Checkpoints encode the SPEC and are hard gates: a violation fails the suite.
+//
+// They used to be wrapped in `if got != spec { t.Skipf("DEFECT-K ...") }` with
+// the real assertion after it, so once the six tracked defects were fixed the
+// skip became unreachable-but-live: reverting any of them produced
+// `--- SKIP` and a green package instead of a red one. Do not reintroduce a
+// Skipf for a conformance checkpoint — if behaviour is knowingly non-conformant,
+// file it and assert the defect explicitly, so the test still fails when it
+// changes.
 //
 // Shared harness helpers (protoNewEnv, protoPostJSON, protoEvents,
 // protoPollUsage) live here and are reused by anthropic_proto_test.go and
@@ -574,9 +580,6 @@ func TestChatProtoAnthropicConversionMaxTokensFinishReason(t *testing.T) {
 
 	got, _ := ch["finish_reason"].(string)
 	if got != "length" {
-		t.Skipf("DEFECT-K chat-D1: anthropicToOpenAIChatResponse ignores stop_reason and always emits finish_reason=\"stop\" (proxy.go:~1159-1168) – spec requires \"length\" for max_tokens truncation – unskip after fix (pinned current value: %q)", got)
-	}
-	if got != "length" {
 		t.Fatalf("checkpoint n2: max_tokens must map to finish_reason length, got %q", got)
 	}
 }
@@ -711,15 +714,10 @@ func TestChatProtoMalformedUpstreamHonestFailure(t *testing.T) {
 
 	status, hdr, raw := env.PostRaw("/v1/chat/completions", `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}`, nil)
 
-	// PIN current behavior: body+content-type are relayed verbatim, HTTP 200.
-	if status == 200 && strings.Contains(raw, "<html>") {
-		ct := hdr.Get("Content-Type")
-		t.Skipf("DEFECT-K chat-D2: pumpStream.commit relays ANY upstream 200 blindly (proxy.go:692-698) — client got HTTP 200 Content-Type=%q with <html> payload, zero SSE frames, no [DONE], no error terminator (silent-ok). Honest failure required – unskip after fix (pinned: 200/html passthrough)", ct)
-	}
-
-	// ---- checkpoint asserts (regression gate post-fix) ----
+	// Hard gate (was a t.Skipf "DEFECT-K", which made this a permanent no-op
+	// once the defect was fixed).
 	if status != 502 && status != 500 {
-		t.Fatalf("u3: malformed upstream stream must surface an honest failure status, got %d", status)
+		t.Fatalf("u3: malformed upstream stream must surface an honest failure status, got %d (Content-Type=%q, body=%s)", status, hdr.Get("Content-Type"), raw)
 	}
 	if strings.Contains(raw, "<html>") {
 		t.Fatalf("u3: raw HTML leaked to an SSE client")

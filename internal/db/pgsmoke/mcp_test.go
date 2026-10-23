@@ -80,7 +80,7 @@ func TestMCPStoreCRUDAgainstPostgres(t *testing.T) {
 		URL:       "https://mcp.example.com/mcp",
 		AuthType:  "bearer",
 		AuthValue: "pg-secret-token",
-		Headers:   map[string]string{"X-Org": "acme"},
+		Headers:   &map[string]string{"X-Org": "acme"},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -107,7 +107,7 @@ func TestMCPStoreCRUDAgainstPostgres(t *testing.T) {
 	// --- a stdio row leaves url NULL and command set ---
 	stdio, err := store.Create(mcp.ServerInput{
 		Name: "pg-stdio", Transport: "stdio", Command: "/bin/true",
-		Args: []string{"--flag", "value"}, Env: map[string]string{"TOKEN": "abc"},
+		Args: []string{"--flag", "value"}, Env: &map[string]string{"TOKEN": "abc"},
 	})
 	if err != nil {
 		t.Fatalf("Create stdio: %v", err)

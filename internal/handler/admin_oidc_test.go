@@ -117,3 +117,48 @@ func adminID(t *testing.T, us *user.Store) string {
 	}
 	return u.ID
 }
+
+// TestOIDCProvisioningRequiresAllowlist pins the admission gate.
+//
+// Verification proves the token came from the configured issuer. It says
+// nothing about whether that subject may have a gateway account — and a
+// self-provisioned account is a `member`, which carries keys:create/rotate/
+// delete, providers:write, mcp:write and logs:read_bodies. Without this gate,
+// pointing OIDC_ISSUER at a corporate or self-service IdP turned "has an account
+// somewhere" into "can read every stored prompt and mint gateway keys".
+func TestOIDCProvisioningRequiresAllowlist(t *testing.T) {
+	h := &AdminHandler{}
+	claims := map[string]any{"email": "someone@example.com", "email_verified": true}
+
+	// Fail closed: no allowlist configured at all.
+	t.Setenv("OIDC_ALLOWED_SUBJECTS", "")
+	t.Setenv("OIDC_ALLOWED_DOMAINS", "")
+	if h.oidcSubjectAllowed("someone", claims) {
+		t.Error("with no allowlist configured, auto-provisioning must be refused")
+	}
+
+	// Exact subject allowlist.
+	t.Setenv("OIDC_ALLOWED_SUBJECTS", "alice, bob")
+	if !h.oidcSubjectAllowed("bob", claims) {
+		t.Error("a listed subject must be admitted")
+	}
+	if h.oidcSubjectAllowed("mallory", claims) {
+		t.Error("an unlisted subject must be refused")
+	}
+
+	// Domain allowlist, with email_verified enforced.
+	t.Setenv("OIDC_ALLOWED_SUBJECTS", "")
+	t.Setenv("OIDC_ALLOWED_DOMAINS", "@example.com")
+	if !h.oidcSubjectAllowed("anyone", claims) {
+		t.Error("a verified email in an allowed domain must be admitted")
+	}
+	if h.oidcSubjectAllowed("anyone", map[string]any{"email": "x@evil.com", "email_verified": true}) {
+		t.Error("a different domain must be refused")
+	}
+	if h.oidcSubjectAllowed("anyone", map[string]any{"email": "x@example.com", "email_verified": false}) {
+		t.Error("an UNVERIFIED email must not satisfy a domain gate")
+	}
+	if h.oidcSubjectAllowed("anyone", map[string]any{}) {
+		t.Error("a token with no email must be refused when only domains are allowed")
+	}
+}

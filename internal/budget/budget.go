@@ -387,6 +387,28 @@ func microToCents(m int64) int64 {
 	return m / 10000
 }
 
+// usageForMicros returns the token count and the spend in MICRO-USD.
+//
+// The enforcement comparison must be done at the ledger's own resolution.
+// usageFor truncates to whole cents, so once the ledger records micro-USD
+// accurately a key that spends $0.004 per request still reads as 0 cents and
+// never crosses a cent-denominated cap. Comparing in micros closes that loop.
+func (d *DBLimiter) usageForMicros(scope, kind string, start time.Time) (int64, int64, error) {
+	tok, micros, _, err := d.snapshot(scope, kind, start)
+	if err != nil {
+		return 0, 0, err
+	}
+	return tok, micros, nil
+}
+
+// limitMicros converts a cents-denominated limit into micro-USD for comparison.
+func limitMicros(cents int64) int64 {
+	if cents <= 0 {
+		return 0
+	}
+	return cents * 10000
+}
+
 // Check implements Limiter.Check against atomic counters. Fail-closed on
 // store errors for known keys; unknown prefixes pass through (they fail
 // auth upstream anyway).
@@ -406,34 +428,36 @@ func (d *DBLimiter) Check(prefix string, promptTokens int) error {
 	day := dayStartUTC(now)
 	month := monthStartUTC(now)
 
-	dayTok, dayCents, uerr := d.usageFor(countersKey(prefix), "day", day)
+	dayTok, dayMicros, uerr := d.usageForMicros(countersKey(prefix), "day", day)
 	if uerr != nil {
 		if hasAnyLimits(k) {
 			return fmt.Errorf("%w: daily snapshot read failed: %v", ErrBudgetUnavailable, uerr)
 		}
 		return nil
 	}
-	_, monthCents, uerr := d.usageFor(countersKey(prefix), "month", month)
+	_, monthMicros, uerr := d.usageForMicros(countersKey(prefix), "month", month)
 	if uerr != nil && hasAnyLimits(k) {
 		return fmt.Errorf("%w: monthly snapshot read failed: %v", ErrBudgetUnavailable, uerr)
 	}
 
+	// Comparisons run in MICRO-USD against a limit converted to micro-USD: a
+	// cent-truncated read made every sub-cent request invisible to the cap.
 	if k.dailyTokens > 0 && dayTok+int64(promptTokens) > k.dailyTokens {
 		return quotaErr("daily_token", k.dailyTokens, dayTok, prefix, "")
 	}
-	if k.dailyCostC > 0 && dayCents > k.dailyCostC {
-		return quotaErr("daily_cost", k.dailyCostC, dayCents, prefix, "")
+	if lim := limitMicros(k.dailyCostC); lim > 0 && dayMicros > lim {
+		return quotaErr("daily_cost", k.dailyCostC, microToCents(dayMicros), prefix, "")
 	}
-	if k.monthlyCostC > 0 && monthCents > k.monthlyCostC {
-		return quotaErr("monthly_cost", k.monthlyCostC, monthCents, prefix, "")
+	if lim := limitMicros(k.monthlyCostC); lim > 0 && monthMicros > lim {
+		return quotaErr("monthly_cost", k.monthlyCostC, microToCents(monthMicros), prefix, "")
 	}
 	if k.orgMonthlyC > 0 && k.orgID != "" {
-		_, orgMonthCents, oerr := d.usageFor(orgCountersKey(k.orgID), "month", month)
+		_, orgMonthMicros, oerr := d.usageForMicros(orgCountersKey(k.orgID), "month", month)
 		if oerr != nil {
 			return fmt.Errorf("%w: org snapshot read failed: %v", ErrBudgetUnavailable, oerr)
 		}
-		if orgMonthCents > k.orgMonthlyC {
-			return quotaErr("org_monthly_cost", k.orgMonthlyC, orgMonthCents, prefix, k.orgID)
+		if orgMonthMicros > limitMicros(k.orgMonthlyC) {
+			return quotaErr("org_monthly_cost", k.orgMonthlyC, microToCents(orgMonthMicros), prefix, k.orgID)
 		}
 	}
 	return nil
@@ -501,6 +525,48 @@ func centsToMicros(cents int) int64 {
 	}
 	c := int64(cents) * 10000 // cents (1e-2 USD) -> micro-USD (1e-6 USD)
 	return c
+}
+
+// MicroRecorder is implemented by limiters that can accumulate spend at the
+// ledger's native resolution (micro-USD) instead of whole cents.
+//
+// This exists because the Limiter interface's `costCents int` quantises every
+// request to the nearest cent. One gpt-4o-mini turn costs ~$0.004, which rounds
+// to 0 cents: the counters stayed at zero forever, so a key with a $10 monthly
+// budget could spend without bound as long as each request stayed under half a
+// cent — the budget check reads a ledger that never moves. A thousand such
+// requests are $4 of real provider spend recorded as $0.
+type MicroRecorder interface {
+	RecordUsageMicros(prefix string, tokens int, costMicros int64, at time.Time)
+	RecordOrgUsageMicros(orgID string, tokens int, costMicros int64, at time.Time)
+}
+
+// RecordUsageMicros is the exact-resolution counterpart of RecordUsage.
+func (d *DBLimiter) RecordUsageMicros(prefix string, tokens int, costMicros int64, at time.Time) {
+	if d.DB == nil || prefix == "" {
+		return
+	}
+	if costMicros < 0 {
+		costMicros = 0
+	}
+	now := at.UTC()
+	t := int64(tokens)
+	recordWindow(d, countersKey(prefix), "day", dayStartUTC(now), t, costMicros)
+	recordWindow(d, countersKey(prefix), "month", monthStartUTC(now), t, costMicros)
+}
+
+// RecordOrgUsageMicros is the exact-resolution counterpart of RecordOrgUsage.
+func (d *DBLimiter) RecordOrgUsageMicros(orgID string, tokens int, costMicros int64, at time.Time) {
+	if d.DB == nil || orgID == "" {
+		return
+	}
+	if costMicros < 0 {
+		costMicros = 0
+	}
+	now := at.UTC()
+	t := int64(tokens)
+	recordWindow(d, orgCountersKey(orgID), "day", dayStartUTC(now), t, costMicros)
+	recordWindow(d, orgCountersKey(orgID), "month", monthStartUTC(now), t, costMicros)
 }
 
 func recordWindow(d *DBLimiter, scope, period string, start time.Time, tokens, costMicros int64) {
@@ -581,13 +647,22 @@ func (u *UsageSink) RecordUsage(keyPrefix string, orgID *string, tokens int, cos
 	if u == nil || u.Limiter == nil || keyPrefix == "" {
 		return
 	}
-	cents := int(math.Round(costUSD * 100))
-	u.Limiter.RecordUsage(keyPrefix, tokens, cents, ts)
-	if u.Extra != nil {
-		u.Extra.RecordUsage(keyPrefix, tokens, cents, ts)
+	// Exact resolution, not whole cents: rounding made every sub-half-cent
+	// request free in the ledger (see MicroRecorder), which is exactly the
+	// traffic a budget cap is meant to stop. UsageSink.Limiter is a *DBLimiter,
+	// which records micro-USD natively.
+	micros := int64(math.Round(costUSD * 1_000_000))
+	if micros < 0 {
+		micros = 0
 	}
+	u.Limiter.RecordUsageMicros(keyPrefix, tokens, micros, ts)
 	if orgID != nil && *orgID != "" {
-		u.Limiter.RecordOrgUsage(*orgID, tokens, cents, ts)
+		u.Limiter.RecordOrgUsageMicros(*orgID, tokens, micros, ts)
+	}
+	if u.Extra != nil {
+		// The in-memory stage (GLOBAL_DAILY_TOKEN_LIMIT) only sums tokens, so
+		// cents granularity is harmless there.
+		u.Extra.RecordUsage(keyPrefix, tokens, int(math.Round(costUSD*100)), ts)
 	}
 }
 

@@ -70,10 +70,13 @@ export default function Users(){
   const load = async()=>{
     setLoading(true); setErr('')
     try{
-      const [users, self] = await Promise.all([api.users.list().catch(()=>[]), api.users.me().catch(()=>null)])
+      // Do NOT pre-catch into empty values: that made the `catch` below
+      // unreachable dead code and rendered a failed request as "0 users — the
+      // org has no accounts". A 500 or a network error must surface as an error.
+      const [users, self] = await Promise.all([api.users.list(), api.users.me()])
       setList(Array.isArray(users)? users: [])
       setMe(self as any)
-    }catch(e:any){ setErr(e.message)}
+    }catch(e:any){ setErr(e?.message || 'failed to load users')}
     finally{ setLoading(false)}
   }
   useEffect(()=>{ load()},[])

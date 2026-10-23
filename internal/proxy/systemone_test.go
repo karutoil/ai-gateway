@@ -194,20 +194,74 @@ func TestDecisionModelsAreListed(t *testing.T) {
 }
 
 func TestDecisionTargets(t *testing.T) {
-	if got := systemOneTarget("https://api.typesafe.ai"); got != "https://api.typesafe.ai/v1/systemone" {
-		t.Errorf("typesafe target = %q", got)
-	}
-	if got := systemOneTarget("http://localhost:8009/v1/"); got != "http://localhost:8009/v1/systemone" {
-		t.Errorf("v1 target = %q", got)
-	}
-	if got := systemOneTarget("http://localhost:8009/v1/systemone"); got != "http://localhost:8009/v1/systemone" {
-		t.Errorf("idempotent target = %q", got)
+	// The llama.cpp spelling (/v1/systemone) for typed systemone providers.
+	for _, c := range []struct{ base, path, want string }{
+		{"https://api.typesafe.ai", "/v1/systemone", "https://api.typesafe.ai/v1/systemone"},
+		{"http://localhost:8009/v1/", "/v1/systemone", "http://localhost:8009/v1/systemone"},
+		{"http://localhost:8009/v1/systemone", "/v1/systemone", "http://localhost:8009/v1/systemone"},
+		// The Jev spelling (/v1/decisions) for resellers that mirror it.
+		{"https://api.surplusintelligence.ai/v1", "/v1/decisions", "https://api.surplusintelligence.ai/v1/decisions"},
+		{"https://api.surplusintelligence.ai", "/v1/decisions", "https://api.surplusintelligence.ai/v1/decisions"},
+		// An operator override may be a bare path or a whole URL.
+		{"https://api.example/v1", "decide", "https://api.example/v1/decide"},
+		{"https://api.example/v1", "https://other.example/v2/decide", "https://other.example/v2/decide"},
+	} {
+		if got := appendEndpointPath(c.base, c.path); got != c.want {
+			t.Errorf("appendEndpointPath(%q, %q) = %q, want %q", c.base, c.path, got, c.want)
+		}
 	}
 	if got := cloudflareDecisionTarget("https://api.cloudflare.com/client/v4/accounts/abc/ai/run", "clef-flash"); got != "https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/cloudflare/clef-flash" {
 		t.Errorf("cloudflare target = %q", got)
 	}
 	if got := cloudflareDecisionTarget("https://api.cloudflare.com/client/v4/accounts/abc", "clef"); got != "https://api.cloudflare.com/client/v4/accounts/abc/@cf/cloudflare/clef" {
 		t.Errorf("cloudflare base-only target = %q", got)
+	}
+}
+
+// TestDecisionPathPerProviderDialect pins the endpoint each provider dialect
+// gets: llama.cpp/typed-systemone keeps /v1/systemone, a generic decision
+// reseller gets the Jev dialect's /v1/decisions, and the system_config override
+// replaces the path on the provider's origin.
+func TestDecisionPathPerProviderDialect(t *testing.T) {
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	h := hForDB(t, database)
+
+	cases := []struct {
+		name string
+		p    *models.Provider
+		want string
+	}{
+		{"typed systemone", &models.Provider{Name: "kev", Type: models.ProviderSystemOne, BaseURL: "http://localhost:8009/v1"}, "http://localhost:8009/v1/systemone"},
+		{"systemone base", &models.Provider{Name: "llama", Type: models.ProviderOpenAI, BaseURL: "http://localhost:8009/v1/systemone"}, "http://localhost:8009/v1/systemone"},
+		{"jev reseller", &models.Provider{Name: "surplus", Type: models.ProviderOpenAI, BaseURL: "https://api.surplusintelligence.ai/v1"}, "https://api.surplusintelligence.ai/v1/decisions"},
+		{"prefixed base", &models.Provider{Name: "mirror", Type: models.ProviderOpenAI, BaseURL: "https://gw.example/openai/v1"}, "https://gw.example/openai/v1/decisions"},
+	}
+	for _, c := range cases {
+		if got := h.decisionTarget(c.p); got != c.want {
+			t.Errorf("%s: decisionTarget = %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// A per-provider override replaces the path on the origin, so it is not
+	// re-prefixed by a gateway base path.
+	if _, err := database.Exec(`INSERT INTO system_config(key,value,updated_at) VALUES('provider.surplus.decision_path','/v2/decide',CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	p := &models.Provider{Name: "surplus", Type: models.ProviderOpenAI, BaseURL: "https://api.surplusintelligence.ai/v1"}
+	if got := h.decisionTarget(p); got != "https://api.surplusintelligence.ai/v2/decide" {
+		t.Errorf("override target = %q, want https://api.surplusintelligence.ai/v2/decide", got)
+	}
+
+	// A full URL override wins outright.
+	if _, err := database.Exec(`UPDATE system_config SET value='https://other.example/v2/decide' WHERE key='provider.surplus.decision_path'`); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.decisionTarget(p); got != "https://other.example/v2/decide" {
+		t.Errorf("full URL override = %q", got)
 	}
 }
 

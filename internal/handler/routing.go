@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"ai-gateway/internal/auth"
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/lb"
 	"ai-gateway/internal/middleware"
@@ -42,7 +43,9 @@ func NewRoutingHandler(store *lb.Store) *RoutingHandler {
 }
 
 func (h *RoutingHandler) ListRules(w http.ResponseWriter, r *http.Request) {
-	rules, err := h.LB.AllRules()
+	// Scoped: an org-scoped caller sees its own rules plus the global ones, not
+	// every tenant's provider ids, overrides and weights.
+	rules, err := h.LB.AllRulesForOrg(h.ProviderID(r))
 	if err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "failed to load routing rules", httperr.TypeProxy)
 		return
@@ -102,17 +105,22 @@ func (h *RoutingHandler) PutRule(w http.ResponseWriter, r *http.Request) {
 	if orgID != "" {
 		for _, m := range members {
 			var cnt int
-			if err := h.LB.DB.QueryRow(`SELECT COUNT(*) FROM providers WHERE id=? AND org_id=?`, m.ProviderID, orgID).Scan(&cnt); err != nil || cnt == 0 {
+			// db.Q: this query used a bare `?`, which lib/pq rejects, so on
+			// Postgres every org-scoped PutRule failed with a 403.
+			if err := h.LB.DB.QueryRow(db.Q(`SELECT COUNT(*) FROM providers WHERE id=? AND org_id=?`), m.ProviderID, orgID).Scan(&cnt); err != nil || cnt == 0 {
 				httperr.Forbidden(w, "provider not in your organization: "+m.ProviderID)
 				return
 			}
 		}
 	}
-	if err := h.LB.ReplaceRuleWithQuota(model, body.Strategy, members, body.QuotaThresholdPct); err != nil {
+	// Write the rule INTO THE CALLER'S ORG. Previously the row was global while
+	// only the provider ids were validated, so a tenant admin's PUT re-pointed
+	// every tenant's traffic for that model at their own provider.
+	if err := h.LB.ReplaceRuleWithQuotaOrg(model, orgID, body.Strategy, members, body.QuotaThresholdPct); err != nil {
 		httperr.Invalid(w, err.Error())
 		return
 	}
-	rule := h.LB.RuleForModel(model)
+	rule := h.LB.RuleForModelOrg(model, orgID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(rule)
@@ -124,7 +132,9 @@ func (h *RoutingHandler) DeleteRule(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "model required")
 		return
 	}
-	if err := h.LB.DeleteRule(model); err != nil {
+	// Delete only the caller's own rule: DeleteRule(model) removed the global
+	// rule for every tenant.
+	if err := h.LB.DeleteRuleOrg(model, h.ProviderID(r)); err != nil {
 		httperr.Write(w, http.StatusInternalServerError, "delete failed", httperr.TypeProxy)
 		return
 	}

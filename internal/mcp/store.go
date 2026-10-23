@@ -102,20 +102,32 @@ func (s *Store) uniqueSlug(base, excludeID string) (string, error) {
 }
 
 // ServerInput is the validated write payload from the admin API.
+//
+// Env and Headers are POINTERS so the payload can express three states:
+//   - nil (key absent from the JSON)  -> keep the stored blob
+//   - {}   (explicitly empty object)  -> clear it
+//   - any other map                   -> replace it
+//
+// They must be tri-state because the secret values are never returned by the
+// API (`json:"-"`), so the dashboard form cannot repopulate them. With plain
+// maps, the form posted `{}` on every save and `Update` wrote NULL over both
+// blobs — renaming a server destroyed its GITHUB_TOKEN and static auth headers
+// irrecoverably. auth_value was already protected against exactly this; env and
+// headers were not.
 type ServerInput struct {
-	Name       string            `json:"name"`
-	Slug       string            `json:"slug"`
-	Transport  string            `json:"transport"`
-	URL        string            `json:"url"`
-	Command    string            `json:"command"`
-	Args       []string          `json:"args"`
-	Env        map[string]string `json:"env"`
-	Headers    map[string]string `json:"headers"`
-	AuthType   string            `json:"auth_type"`
-	AuthHeader string            `json:"auth_header"`
-	AuthValue  string            `json:"auth_value"`
-	Enabled    *bool             `json:"enabled"`
-	OrgID      string            `json:"org_id"`
+	Name       string             `json:"name"`
+	Slug       string             `json:"slug"`
+	Transport  string             `json:"transport"`
+	URL        string             `json:"url"`
+	Command    string             `json:"command"`
+	Args       []string           `json:"args"`
+	Env        *map[string]string `json:"env,omitempty"`
+	Headers    *map[string]string `json:"headers,omitempty"`
+	AuthType   string             `json:"auth_type"`
+	AuthHeader string             `json:"auth_header"`
+	AuthValue  string             `json:"auth_value"`
+	Enabled    *bool              `json:"enabled"`
+	OrgID      string             `json:"org_id"`
 }
 
 // validate checks the payload shape. keepExistingAuth relaxes the
@@ -182,6 +194,16 @@ func (s *Store) encrypt(v any) ([]byte, error) {
 	return provider.Encrypt(b, s.masterKey)
 }
 
+// encryptPtr is the tri-state variant of encrypt used by Update: a nil pointer
+// means "the caller did not send this field, keep what is stored", which is
+// distinguishable from an explicit empty map ("clear it").
+func (s *Store) encryptPtr(v *map[string]string) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return s.encrypt(*v)
+}
+
 func (s *Store) decryptMap(blob []byte) map[string]string {
 	if len(blob) == 0 {
 		return nil
@@ -223,11 +245,18 @@ func (s *Store) Create(in ServerInput) (*Server, error) {
 	id := uuid.NewString()
 	now := time.Now().UTC()
 	argsJSON, _ := json.Marshal(in.Args)
-	envEnc, err := s.encrypt(in.Env)
+	var envMap, headersMap map[string]string
+	if in.Env != nil {
+		envMap = *in.Env
+	}
+	if in.Headers != nil {
+		headersMap = *in.Headers
+	}
+	envEnc, err := s.encrypt(envMap)
 	if err != nil {
 		return nil, err
 	}
-	headersEnc, err := s.encrypt(in.Headers)
+	headersEnc, err := s.encrypt(headersMap)
 	if err != nil {
 		return nil, err
 	}
@@ -276,11 +305,15 @@ func (s *Store) Update(id string, in ServerInput) (*Server, error) {
 		return nil, err
 	}
 	argsJSON, _ := json.Marshal(in.Args)
-	envEnc, err := s.encrypt(in.Env)
+	// env_enc / headers_enc are only rewritten when the caller actually sent the
+	// field (nil = keep). See ServerInput's doc comment: a plain map cannot
+	// distinguish "the form left it blank" from "clear it", and the blank case
+	// is what silently destroyed stored credentials on an unrelated edit.
+	envEnc, err := s.encryptPtr(in.Env)
 	if err != nil {
 		return nil, err
 	}
-	headersEnc, err := s.encrypt(in.Headers)
+	headersEnc, err := s.encryptPtr(in.Headers)
 	if err != nil {
 		return nil, err
 	}
@@ -301,8 +334,23 @@ func (s *Store) Update(id string, in ServerInput) (*Server, error) {
 		enabled = *in.Enabled
 	}
 	now := time.Now().UTC()
-	query := `UPDATE mcp_servers SET name=?,slug=?,transport=?,url=?,command=?,args=?,env_enc=?,headers_enc=?,auth_type=?,auth_header=?,enabled=?,updated_at=?`
-	params := []any{in.Name, slug, in.Transport, nullStr(in.URL), nullStr(in.Command), string(argsJSON), envEnc, headersEnc, in.AuthType, nullStr(in.AuthHeader), db.BoolInt(enabled), now}
+	query := `UPDATE mcp_servers SET name=?,slug=?,transport=?,url=?,command=?,args=?,auth_type=?,auth_header=?,enabled=?,updated_at=?`
+	params := []any{in.Name, slug, in.Transport, nullStr(in.URL), nullStr(in.Command), string(argsJSON), in.AuthType, nullStr(in.AuthHeader), db.BoolInt(enabled), now}
+	if in.Env != nil {
+		query += `,env_enc=?`
+		params = append(params, envEnc)
+	}
+	if in.Headers != nil {
+		query += `,headers_enc=?`
+		params = append(params, headersEnc)
+	}
+	// org_id was previously accepted in the payload, validated, and then
+	// silently dropped: an admin could not move a server between orgs and PUT
+	// answered 200 with the old org, which reads as success.
+	if strings.TrimSpace(in.OrgID) != "" {
+		query += `,org_id=?`
+		params = append(params, in.OrgID)
+	}
 	if authEnc != nil || in.AuthType == string(AuthNone) {
 		query += `,auth_value_enc=?`
 		if in.AuthType == string(AuthNone) {
@@ -567,7 +615,29 @@ func (s *Store) SetKeyPermissions(keyID string, perms []KeyPermission) error {
 			return err
 		}
 	}
+	// "Revoke all" must actually revoke. Deleting every grant row made the key
+	// indistinguishable from one that was never configured, and an unconfigured
+	// key is allowed every enabled tool — so the most common admin action
+	// (remove all MCP access) silently granted the widest possible access. The
+	// marker records that this key has been explicitly configured, which makes
+	// AccessForKey fail closed on an empty row set.
+	if _, err := tx.Exec(db.Q(`INSERT INTO mcp_key_configured(key_id,configured_at) VALUES(?,?)
+		ON CONFLICT(key_id) DO UPDATE SET configured_at=excluded.configured_at`), keyID, now); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// keyConfigured reports whether the operator has ever set this key's grants.
+func (s *Store) keyConfigured(keyID string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(db.Q(`SELECT COUNT(*) FROM mcp_key_configured WHERE key_id=?`), keyID).Scan(&n)
+	if err != nil {
+		// Table absent on a deployment that predates this migration: treat as
+		// unconfigured (the historical permissive default) rather than denying.
+		return false, nil
+	}
+	return n > 0, nil
 }
 
 // Access describes the effective tools a key may use.
@@ -594,6 +664,13 @@ func (s *Store) AccessForKey(key *models.GatewayKey) (*Access, error) {
 		return nil, err
 	}
 	access.Explicit = len(perms) > 0
+	if !access.Explicit {
+		// An explicit "no grants" state (see SetKeyPermissions) is a DENY, not
+		// the historical allow-all default.
+		if configured, cerr := s.keyConfigured(key.ID); cerr == nil && configured {
+			access.Explicit = true
+		}
+	}
 	permByServer := make(map[string]KeyPermission, len(perms))
 	for _, p := range perms {
 		permByServer[p.ServerID] = p

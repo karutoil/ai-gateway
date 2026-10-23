@@ -165,6 +165,39 @@ TTL): identical bodies are replayed as `X-Cache: HIT` with no upstream call and
 `cost_usd=0`. Filtering and routing are bidirectional: decision providers never
 receive chat traffic and text providers never receive `/v1/systemone` traffic.
 
+### Which models count as decision models
+
+The capability guard and `GET /v1/models` must never disagree about the same id,
+so the guard reads the provider's own `provider_models` row first (that row *is*
+the listing). It falls back to `models_catalog`, then to the curated registry in
+`internal/decision/registry.go`. This matters because models.dev has no notion of
+decision models: its rows for decision mirrors (`opencode/jev-1.13`) carry text
+modalities, so a catalog-only verdict rejected `surplus/jev-1.13` with
+`is not a decision model` while `/v1/models` advertised it as
+`"decision": true`. A provider that lists a family id as a *text* model keeps
+chat traffic for it — the curated `jev-`/`kev-`/`clef-` family rule never
+overrides a provider's own row.
+
+### Which path a decision request uses
+
+The protocol has two spellings. Providers typed `systemone`, or whose base URL
+names a systemone endpoint, are sent to `/v1/systemone` (llama.cpp, Kev). Every
+other decision-capable provider — a Jev reseller such as Surplus Intelligence,
+which answers `POST /v1/decisions` and 404s `/v1/systemone` — is sent to
+`/v1/decisions`, appended to the provider base URL so a gateway prefix survives.
+
+A provider can override the endpoint with the `system_config` setting
+`provider.<name>.decision_path` (an admin setting, a path or a full URL):
+
+```
+PUT /api/models/settings   {"provider.surplus.decision_path":"/v1/decisions"}
+```
+
+A path override replaces the path on the provider's origin
+(`https://api.surplusintelligence.ai/v1` + `/v2/decide` →
+`https://api.surplusintelligence.ai/v2/decide`); a full URL replaces the target
+outright. Leave it unset unless the provider follows a third spelling.
+
 ---
 
 ## `IMAGE_TIMEOUT_SECONDS` — final semantics

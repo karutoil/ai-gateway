@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"ai-gateway/internal/apikey"
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/models"
+	"ai-gateway/internal/rbac"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -70,9 +72,12 @@ func SafePrefix(r *http.Request) string {
 	if k, ok := GatewayKeyFromContext(r.Context()); ok && k != nil {
 		return k.Prefix
 	}
-	if p := r.Header.Get("X-Gateway-Key-Prefix"); p != "" {
-		return p
-	}
+	// NOTE: the X-Gateway-Key-Prefix header is NOT trusted here. It is set by the
+	// middleware AFTER a key is verified, so a value present without a key in
+	// context came from the client: trusting it let any caller attribute its
+	// requests to another key in the access log, poisoning "what did key X do?"
+	// forensics. Callers that need the header (budget/ratelimit, which run after
+	// SetGatewayKey) read it directly.
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
 		auth = r.Header.Get("x-api-key")
@@ -153,11 +158,29 @@ func Logger(next http.Handler) http.Handler {
 	})
 }
 
+// Recovery converts a panic into a 500 — but only when nothing has been
+// written yet.
+//
+// Every streaming path (proxy commit(), responses_stream, the MCP bridge)
+// writes 200 + SSE headers before bytes flow. An unconditional http.Error after
+// that is ignored as a superfluous WriteHeader, so the client received a
+// valid-looking SSE stream with a bare JSON blob injected into it and no
+// terminal frame — the exact failure the SSE paths take pains to avoid.
 func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sr, _ := w.(*statusRecorder)
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Error().Interface("panic", rec).Bytes("stack", debug.Stack()).Str("path", r.URL.Path).Msg("panic recovered")
+				if sr != nil && sr.status != 0 {
+					// Response already committed: the status line cannot be
+					// changed. Close the stream cleanly instead of injecting a
+					// foreign payload into it.
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					return
+				}
 				http.Error(w, `{"error":{"message":"internal server error"}}`, http.StatusInternalServerError)
 			}
 		}()
@@ -250,6 +273,18 @@ func GatewayAuthWithJWTRevocation(store *apikey.Store, jwtSecret []byte, checker
 							http.Error(w, `{"error":{"message":"session revoked","type":"authentication_error"}}`, http.StatusUnauthorized)
 							return
 						}
+					}
+					// A dashboard session is a PROXY credential: it spends the
+					// operator's provider money with no per-user budget. Gate it
+					// on proxy:use so a `readonly` account cannot run the
+					// Playground (or replay its session cookie against
+					// /v1/images/generations) and burn the most expensive model.
+					// Role defaults are the check here because per-user grants are
+					// not carried in the JWT; readonly does not get proxy:use.
+					role, _ := claims["role"].(string)
+					if role != "" && !rbac.Has(rbac.Defaults(role), rbac.PermProxyUse) {
+						http.Error(w, `{"error":{"message":"this account may not use the proxy API (proxy:use)","type":"permission_error"}}`, http.StatusForbidden)
+						return
 					}
 					key := sessionGatewayKey(subject, orgID)
 					attachGatewayKey(next, w, r, key)
@@ -356,16 +391,57 @@ func attachGatewayKey(next http.Handler, w http.ResponseWriter, r *http.Request,
 	if key.OrgID != nil && *key.OrgID != "" {
 		r.Header.Set("X-Gateway-Org", *key.OrgID)
 	}
+	// Internal-only markers must never arrive from the wire. The MCP tool loop
+	// used to signal itself with this header; acting on a client-supplied value
+	// re-enabled retries on billable creates and forced streaming requests down
+	// the buffered (unmetered) path. The marker now lives in the request
+	// context, and this Del keeps a future reader from trusting the header.
+	r.Header.Del("X-Gateway-MCP-Round")
 	next.ServeHTTP(w, r)
 }
+
+// sessionBudgetUSD is the optional monthly spend cap applied to dashboard
+// sessions (SESSION_MONTHLY_BUDGET_USD). Zero = uncapped, which is the previous
+// behaviour: session spend is attributed (see apikey.MonthSpendUSDForPrefix) but
+// nothing enforced it, so one logged-in user could spend without limit.
+// sessionBudgetCap prefers the config value (which validates and documents the
+// knob) and falls back to a direct env read for tests that build a Handler
+// without going through config.Load.
+func sessionBudgetCap() float64 {
+	if SessionMonthlyBudgetUSD > 0 {
+		return SessionMonthlyBudgetUSD
+	}
+	return sessionBudgetUSD()
+}
+
+func sessionBudgetUSD() float64 {
+	v := strings.TrimSpace(os.Getenv("SESSION_MONTHLY_BUDGET_USD"))
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0
+	}
+	return f
+}
+
+// SessionMonthlyBudgetUSD is the config-driven override for sessionBudgetUSD,
+// set once from cfg at startup. Kept as a package var so the session key (built
+// per request) stays allocation-cheap and free of config plumbing.
+var SessionMonthlyBudgetUSD float64
+
+// SetSessionMonthlyBudget installs the operator's session spend cap.
+func SetSessionMonthlyBudget(usd float64) { SessionMonthlyBudgetUSD = usd }
 
 func sessionGatewayKey(subject, orgID string) *models.GatewayKey {
 	prefix := sessionPrefix(subject)
 	key := &models.GatewayKey{
-		ID:           "session:" + subject,
-		Name:         "session",
-		Prefix:       prefix,
-		RateLimitRPM: 120,
+		ID:               "session:" + subject,
+		Name:             "session",
+		Prefix:           prefix,
+		RateLimitRPM:     120,
+		MonthlyBudgetUSD: sessionBudgetCap(),
 	}
 	if orgID != "" {
 		key.OrgID = &orgID

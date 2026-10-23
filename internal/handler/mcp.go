@@ -50,6 +50,33 @@ func (h *MCPHandler) Routes(r chi.Router) {
 	r.With(middleware.RequirePerm(rbac.PermKeysLimits)).Put("/keys/{id}/mcp", h.SetKeyPermissions)
 }
 
+// requireStdioAllowed refuses a stdio-transport server unless the caller is a
+// global admin AND the deployment has opted in.
+//
+// SECURITY: a stdio MCP server makes the gateway spawn an arbitrary local
+// binary with its own environment (which holds MASTER_KEY). `mcp:write` is a
+// DEFAULT permission for the ordinary `member` and `support` roles, so without
+// this gate any operator account is one POST away from full control of every
+// provider credential in the deployment. Executing local code is an admin
+// capability, not a registry-editing capability.
+//
+// The operator opt-in (MCP_STDIO_ENABLED) exists so a deployment that never
+// uses local MCP servers cannot be made to spawn one at all, even by an admin.
+func requireStdioAllowed(w http.ResponseWriter, r *http.Request, transport string) bool {
+	if mcp.Transport(transport) != mcp.TransportStdio {
+		return true
+	}
+	if !mcp.StdioEnabled() {
+		httperr.Invalid(w, "stdio MCP servers are disabled on this deployment (set MCP_STDIO_ENABLED=true to allow spawning local processes)")
+		return false
+	}
+	if auth.GetRole(r) != rbac.RoleAdmin || auth.GetOrgID(r) != "" {
+		httperr.Forbidden(w, "stdio MCP servers execute local processes and may only be created by a global administrator")
+		return false
+	}
+	return true
+}
+
 func (h *MCPHandler) audit(r *http.Request, action, target string, meta any) {
 	if h.Recorder == nil {
 		return
@@ -87,12 +114,16 @@ func (h *MCPHandler) visibleServerIDs(r *http.Request) (map[string]bool, bool) {
 // previously skipped it entirely: any member (mcp:write is a default for
 // member/support) could read or mutate another org's server by id.
 func serverInCallerScope(r *http.Request, srv *mcp.Server) bool {
-	if auth.GetRole(r) == "admin" {
+	// Global admin only: a tenant-scoped admin (org claim present) is confined
+	// to its own org like everyone else.
+	if auth.GetRole(r) == "admin" && auth.GetOrgID(r) == "" {
 		return true
 	}
 	if srv.OrgID == nil || *srv.OrgID == "" {
 		return true
 	}
+	// Org-owned rows require a matching claim from ANY caller, including an
+	// admin whose token is scoped to a different org (see requireKeyScope).
 	org := auth.GetOrgID(r)
 	return org != "" && *srv.OrgID == org
 }
@@ -120,7 +151,13 @@ func (h *MCPHandler) requireServerScope(w http.ResponseWriter, r *http.Request, 
 // single-tenant contract as AdminHandler.resolveScope). Fails closed when
 // no DB handle is wired.
 func (h *MCPHandler) requireKeyScope(w http.ResponseWriter, r *http.Request, keyID string) bool {
-	if auth.GetRole(r) == "admin" {
+	// A GLOBAL admin (no org claim) passes unconditionally. An admin whose token
+	// carries an org claim is a TENANT-scoped caller and must still match the
+	// key's org — the contract oauth.go:providerInCallerScope documents and
+	// TestAdminOrgScopeSymmetry enforces for providers. The old unconditional
+	// `role == "admin"` early return let a tenant admin grant themselves MCP
+	// permissions on another tenant's key.
+	if auth.GetRole(r) == "admin" && auth.GetOrgID(r) == "" {
 		return true
 	}
 	if h.DB == nil {
@@ -150,14 +187,17 @@ func (h *MCPHandler) ListServers(w http.ResponseWriter, r *http.Request) {
 		httperr.Write(w, http.StatusInternalServerError, "failed to list mcp servers", httperr.TypeProxy)
 		return
 	}
-	org := auth.GetOrgID(r)
-	role := auth.GetRole(r)
+	// Use the SAME scope rule as the by-id endpoints (serverInCallerScope):
+	// admins see everything, global (org-less) rows are shared, and every
+	// other row requires the caller's verified org to match. The previous
+	// ad-hoc filter let a non-admin with NO org claim (`org == ""`, e.g. a
+	// user created without a membership) fall through for every row and read
+	// every tenant's name, url, command, args, auth_header and last_error.
 	out := make([]mcp.Server, 0, len(servers))
-	for _, srv := range servers {
-		if role != "admin" && org != "" && srv.OrgID != nil && *srv.OrgID != "" && *srv.OrgID != org {
-			continue
+	for i := range servers {
+		if serverInCallerScope(r, &servers[i]) {
+			out = append(out, servers[i])
 		}
-		out = append(out, srv)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -178,13 +218,17 @@ func (h *MCPHandler) CreateServer(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "invalid json")
 		return
 	}
-	// Non-admins can only create servers inside their verified org.
-	if auth.GetRole(r) != "admin" {
+	// Only a GLOBAL admin may create a server in another org or globally; a
+	// tenant admin is confined to its own org (isGlobalAdmin).
+	if !isGlobalAdmin(r) {
 		in.OrgID = auth.GetOrgID(r)
 		if in.OrgID == "" {
 			httperr.Forbidden(w, "org scope required")
 			return
 		}
+	}
+	if !requireStdioAllowed(w, r, in.Transport) {
+		return
 	}
 	srv, err := h.Store.Create(in)
 	if err != nil {
@@ -213,7 +257,7 @@ func (h *MCPHandler) UpdateServer(w http.ResponseWriter, r *http.Request) {
 		httperr.NotFound(w, "mcp server not found")
 		return
 	}
-	if auth.GetRole(r) != "admin" {
+	if !isGlobalAdmin(r) {
 		org := auth.GetOrgID(r)
 		if org == "" || existing.OrgID == nil || *existing.OrgID != org {
 			httperr.NotFound(w, "mcp server not found")
@@ -227,8 +271,15 @@ func (h *MCPHandler) UpdateServer(w http.ResponseWriter, r *http.Request) {
 	}
 	// Tenant-scoped callers cannot move a server into another org (or make
 	// it global, which every tenant can then read): pin the stored org.
-	if auth.GetRole(r) != "admin" && existing.OrgID != nil {
+	if !isGlobalAdmin(r) && existing.OrgID != nil {
 		in.OrgID = *existing.OrgID
+	}
+	// A transport change to stdio is the same privilege escalation as creating
+	// one: an existing http server can be repointed at a local binary.
+	if mcp.Transport(in.Transport) == mcp.TransportStdio || mcp.Transport(existing.Transport) == mcp.TransportStdio {
+		if !requireStdioAllowed(w, r, string(mcp.TransportStdio)) {
+			return
+		}
 	}
 	srv, err := h.Store.Update(existing.ID, in)
 	if err != nil {
@@ -256,7 +307,7 @@ func (h *MCPHandler) DeleteServer(w http.ResponseWriter, r *http.Request) {
 		httperr.NotFound(w, "mcp server not found")
 		return
 	}
-	if auth.GetRole(r) != "admin" {
+	if !isGlobalAdmin(r) {
 		org := auth.GetOrgID(r)
 		if org == "" || existing.OrgID == nil || *existing.OrgID != org {
 			httperr.NotFound(w, "mcp server not found")
@@ -478,7 +529,15 @@ func (h *MCPHandler) GetKeyPermissions(w http.ResponseWriter, r *http.Request) {
 		byServer[p.ServerID] = p
 	}
 	rows := make([]row, 0, len(servers))
-	for _, srv := range servers {
+	for i := range servers {
+		srv := servers[i]
+		// Scope the roster: without this filter every caller (mcp:read and
+		// keys:read_own are readonly defaults) received the name, slug and tool
+		// count of EVERY org's MCP servers — the deployment's whole internal
+		// tooling inventory — even though the by-id routes 404 correctly.
+		if !serverInCallerScope(r, &srv) {
+			continue
+		}
 		p, ok := byServer[srv.ID]
 		rows = append(rows, row{
 			ServerID:     srv.ID,

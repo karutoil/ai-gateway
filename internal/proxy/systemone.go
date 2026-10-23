@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/decision"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/imagegen"
@@ -71,7 +72,17 @@ func (h *Handler) SystemOne(w http.ResponseWriter, r *http.Request) {
 		body = replaceModelInBody(body, model)
 	}
 	providerHint := r.Header.Get("X-Provider")
-	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), isDecisionProvider)
+	// A provider is decision-capable when its type/base URL announces System One
+	// (llama.cpp, Workers AI) OR when its own model row marks this model as a
+	// decision model. The second half matters for a Jev reseller that speaks the
+	// protocol on its own path (surplus answers POST /v1/decisions): its models
+	// are advertised as decision by GET /v1/models, so routing must not answer
+	// "no decision-capable provider configured" for them.
+	decisionProviders := h.providersListingDecision(decision.BaseName(model))
+	capable := func(p *models.Provider) bool {
+		return isDecisionProvider(p) || decisionProviders[strings.ToLower(p.Name)]
+	}
+	candidates, rule := h.candidateProvidersWithRuleContext(r.Context(), rawModel, model, providerHint, h.requestKeyOrg(r), capable)
 	if len(candidates) == 0 {
 		if rule != nil {
 			httperr.Proxy(w, http.StatusServiceUnavailable, "no routing member is below its OAuth quota threshold")
@@ -86,7 +97,7 @@ func (h *Handler) SystemOne(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	h.proxyCandidatesWithOpts(w, r, body, false, model, "systemone", r.Header.Get("X-Gateway-Key-Prefix"), start, candidates, rule,
-		func(p *models.Provider, in []byte) (string, string, []byte, bool, string, error) {
+		func(p *models.Provider, in []byte, candModel string) (string, string, []byte, bool, string, error) {
 			apiKey, err := h.ProviderStore.DecryptKey(p)
 			if err != nil {
 				return "", "", nil, false, "", err
@@ -96,7 +107,7 @@ func (h *Handler) SystemOne(w http.ResponseWriter, r *http.Request) {
 			// calling us. Using the outer `model` billed the override while the
 			// upstream ran the alias.
 			sent := upstreamModelFor("", in, model)
-			target, out, err := decisionUpstream(p, in, sent)
+			target, out, err := h.decisionUpstream(p, in, sent)
 			if err != nil {
 				return "", "", nil, false, "", err
 			}
@@ -122,10 +133,70 @@ func isDecisionProvider(p *models.Provider) bool {
 	return strings.Contains(base, "systemone") || strings.Contains(base, "/ai/run")
 }
 
+// providersListingDecision returns the (lower-cased) names of providers whose
+// own model row marks modelID as a decision model. One query for the whole
+// candidate filter — the alternative is a row lookup per candidate provider.
+func (h *Handler) providersListingDecision(modelID string) map[string]bool {
+	out := map[string]bool{}
+	if h.DB == nil || modelID == "" {
+		return out
+	}
+	rows, err := h.DB.Query(db.Q(`SELECT LOWER(p.name) FROM provider_models pm JOIN providers p ON p.id = pm.provider_id WHERE pm.model_id=? AND pm.decision<>0`), modelID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil && name != "" {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// decisionTarget builds the URL a decision request is sent to.
+//
+// The protocol has two spellings in the wild: llama.cpp's /v1/systemone and the
+// Jev dialect's /v1/decisions (TypeSafe and the resellers mirroring it — surplus
+// answers POST /v1/decisions and 404s /v1/systemone). Providers typed systemone,
+// or whose base URL already names a systemone endpoint, keep /v1/systemone;
+// every other decision-capable provider gets /v1/decisions, appended to the base
+// URL so a gateway prefix survives.
+//
+// An operator can override per provider with the system_config setting
+// `provider.<name>.decision_path`. An override names an endpoint, not a suffix,
+// so it replaces the path on the provider's origin (and a full URL replaces the
+// whole target).
+func (h *Handler) decisionTarget(p *models.Provider) string {
+	if p == nil {
+		return ""
+	}
+	if override := h.settingString("provider." + p.Name + ".decision_path"); override != "" {
+		if u, err := url.Parse(strings.TrimSpace(p.BaseURL)); err == nil && u.Scheme != "" && u.Host != "" {
+			path := override
+			if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+				return path
+			}
+			if !strings.HasPrefix(path, "/") {
+				path = "/" + path
+			}
+			u.Path, u.RawQuery, u.Fragment = path, "", ""
+			return u.String()
+		}
+		return appendEndpointPath(p.BaseURL, override)
+	}
+	path := "/v1/decisions"
+	if p.Type == models.ProviderSystemOne || strings.Contains(strings.ToLower(p.BaseURL), "systemone") {
+		path = "/v1/systemone"
+	}
+	return appendEndpointPath(p.BaseURL, path)
+}
+
 // decisionUpstream builds the upstream URL and (dialect-specific) request body
 // for a decision request. model is the id actually being sent (the resolved
 // alias, or a routing rule's model_override).
-func decisionUpstream(p *models.Provider, body []byte, model string) (string, []byte, error) {
+func (h *Handler) decisionUpstream(p *models.Provider, body []byte, model string) (string, []byte, error) {
 	selector := decision.BaseName(model)
 	if selector == "" {
 		selector = decision.BaseName(translate.ExtractModel(body))
@@ -144,7 +215,7 @@ func decisionUpstream(p *models.Provider, body []byte, model string) (string, []
 	if cur := translate.ExtractModel(body); cur != selector && selector != "" {
 		out = replaceModelInBody(body, selector)
 	}
-	return systemOneTarget(p.BaseURL), out, nil
+	return h.decisionTarget(p), out, nil
 }
 
 // validateDecisionSelector rejects a selector that cannot be a single path
@@ -162,18 +233,30 @@ func validateDecisionSelector(selector string) error {
 	return nil
 }
 
-// systemOneTarget appends the System One path to a provider base URL without
-// doubling an existing /v1 segment.
-func systemOneTarget(baseURL string) string {
-	b := strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	switch {
-	case strings.HasSuffix(b, "/systemone"):
-		return b
-	case strings.HasSuffix(b, "/v1"):
-		return b + "/systemone"
-	default:
-		return b + "/v1/systemone"
+// appendEndpointPath joins a provider base URL with an endpoint path without
+// doubling a shared /v1 segment (base "http://host/v1" + "/v1/systemone" is
+// "http://host/v1/systemone"). An absolute path (http:// or https://) replaces
+// the base entirely, which is how an operator points a provider's decisions at
+// another host.
+func appendEndpointPath(baseURL, path string) string {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
 	}
+	if path == "" {
+		path = "/v1/systemone"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	b := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(b, path) {
+		return b
+	}
+	if strings.HasSuffix(b, "/v1") && strings.HasPrefix(path, "/v1/") {
+		return b + path[len("/v1"):]
+	}
+	return b + path
 }
 
 // cloudflareDecisionTarget builds the Workers AI run URL for a decision model:

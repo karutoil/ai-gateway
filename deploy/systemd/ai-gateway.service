@@ -28,7 +28,15 @@ Restart=on-failure
 RestartSec=2
 User=gateway
 Group=gateway
-EnvironmentFile=/etc/ai-gateway.env
+# Two accepted spellings of the env file: this unit and deploy/systemd/README.md
+# document /etc/ai-gateway.env, while the failover tooling (promote.sh,
+# sync-gateway.sh, podman-compose.standby.yml) uses /etc/ai-gateway/env. Reading
+# both (later file wins) means a promotion that rewrites either one is picked up;
+# before this, promote.sh rewrote /etc/ai-gateway/env and the promoted service
+# kept the dead primary's DATABASE_URL while the script printed success. The
+# leading "-" makes a missing file non-fatal.
+EnvironmentFile=-/etc/ai-gateway.env
+EnvironmentFile=-/etc/ai-gateway/env
 Environment=ENV=production
 ExecStart=/usr/local/bin/gateway
 WorkingDirectory=/var/lib/ai-gateway

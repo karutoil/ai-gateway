@@ -389,8 +389,13 @@ func TestMCPKeyPermissionEditor(t *testing.T) {
 		t.Fatalf("grants not cleared: %+v", perms)
 	}
 	access, _ = store.AccessForKey(verified)
-	if len(access.Tools) != 3 {
-		t.Fatalf("clearing grants should restore the default: %d tools", len(access.Tools))
+	// CORRECTED: this used to assert 3 tools, i.e. that "revoke every server"
+	// restored the allow-everything default. That is the defect, not the
+	// contract — an admin who removes all MCP access from a key must end up with
+	// a key that can use nothing. See mcp/revoke_all_test.go.
+	if !access.Explicit || len(access.Tools) != 0 || len(access.Servers) != 0 {
+		t.Fatalf("revoking every grant must deny everything, got explicit=%v servers=%d tools=%d",
+			access.Explicit, len(access.Servers), len(access.Tools))
 	}
 }
 

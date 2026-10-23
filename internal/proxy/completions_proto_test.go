@@ -128,13 +128,8 @@ func TestCompProtoAnthropicPathRequestTranslation(t *testing.T) {
 	// ---- checkpoint l2 proper (spec): OpenAI-shaped completion object ----
 	obj, _ := shaped["object"].(string)
 	chosen, hasChoices := shaped["choices"].([]interface{})
-	conforms := obj == "text_completion" && hasChoices && len(chosen) > 0 &&
-		strings.Contains(raw, `"finish_reason"`)
-	if !conforms {
-		t.Skipf("DEFECT-K comp-D1: /v1/completions anthropic-heuristic path relays the RAW Anthropic message object (type=%q, choices absent) instead of an OpenAI text_completion object; conversion exists but is gated to endpoint==chat.completions (proxy.go:587) – unskip after fix (pinned: type=message relay)", typ)
-	}
-	if obj != "text_completion" || !hasChoices {
-		t.Fatalf("l2: post-fix regression — expect OpenAI completion object")
+	if obj != "text_completion" || !hasChoices || len(chosen) == 0 || !strings.Contains(raw, `"finish_reason"`) {
+		t.Fatalf("l2: post-fix regression — expect an OpenAI text_completion object with choices and finish_reason, got object=%q choices=%d:\n%s", obj, len(chosen), raw)
 	}
 }
 
@@ -167,9 +162,6 @@ data: {"type":"message_stop"}`,
 		t.Fatalf("expected 200 got %d: %s", status, raw)
 	}
 
-	// PIN current behavior: the ANTHROPIC SSE dialect is streamed to a legacy
-	// /v1/completions client.
-	gotAnthropic := strings.Contains(raw, "event: message_start") && strings.Contains(raw, "content_block_delta")
 	ct := hdr.Get("Content-Type")
 
 	// checkpoint l2-stream (spec): legacy clients require data:-only chat-style
@@ -178,9 +170,6 @@ data: {"type":"message_stop"}`,
 	hasDataDone := strings.Contains(raw, "data: [DONE]")
 	sseCt := strings.HasPrefix(ct, "text/event-stream")
 
-	if gotAnthropic && !(openAIShape && hasDataDone) {
-		t.Skipf("DEFECT-K comp-D2: streaming /v1/completions on the anthropic heuristics path forwards the native anthropic event-dialect SSE verbatim (message_start/content_block_delta/message_stop...) though legacy completions clients can only parse data:-framed chunks ending [DONE]; Content-Type=%q – unskip after fix (pinned: anthropic dialect passthrough)", ct)
-	}
 	if !sseCt {
 		t.Fatalf("l2-stream: committed response should stay text/event-stream, got %q body=%s", ct, raw)
 	}

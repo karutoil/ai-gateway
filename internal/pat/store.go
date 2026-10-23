@@ -91,21 +91,24 @@ func (s *Store) Authenticate(raw string) (userID string, scopes string, ok bool)
 	if !strings.HasPrefix(raw, prefix) {
 		return "", "", false
 	}
-	var id string
+	var tokenID, uid string
 	var exp sql.NullTime
 	var revoked sql.NullTime
 	var sc string
+	// Select the token id AND the user id as separate columns: the previous
+	// query scanned user_id into `id` and then ran `UPDATE … WHERE id=<user
+	// id>`, which matched zero rows, so last_used_at was never recorded.
 	err := s.db.QueryRow(db.Q(
-		`SELECT user_id, scopes, expires_at, revoked_at FROM personal_access_tokens WHERE hash = ?`),
-		Hash(raw)).Scan(&id, &sc, &exp, &revoked)
+		`SELECT id, user_id, scopes, expires_at, revoked_at FROM personal_access_tokens WHERE hash = ?`),
+		Hash(raw)).Scan(&tokenID, &uid, &sc, &exp, &revoked)
 	if err != nil {
 		return "", "", false
 	}
 	if revoked.Valid || (exp.Valid && time.Now().After(exp.Time)) {
 		return "", "", false
 	}
-	_, _ = s.db.Exec(db.Q(`UPDATE personal_access_tokens SET last_used_at = ? WHERE id = ?`), time.Now().UTC(), id)
-	return id, sc, true
+	_, _ = s.db.Exec(db.Q(`UPDATE personal_access_tokens SET last_used_at = ? WHERE id = ?`), time.Now().UTC(), tokenID)
+	return uid, sc, true
 }
 
 // UsernameFor resolves the dashboard username owning a token (the auth

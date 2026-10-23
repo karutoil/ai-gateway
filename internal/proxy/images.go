@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-gateway/internal/db"
 	"ai-gateway/internal/decision"
 	"ai-gateway/internal/httperr"
 	"ai-gateway/internal/imagegen"
@@ -106,7 +108,7 @@ func (h *Handler) ImageGenerations(w http.ResponseWriter, r *http.Request) {
 	// attempt's response is transformed, on the same goroutine.
 	billModel := model
 	h.proxyCandidatesWithOpts(w, r, body, false, model, "images.generations", keyPrefix, start, h.billableImageCandidates(candidates), rule,
-		func(p *models.Provider, in []byte) (string, string, []byte, bool, string, error) {
+		func(p *models.Provider, in []byte, candModel string) (string, string, []byte, bool, string, error) {
 			n, perr := imagegen.ParseRequest(in)
 			if perr != nil {
 				return "", "", nil, false, "", perr
@@ -172,14 +174,24 @@ func (h *Handler) ImageEdits(w http.ResponseWriter, r *http.Request) {
 	keyPrefix := r.Header.Get("X-Gateway-Key-Prefix")
 	billModel := model
 	h.proxyCandidatesWithOpts(w, r, body, false, model, "images.edits", keyPrefix, start, h.billableImageCandidates(candidates), rule,
-		func(p *models.Provider, in []byte) (string, string, []byte, bool, string, error) {
+		func(p *models.Provider, in []byte, candModel string) (string, string, []byte, bool, string, error) {
 			n, f, perr := parseEditMultipart(in, contentType)
 			if perr != nil {
 				return "", "", nil, false, "", perr
 			}
-			// The rebuilt multipart body carries `model`, so the upstream id is
-			// whatever the (possibly override-rewritten) body says.
-			sent := upstreamModelFor(n.Model, nil, model)
+			// Use the candidate model the router resolved, NOT the body's
+			// `model` field. The multipart form is rebuilt from the parsed
+			// parts, so replaceModelInBody (a JSON rewriter) never touched it and
+			// the body still holds the client's alias. Taking the body's value
+			// made this route ignore lb_rules.model_override entirely: the
+			// provider received the alias (usually 400 "unknown model") and, when
+			// the alias happened to be valid, the request was PRICED from the
+			// alias while request_logs.model recorded the override — spend that
+			// reaches no budget.
+			sent := strings.TrimSpace(candModel)
+			if sent == "" {
+				sent = upstreamModelFor(n.Model, nil, model)
+			}
 			billModel = sent
 			return h.imageEditUpstreamRequest(p, n, f, sent)
 		},
@@ -801,26 +813,55 @@ func (h *Handler) rejectDecisionModelOnText(w http.ResponseWriter, model, endpoi
 	return true
 }
 
-// rejectDecisionModelOnText is the catalog-less variant of
-// (*Handler).rejectDecisionModelOnText, kept for the text-endpoint call sites in
-// internal/proxy/proxy.go (owned by another agent). Those call sites should
-// switch to the handler method, which also honours a catalog row synced with
-// decision=1; until then they keep the curated-registry behaviour.
+// providerModelDecision reads the provider_models row that GET /v1/models
+// advertises for providerName/modelID and reports its decision flag.
 //
-// Returns true when the request was rejected (the caller must return).
-func rejectDecisionModelOnText(w http.ResponseWriter, model, endpoint string) bool {
-	if !decision.IsDecisionModel(model) {
-		return false
+// That row is the most specific capability evidence the gateway has, because
+// the model listing is built from it: if /v1/models says `"decision": true`
+// for "surplus/jev-1.13", POST /v1/systemone must accept the same id. The
+// catalog alone reached the opposite verdict, because models.dev has no notion
+// of decision models — its rows for decision mirrors ("opencode/jev-1.13")
+// carry text modalities, and treating that as authoritative made the endpoint
+// reject a model its own listing advertised as a decision model.
+//
+// ok=false means there is no row (discovery has not run, or the id names a
+// models.dev namespace rather than a configured provider), in which case the
+// caller falls back to the catalog and the curated registry.
+func (h *Handler) providerModelDecision(providerName, modelID string) (dec bool, ok bool) {
+	if h.DB == nil || providerName == "" || modelID == "" {
+		return false, false
 	}
-	httperr.Invalid(w, "model '"+model+"' is a System One / decision model (typed noul/choice/score questions, no text generation); use POST /v1/systemone instead of "+endpoint)
-	return true
+	var flag sql.NullInt64
+	err := h.DB.QueryRow(db.Q(`SELECT pm.decision FROM provider_models pm JOIN providers p ON p.id = pm.provider_id WHERE LOWER(p.name)=LOWER(?) AND pm.model_id=? LIMIT 1`), providerName, modelID).Scan(&flag)
+	if err != nil {
+		return false, false
+	}
+	return flag.Int64 != 0, true
+}
+
+// providerQualifiedDecision is providerModelDecision for a client-supplied id:
+// "surplus/jev-1.13" asks the provider "surplus" about the model "jev-1.13".
+// An unqualified id has no provider to ask, so it reports ok=false and the
+// catalog/registry decide — a bare "jev-1.13" must stay a chat model for the
+// providers that mirror it as text.
+func (h *Handler) providerQualifiedDecision(model string) (dec bool, ok bool) {
+	i := strings.LastIndex(model, "/")
+	if i <= 0 || i+1 >= len(model) {
+		return false, false
+	}
+	return h.providerModelDecision(model[:i], model[i+1:])
 }
 
 // modelIsDecisionModel reports whether a model is a decision (System One)
-// model. The catalog is authoritative when it has a row (its decision flag or a
+// model. The provider's own row wins when there is one (it is what /v1/models
+// advertises, so the listing and the guards can never disagree about the same
+// id); otherwise the catalog is authoritative (its decision flag or a
 // "decision" output modality — this is where operator edits and models.dev
-// discoveries land); the curated registry is the offline fallback.
+// discoveries land) with the curated registry as the offline fallback.
 func (h *Handler) modelIsDecisionModel(model string) bool {
+	if dec, ok := h.providerQualifiedDecision(model); ok {
+		return dec
+	}
 	return decision.IsDecisionModelWithLookup(model, h.catalogCapability)
 }
 

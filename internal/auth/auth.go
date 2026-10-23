@@ -180,6 +180,9 @@ func adminMiddleware(secret []byte, checker SessionChecker) func(http.Handler) h
 				r = r.WithContext(WithRole(r.Context(), role))
 				r = r.WithContext(WithSubject(r.Context(), username))
 				r = r.WithContext(WithPATScopes(r.Context(), scopes))
+				// Report the VERIFIED identity up to the audit middleware, which
+				// sits above this one and therefore never sees this context.
+				NoteActor(r.Context(), username)
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -237,6 +240,9 @@ func adminMiddleware(secret []byte, checker SessionChecker) func(http.Handler) h
 			ctx := context.WithValue(r.Context(), contextKeyOrgID, orgID)
 			ctx = context.WithValue(ctx, contextKeyRole, role)
 			ctx = context.WithValue(ctx, contextKeySubject, subject)
+			// Report the VERIFIED identity up to the audit middleware (see
+			// WithActorBox): that middleware wraps this one and cannot see ctx.
+			NoteActor(ctx, subject)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -411,6 +417,40 @@ func WithOrgID(ctx context.Context, orgID string) context.Context {
 
 func WithSubject(ctx context.Context, subject string) context.Context {
 	return context.WithValue(ctx, contextKeySubject, subject)
+}
+
+// actorBox is a mutable holder the audit middleware installs BEFORE the auth
+// middleware runs, so an identity verified deeper in the chain can be reported
+// back to a middleware that is higher up.
+//
+// Without it the audit middleware could never attribute anything: Go's
+// middleware chain passes a NEW *http.Request down via r.WithContext(...), so
+// the request object the outer middleware still holds never sees the subject
+// that AdminMiddleware set. Every control-plane mutation was therefore recorded
+// as "anonymous" (or, after a first attempt at gating on a non-anonymous actor,
+// not recorded at all).
+type actorBox struct{ name string }
+
+type contextKeyActorBox struct{}
+
+// WithActorBox returns ctx carrying a fresh, empty actor box, plus a getter.
+// The audit middleware calls this before invoking the rest of the chain.
+func WithActorBox(ctx context.Context) (context.Context, func() string) {
+	box := &actorBox{}
+	ctx = context.WithValue(ctx, contextKeyActorBox{}, box)
+	return ctx, func() string { return box.name }
+}
+
+// NoteActor records the verified acting identity into the box installed by
+// WithActorBox. It is a no-op when no box is present (e.g. unit tests that call
+// a handler directly). Callers must pass a VERIFIED identity only.
+func NoteActor(ctx context.Context, name string) {
+	if name == "" {
+		return
+	}
+	if box, ok := ctx.Value(contextKeyActorBox{}).(*actorBox); ok && box != nil {
+		box.name = name
+	}
 }
 
 func GetSubject(r *http.Request) string {

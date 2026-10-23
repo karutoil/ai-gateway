@@ -1267,10 +1267,15 @@ func (h *Handler) copyVideoBody(w http.ResponseWriter, body io.Reader) (int64, e
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
+		// One buffer per download, copied per chunk. Allocating 32 KiB INSIDE
+		// the loop turned a 100 MB video download into ~3200 allocations
+		// (~100 MB of garbage) on the memory-heaviest route in the gateway. The
+		// copy is required: the consumer must not alias a buffer the next Read
+		// overwrites.
+		buf := make([]byte, 32<<10)
 		for {
-			buf := make([]byte, 32<<10)
 			n, err := body.Read(buf)
-			cm := chunkMsg{data: buf[:n], err: err}
+			cm := chunkMsg{data: append([]byte(nil), buf[:n]...), err: err}
 			select {
 			case chunks <- cm:
 			case <-done:

@@ -171,11 +171,13 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 			if body.NewSubscription {
 				name = h.Providers.UniqueName(name)
 			}
-			// Non-admins create inside their own verified org — the same rule
-			// as POST /providers (CreateProvider). The old call hardcoded the
-			// org to "", minting GLOBAL providers writable by any member.
+			// Anyone who is not a GLOBAL admin creates inside their own verified
+			// org — the same rule as POST /providers (CreateProvider). The old
+			// call hardcoded the org to "", minting GLOBAL providers writable by
+			// any member; and keying on role alone let a tenant ADMIN mint one
+			// outside its org too.
 			orgID := ""
-			if auth.GetRole(r) != "admin" {
+			if !isGlobalAdmin(r) {
 				orgID = auth.GetOrgID(r)
 				if orgID == "" {
 					httperr.Forbidden(w, "org scope required")

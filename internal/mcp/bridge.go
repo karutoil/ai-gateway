@@ -30,6 +30,17 @@ type Bridge struct {
 	Manager     *Manager
 	MaxRounds   int
 	LoopTimeout time.Duration
+	// Admit, when set, is called BEFORE every LLM round of the tool loop.
+	//
+	// The loop re-enters the protocol handler with a buffered writer, which
+	// bypasses the router's admission middleware: rate limits and the
+	// budget/quota check only ever ran once, for the original client request.
+	// One client request could therefore be up to MaxRounds (25) billed
+	// completions after the key had already hit its cap, and the limiter's own
+	// counters were never consulted for rounds 2..N. Returning an error aborts
+	// the loop; the proxy supplies a closure that runs the same checks the
+	// middleware does.
+	Admit func(ctx context.Context) error
 }
 
 func NewBridge(store *Store, manager *Manager, maxRounds int, loopTimeout time.Duration) *Bridge {
@@ -84,6 +95,16 @@ func (b *Bridge) RunAuto(w http.ResponseWriter, r *http.Request, expandedBody []
 	// the (buffered) tool rounds run. The final model round's bytes are
 	// forwarded verbatim afterwards.
 	var stopKeepalive func()
+	// Deferred, not called on the happy path only: a panic anywhere in the loop
+	// (exec -> the whole proxy path, Manager.CallToolMeta, AppendToolResults,
+	// ParseToolCalls) unwinds to Recovery and would leave the keepalive
+	// goroutine writing to a ResponseWriter whose ServeHTTP already returned,
+	// every 10s, forever — plus concurrent writes to a finished writer.
+	defer func() {
+		if stopKeepalive != nil {
+			stopKeepalive()
+		}
+	}()
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -103,6 +124,16 @@ func (b *Bridge) RunAuto(w http.ResponseWriter, r *http.Request, expandedBody []
 			loopErr = "mcp_max_rounds_exceeded"
 			log.Warn().Str("endpoint", endpoint).Int("rounds", rounds).Msg("mcp tool loop hit the configured round cap")
 			break
+		}
+		// Admission per round: every iteration is a separately billed upstream
+		// completion, so a key that has exhausted its budget (or its rate limit)
+		// must stop the loop here, not keep spending until MaxRounds.
+		if b.Admit != nil {
+			if aerr := b.Admit(ctx); aerr != nil {
+				loopErr = "mcp_admission_denied"
+				log.Warn().Err(aerr).Str("endpoint", endpoint).Int("rounds", rounds).Msg("mcp tool loop stopped: admission denied")
+				break
+			}
 		}
 		if ctx.Err() != nil {
 			loopErr = "mcp_timeout"
@@ -185,6 +216,7 @@ func (b *Bridge) RunAuto(w http.ResponseWriter, r *http.Request, expandedBody []
 	}
 	if stopKeepalive != nil {
 		stopKeepalive()
+		stopKeepalive = nil
 	}
 
 	// No upstream response at all (timeout before the first round).

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -15,6 +16,7 @@ import (
 	pathpkg "path"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -147,12 +149,14 @@ func main() {
 	proxyHandler := proxy.NewWithCatalog(providerStore, catalogStore, database)
 	// Hardened transport + timeouts (long streams are bounded by an idle
 	// watchdog, not a blanket client/server deadline).
-	proxyHandler.Timeouts = proxy.TimeoutsConfig{
+	// ApplyTimeouts (not a bare struct assignment) rebuilds the outbound client
+	// so the transport's ResponseHeaderTimeout honours the configured value.
+	proxyHandler.ApplyTimeouts(proxy.TimeoutsConfig{
 		UpstreamHeader:   time.Duration(cfg.UpstreamHeaderTimeoutSecs) * time.Second,
 		RequestTotal:     time.Duration(cfg.RequestTotalTimeoutSecs) * time.Second,
 		StreamIdle:       time.Duration(cfg.StreamIdleTimeoutSecs) * time.Second,
 		WriteHeaderGrace: time.Duration(cfg.WriteHeaderGraceSecs) * time.Second,
-	}
+	})
 	// Client-facing first-byte budget: default 85s (inside Cloudflare's
 	// ~100s edge window so the gateway answers before it can 524). Explicit
 	// values win, including 0 to disable; -1 (the env default) keeps 85s.
@@ -310,6 +314,26 @@ func main() {
 	mcpStore := mcp.NewStore(database, cfg.MasterKey)
 	mcpManager := mcp.NewManager(mcpStore, time.Duration(cfg.MCPCallTimeoutSecs)*time.Second)
 	mcpBridge := mcp.NewBridge(mcpStore, mcpManager, cfg.MCPMaxRounds, time.Duration(cfg.MCPLoopTimeoutSecs)*time.Second)
+	// Every round of the MCP tool loop is a separately billed upstream
+	// completion, and the loop re-enters the handler BELOW the router's
+	// admission middleware. Re-run the ledger check before each round so a key
+	// that has exhausted its budget (or its daily token cap) cannot spend
+	// MaxRounds more completions on one client request.
+	mcpBridge.Admit = func(ctx context.Context) error {
+		key, ok := middleware.GatewayKeyFromContext(ctx)
+		if !ok || key == nil {
+			return nil
+		}
+		if err := limiter.Check(key.Prefix, 0); err != nil {
+			return err
+		}
+		if memStage != nil {
+			if err := memStage.Check(key.Prefix, 0); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	proxyHandler.MCP = mcpBridge
 	mcpEndpoint := mcp.NewEndpoint(mcpStore, mcpManager, apiKeyStore)
 	// One version string in the binary: the MCP serverInfo and the clientInfo
@@ -333,10 +357,30 @@ func main() {
 		rl = middleware.NewRateLimiter()
 	}
 	proxyHandler.RateLimiter = rl
+	// Dashboard sessions spend on the proxy plane with no key of their own; give
+	// the operator a way to bound that (SESSION_MONTHLY_BUDGET_USD).
+	middleware.SetSessionMonthlyBudget(cfg.SessionMonthlyBudgetUSD)
 	r := chi.NewRouter()
+	// In-flight accounting: shutdown waits (bounded) for handlers to finish
+	// before closing the DB. Without it, srv.Close() cancelled in-flight
+	// requests, the handler's LAST act — writing the request_logs row, i.e. the
+	// bill — never ran, and database.Close() had already happened, so the spend
+	// vanished with no error logged. The provider still billed those tokens.
+	var inFlight sync.WaitGroup
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			inFlight.Add(1)
+			defer inFlight.Done()
+			next.ServeHTTP(w, r)
+		})
+	})
 	r.Use(middleware.RequestID)
-	r.Use(middleware.Recovery)
+	// Logger BEFORE Recovery so a panic still produces an access-log line:
+	// with Recovery outermost, a panic unwound through Logger without reaching
+	// its logging statement, so request-rate dashboards under-counted exactly
+	// when things were breaking.
 	r.Use(middleware.Logger)
+	r.Use(middleware.Recovery)
 	r.Use(audit.Middleware(rec))
 	// Cloudflare Tunnel / reverse proxy: trust X-Forwarded-* and CF-Connecting-IP
 	// This makes RemoteAddr, scheme and host correct behind cloudflared.
@@ -355,7 +399,7 @@ func main() {
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With", "x-api-key", "X-Provider", "anthropic-version", "X-Gateway-Key-Prefix", "X-Gateway-Org", "X-Request-ID"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Requested-With", "x-api-key", "X-Provider", "anthropic-version", "X-Request-ID"},
 		ExposedHeaders:   []string{"X-Request-ID", "Content-Type", "Authorization"},
 		AllowCredentials: allowCreds,
 		MaxAge:           300,
@@ -407,6 +451,9 @@ func main() {
 		r.Handle("/metrics", promhttp.Handler())
 	}
 
+	// Constructed BEFORE the handlers so every credential-verification path
+	// shares one set of buckets (see AuthLimiter below).
+	authLimiter := middleware.NewAuthRateLimiter()
 	admin := &handler.AdminHandler{
 		ProviderStore: providerStore,
 		APIKeyStore:   apiKeyStore,
@@ -415,7 +462,12 @@ func main() {
 		Discovery:     discoveryService,
 		UserStore:     userStore,
 		Recorder:      rec,
-		AuthLimiter:   middleware.NewAuthRateLimiter(),
+		// ONE limiter shared by every credential-verification path (password
+		// login, passkey begin/finish, recovery). Each used to get its own
+		// AuthRateLimiter with an independent per-account bucket, so
+		// AuthAttemptsPerAccountPerMinute was effectively 4x the configured value
+		// and an attacker could hop between endpoints to stretch the budget.
+		AuthLimiter: authLimiter,
 	}
 	patStore := pat.NewStore(database)
 	auth.SetPATAuthenticator(
@@ -443,8 +495,13 @@ func main() {
 		APIKeyStore: apiKeyStore,
 	}
 
-	// DB-backed webhooks: every enabled webhook row receives matching events.
+	// Webhooks: the `webhooks` TABLE rows and the env-configured WEBHOOK_URL are
+	// BOTH delivered to. main() used to replace the env dispatcher outright
+	// (SetGlobal(NewDBDispatch(...))), so an operator who set WEBHOOK_URL per
+	// ARCHITECTURE.md got silence with no warning — and the shutdown drain below
+	// was dead code because Global was never an *HTTPDispatcher.
 	webhookDispatch := webhook.NewDBDispatch(database)
+	webhookDispatch.SetEnvDispatcher(webhook.Global)
 	webhook.SetGlobal(webhookDispatch)
 	webhookHandler := &handler.WebhookHandler{DB: database, Dispatcher: webhookDispatch, Recorder: rec}
 	profileHandler := &handler.ProfileHandler{
@@ -484,11 +541,16 @@ func main() {
 		oauthHandler.PublicRoutes(r)
 		// Passkey public endpoints (no auth) — for login via passkey + recovery.
 		// Each credential-verification path gets brute-force limiting.
-		authLimiter := middleware.NewAuthRateLimiter()
 		acctOf := middleware.AccountFromLoginBody
 		if passkeyHandler != nil {
 			r.With(authLimiter.Middleware(acctOf)).Post("/auth/passkey/login/begin", passkeyHandler.BeginLogin)
-			r.With(authLimiter.Middleware(func(req *http.Request) string { return "" })).Post("/auth/passkey/login/finish", passkeyHandler.FinishLogin)
+			// login/finish carries the assertion in a nested object, not a
+			// `username` field. Returning "" skipped the per-account brake
+			// entirely, so this endpoint was protected by the per-IP limit only —
+			// the one defence a spoofed X-Forwarded-For or a botnet defeats.
+			// Key it on the credential id the assertion names, which is
+			// per-account and attacker-invisible.
+			r.With(authLimiter.Middleware(passkeyCredentialAccount)).Post("/auth/passkey/login/finish", passkeyHandler.FinishLogin)
 			r.With(authLimiter.Middleware(acctOf)).Post("/auth/recovery/verify", passkeyHandler.VerifyRecovery)
 		}
 		r.Group(func(r chi.Router) {
@@ -752,8 +814,22 @@ func main() {
 	// worker goroutine. The DB-backed dispatcher (webhook.Global when DB
 	// webhooks are configured) has no backlog — it spawns per-event
 	// deliveries that are best-effort by design.
-	if d, ok := webhook.Global.(*webhook.HTTPDispatcher); ok {
+	// Drain whichever dispatcher is installed. DBDispatch.Stop waits (bounded)
+	// for in-flight deliveries, and it owns the env dispatcher it wraps.
+	if d, ok := webhook.Global.(*webhook.DBDispatch); ok {
 		d.Stop()
+	} else if d, ok := webhook.Global.(*webhook.HTTPDispatcher); ok {
+		d.Stop()
+	}
+	// Let handlers finish their bookkeeping (the request_logs billing row, the
+	// spend ledger) before the database goes away. Bounded so a stuck handler
+	// cannot turn SIGTERM into a supervisor SIGKILL.
+	drained := make(chan struct{})
+	go func() { inFlight.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(time.Duration(cfg.ShutdownGraceSecs) * time.Second):
+		log.Warn().Msg("in-flight requests still running at shutdown; billing rows for them may be lost")
 	}
 	// Tear down MCP client sessions (their stdio child processes included)
 	// before the process exits so no orphan survives a restart.
@@ -814,20 +890,40 @@ func forwardedHeaders(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Cloudflare Tunnel sets CF-Connecting-IP to real client IP.
-		// Also respect X-Forwarded-For (first entry) and X-Real-IP.
+		// Cloudflare Tunnel sets CF-Connecting-IP to the real client IP.
+		// Otherwise walk X-Forwarded-For RIGHT TO LEFT and take the first hop
+		// that is not itself a trusted proxy.
+		//
+		// SECURITY: taking the FIRST entry was spoofable behind any standard
+		// reverse proxy. nginx's `proxy_add_x_forwarded_for` APPENDS the peer to
+		// whatever the client sent, so the leftmost entry is attacker-controlled:
+		// a client sending `X-Forwarded-For: 10.0.0.9` chose its own apparent IP,
+		// defeating per-key IP allowlists and the per-IP login rate limit. The
+		// rightmost untrusted hop is the only entry the chain vouches for.
 		realIP := ""
-		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-			realIP = strings.TrimSpace(cf)
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" && net.ParseIP(cf) != nil {
+			realIP = cf
 		} else if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// X-Forwarded-For may be "client, proxy1, proxy2"
-			if idx := strings.Index(xff, ","); idx != -1 {
-				realIP = strings.TrimSpace(xff[:idx])
-			} else {
-				realIP = strings.TrimSpace(xff)
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				hop := strings.TrimSpace(parts[i])
+				if hop == "" {
+					continue
+				}
+				if net.ParseIP(hop) == nil {
+					// Garbage in the chain: stop rather than fall back to a
+					// value we cannot parse.
+					realIP = ""
+					break
+				}
+				if i > 0 && ipInRanges(hop, trusted) {
+					continue // our own proxy hop; keep walking left
+				}
+				realIP = hop
+				break
 			}
-		} else if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			realIP = strings.TrimSpace(xri)
+		} else if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" && net.ParseIP(xri) != nil {
+			realIP = xri
 		}
 		if realIP != "" {
 			r.Header.Set("X-Real-IP", realIP)
@@ -877,8 +973,41 @@ func shutdownGraceWarning(graceSecs int, budget time.Duration) string {
 	return "SHUTDOWN_GRACE_SECONDS is shorter than the image budget: a rolling deploy will cancel in-flight image generations (clients get 502 and the request_logs billing row is lost). Set SHUTDOWN_GRACE_SECONDS >= the image budget and raise the supervisor's stop timeout above it."
 }
 
+// passkeyCredentialAccount derives a per-account bucket key for
+// /auth/passkey/login/finish from the assertion's credential id (base64url of a
+// per-credential random handle). Falls back to the empty string — per-IP only —
+// when the body cannot be parsed, because an unparseable body is rejected by the
+// handler anyway.
+func passkeyCredentialAccount(r *http.Request) string {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return ""
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var probe struct {
+		ID       string `json:"id"`
+		RawID    string `json:"rawId"`
+		Response struct {
+			ID string `json:"id"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return ""
+	}
+	for _, v := range []string{probe.ID, probe.RawID, probe.Response.ID} {
+		if v != "" {
+			return "webauthn:" + v
+		}
+	}
+	return ""
+}
+
 // runLogRetention deletes request_logs older than the configured retention
 // window once per day. Runs forever until process exit; best-effort.
+//
+// Batched (db.PruneRequestLogs): a single unbounded DELETE against a
+// year-old history holds SQLite's only connection for its whole duration and
+// balloons the WAL, so the gateway stops answering instead of failing fast.
 func runLogRetention(database *sql.DB, days int) {
 	if database == nil || days <= 0 {
 		return
@@ -887,19 +1016,31 @@ func runLogRetention(database *sql.DB, days int) {
 	defer ticker.Stop()
 	purge := func() {
 		cutoff := time.Now().UTC().AddDate(0, 0, -days)
-		var bound string
-		if db.Dialect() == "postgres" {
-			bound = cutoff.Format(time.RFC3339Nano)
-		} else {
-			bound = cutoff.Format("2006-01-02 15:04:05.999999999+00:00")
-		}
-		res, err := database.Exec(db.Q(`DELETE FROM request_logs WHERE created_at < ?`), bound)
+		// A bounded context: a purge must never become the thing that wedges
+		// the request path indefinitely.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		n, err := db.PruneRequestLogs(ctx, database, cutoff, 2000)
 		if err != nil {
-			log.Warn().Err(err).Msg("log retention purge failed")
+			log.Warn().Err(err).Int64("deleted", n).Msg("log retention purge failed")
 			return
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
+		if n > 0 {
 			log.Info().Int64("deleted", n).Int("days", days).Msg("request log retention purge")
+		}
+		// audit_logs and mcp_tool_calls ride the same window: both are
+		// append-only request-path tables with no other sweep, so leaving them
+		// out of the retention job means "log retention" silently covers only
+		// one of the three tables that grow.
+		if an, aerr := db.PruneAuditLogs(ctx, database, cutoff, 2000); aerr != nil {
+			log.Warn().Err(aerr).Msg("audit log retention purge failed")
+		} else if an > 0 {
+			log.Info().Int64("deleted", an).Int("days", days).Msg("audit log retention purge")
+		}
+		if mn, merr := db.PruneMCPToolCalls(ctx, database, cutoff, 2000); merr != nil {
+			log.Warn().Err(merr).Msg("mcp tool call retention purge failed")
+		} else if mn > 0 {
+			log.Info().Int64("deleted", mn).Int("days", days).Msg("mcp tool call retention purge")
 		}
 	}
 	purge()
@@ -922,15 +1063,25 @@ func runVideoJobRetention(database *sql.DB) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	prune := func() {
-		res, err := db.PruneVideoJobs(context.Background(), database, 500, db.DefaultVideoJobRetention)
-		if err != nil {
-			log.Warn().Err(err).Msg("video job retention sweep failed")
-			return
-		}
-		if res.Total() > 0 {
-			log.Info().Int64("expired", res.Expired).Int64("retention", res.Retention).
-				Dur("retention_window", db.DefaultVideoJobRetention).
-				Msg("video job retention sweep")
+		// Abandoned first: a job the client never polled sits in
+		// queued/in_progress forever (the gateway runs no background poller),
+		// and the terminal-only sweep below deliberately never touches a
+		// non-terminal row. Transitioning it to failed keeps the "never delete
+		// an in-flight job" invariant while making it reclaimable.
+		if n, aerr := db.AbandonNonTerminalVideoJobs(context.Background(), database, 500, db.DefaultAbandonedJobLifetime); aerr != nil {
+			log.Warn().Err(aerr).Msg("video job abandonment sweep failed")
+		} else {
+			res, err := db.PruneVideoJobs(context.Background(), database, 500, db.DefaultVideoJobRetention)
+			if err != nil {
+				log.Warn().Err(err).Msg("video job retention sweep failed")
+				return
+			}
+			res.Abandoned = n
+			if res.Total() > 0 || n > 0 {
+				log.Info().Int64("expired", res.Expired).Int64("retention", res.Retention).Int64("abandoned", n).
+					Dur("retention_window", db.DefaultVideoJobRetention).
+					Msg("video job retention sweep")
+			}
 		}
 	}
 	prune()

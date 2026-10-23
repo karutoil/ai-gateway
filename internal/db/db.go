@@ -118,6 +118,15 @@ var migration033SQL string
 //go:embed migrations/034_request_client.sql
 var migration034SQL string
 
+//go:embed migrations/035_budget_and_search_indexes.sql
+var migration035SQL string
+
+//go:embed migrations/036_lb_rules_org_scope.sql
+var migration036SQL string
+
+//go:embed migrations/037_mcp_key_configured.sql
+var migration037SQL string
+
 // migrationsList is the ordered set of embedded migrations. It is a function
 // (rather than an inline literal) so callers and tests can introspect the
 // schema version instead of hardcoding a count that goes stale on every new
@@ -164,6 +173,9 @@ func migrationsList() []struct {
 		{32, migration032SQL},
 		{33, migration033SQL},
 		{34, migration034SQL},
+		{35, migration035SQL},
+		{36, migration036SQL},
+		{37, migration037SQL},
 	}
 }
 
@@ -980,6 +992,10 @@ func applyRoutingAlters(db *sql.DB) {
 		"ALTER TABLE lb_rules ADD COLUMN strategy TEXT NOT NULL DEFAULT 'round_robin'",
 		"ALTER TABLE lb_rules ADD COLUMN model_override TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE lb_rules ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
+		// 036: routing rules are partitioned by org. Nullable keeps every
+		// pre-existing row GLOBAL (the previous behaviour), so a legacy DB and a
+		// fresh one agree; the migration adds the same column for versioned DBs.
+		"ALTER TABLE lb_rules ADD COLUMN org_id TEXT",
 	}
 	for _, stmt := range cols {
 		execAlterIdempotent(db, stmt)

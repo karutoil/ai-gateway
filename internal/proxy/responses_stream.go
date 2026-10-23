@@ -71,6 +71,34 @@ func isResponsesKeepaliveEvent(ev sseEvent) bool {
 	return false
 }
 
+// isResponsesTerminalEventName reports whether a Responses-API event type ends
+// the turn. `response.completed` is the normal end, `response.incomplete` the
+// truncated-but-final one, `response.failed` the error end — all three mean the
+// client has everything the protocol will ever send for this request.
+func isResponsesTerminalEventName(name string) bool {
+	switch name {
+	case "response.completed", "response.incomplete", "response.failed":
+		return true
+	}
+	return false
+}
+
+// eventTypeOf returns the "type" field of an SSE data payload, or "" when the
+// payload is absent or not a JSON object. Some upstreams put the event name in
+// `event:` only, some only in the payload's "type" — both are checked.
+func eventTypeOf(data []byte) string {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return ""
+	}
+	var m map[string]interface{}
+	if json.Unmarshal(trimmed, &m) != nil {
+		return ""
+	}
+	t, _ := m["type"].(string)
+	return t
+}
+
 // cutCompleteSSEBlock extracts the first complete SSE block (terminated by a
 // blank line) from pending. It handles both LF and CRLF framing and preserves
 // the original bytes verbatim for forwarding. ok=false means no complete
@@ -193,6 +221,12 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 		ttfb.sent.Store(true) // any later WriteHeader must be swallowed
 	}
 
+	// terminalSeen records that a protocol TERMINAL event (response.completed /
+	// incomplete / failed) already reached the client. A client that hangs up
+	// after it has the whole turn is done, not gone: see finishDelivered in
+	// pumpStream for the full rationale.
+	terminalSeen := false
+
 	harvestFrame := func(frame []byte) {
 		events := parseSSEEvents(frame)
 		for _, ev := range events {
@@ -210,7 +244,11 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 				sample.Write(snapshot)
 			}
 			if bytes.Equal(bytes.TrimSpace(ev.data), []byte("[DONE]")) {
+				terminalSeen = true
 				continue
+			}
+			if isResponsesTerminalEventName(ev.name) || isResponsesTerminalEventName(eventTypeOf(ev.data)) {
+				terminalSeen = true
 			}
 			var evMap map[string]interface{}
 			if len(ev.data) > 0 && ev.data[0] == '{' {
@@ -386,6 +424,22 @@ func (h *Handler) streamNativeResponses(w http.ResponseWriter, r *http.Request, 
 				drainChan(chunks)
 				log.Warn().Str("model", model).Str("provider", providerID).Msg("client disconnected during native responses stream before first byte")
 				h.logRequestExtendedBodies(ctx, keyPrefix, providerID, model, "responses", 499, time.Since(start).Milliseconds(), 0, 0, 0, true, nil, nil)
+				res.committed = true
+				return res
+			}
+			resp.Body.Close()
+			drainChan(chunks)
+			if terminalSeen {
+				// The terminal event already went out: the turn completed and
+				// the client hung up on its own terms. Log it as the success it
+				// was instead of a 499 mid-stream failure.
+				if len(pending) > 0 {
+					harvestFrame(pending)
+					pending = nil
+				}
+				cost := h.costForModel(model, streamSplit(promptTok, completionTok, liveDetail))
+				h.recordUsage(keyPrefix, r, promptTok+completionTok, cost)
+				h.logRequestStreamed(ctx, keyPrefix, providerID, model, "responses", resp.StatusCode, time.Since(start).Milliseconds(), ttftMs, promptTok, completionTok, cost, sample.Bytes(), capture, "bypass", liveDetail)
 				res.committed = true
 				return res
 			}
@@ -1099,6 +1153,20 @@ func (h *Handler) pumpResponsesFromStream(w http.ResponseWriter, r *http.Request
 		typ, _ := m["type"].(string)
 
 		if isAnthropicUpstream {
+			// Harvest the cache split for PRICING, not just for the log row.
+			// harvestAnthropicTokens folds cache_read/cache_creation into the
+			// prompt count, and streamSplit prices (prompt - cacheRead -
+			// cacheWrite) at the input rate — so without the detail here every
+			// cached token was billed at full price (~9x over-charge for a
+			// cache-heavy agentic turn) while the row's cache columns read 0.
+			if _, _, d := extractUsageDetailFromMap(m); d.CacheRead > 0 || d.CacheWrite > 0 {
+				if d.CacheRead > streamDetail.CacheRead {
+					streamDetail.CacheRead = d.CacheRead
+				}
+				if d.CacheWrite > streamDetail.CacheWrite {
+					streamDetail.CacheWrite = d.CacheWrite
+				}
+			}
 			switch typ {
 			case "message_start", "message_delta":
 				pt, ct := harvestAnthropicTokens(data)

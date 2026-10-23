@@ -211,7 +211,19 @@ type ProviderModel struct {
 	// Image marks an image-generation model (see CatalogModel).
 	Image bool `json:"image"`
 	// Video marks a video-generation model (see CatalogModel).
-	Video        bool    `json:"video"`
+	Video bool `json:"video"`
+	// ImageOnly / VideoOnly separate a PURE generator (barred from the text
+	// endpoints) from a model that also chats, so a client can offer the right
+	// models per mode. They are computed from the same helpers the /v1/models
+	// payload uses (imagegen.ImageOnlyFromModalities / videogen.…).
+	//
+	// They are on THIS struct because /api/provider-models is what the dashboard
+	// reads: it previously exposed only Image/Video, so the Playground's
+	// `image_only`/`video_only` predicates were permanently false and every text
+	// picker offered sora-2 / veo-* / imagen-*, which the gateway then rejected
+	// with a 400.
+	ImageOnly    bool    `json:"image_only"`
+	VideoOnly    bool    `json:"video_only"`
 	AvgTTFTMs    float64 `json:"avg_ttft_ms,omitempty"`
 	AvgTPS       float64 `json:"avg_tps,omitempty"`
 	RequestCount int     `json:"request_count,omitempty"`

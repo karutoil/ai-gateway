@@ -125,11 +125,14 @@ func clientIP(r *http.Request) string {
 
 // AccountFromLoginBody extracts the username from a JSON login-shaped body so
 // the same limiter can protect login/passkey/recovery endpoints.
+//
+// The Content-Type is deliberately IGNORED: the login handler decodes the body
+// as JSON regardless of the declared type, so gating this on
+// `Content-Type: application/json` handed an attacker a way to switch the
+// per-ACCOUNT brake off entirely (send `text/plain`, keep the JSON body) and
+// fall back to the per-IP limit — the one defence that a spoofed
+// X-Forwarded-For or a botnet defeats. Parse what the handler will parse.
 func AccountFromLoginBody(r *http.Request) string {
-	ct := r.Header.Get("Content-Type")
-	if ct != "" && !strings.Contains(ct, "json") {
-		return ""
-	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		return ""

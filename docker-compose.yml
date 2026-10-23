@@ -32,7 +32,9 @@ services:
       context: .
     image: ai-gateway:local
     ports:
-      - "8080:8080"
+      # Bound to loopback: the dashboard is an admin surface and must be reached
+      # through the reverse proxy/tunnel, not published on every interface.
+      - "127.0.0.1:8080:8080"
     env_file:
       - path: .env.example
         required: false
@@ -40,6 +42,15 @@ services:
         required: false
     environment:
       PORT: 8080
+      # REQUIRED: no default admin password. `.env.example` used to ship
+      # `ADMIN_PASSWORD=change-me`, and because it is the first env_file it was
+      # always present — `docker compose up` booted the dashboard with a known
+      # password on every interface. `${VAR:?}` makes compose refuse to start
+      # until the operator sets one.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env (see .env.example)}
+      # Production semantics: enables the password/secret strength checks and
+      # disables dev-only conveniences.
+      ENV: production
       # Postgres primary (recommended). Override with sqlite via
       #   DATABASE_URL=/data/gateway.db
       # in .env if you ever need the file-backed fallback.
@@ -90,11 +101,14 @@ services:
   postgres:
     image: docker.io/library/postgres:17-alpine
     ports:
-      - "5433:5432"
+      # Loopback only. This published 0.0.0.0:5433 with the password `gateway`,
+      # i.e. an internet-reachable database for anyone who ran the documented
+      # compose stack on a public host. The gateway reaches it over the compose
+      # network, so host publishing exists only for psql/migration convenience.
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_USER: gateway
       POSTGRES_DB: gateway
-      # Dev default only — set POSTGRES_PASSWORD in .env for anything shared.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
     volumes:
       - pgdata:/var/lib/postgresql/data

@@ -227,12 +227,16 @@ func convertMessages(in map[string]any, runtime string) (system []string, conten
 			}
 		case "assistant":
 			parts := []map[string]any{}
+			// stringContent already walks a []any content array and concatenates
+			// every text/input_text part, so this single branch covers BOTH
+			// shapes. The old code then ALSO ran contentArrayTexts over the same
+			// array, appending every assistant text a second time: every
+			// /v1/messages and /v1/responses multi-turn request (and any chat
+			// request whose assistant content is an array, which every OpenAI SDK
+			// produces after a tool round) sent each prior answer twice —
+			// confusing continuations and double-billing the inflated prompt.
 			if t := stringContent(m["content"]); strings.TrimSpace(t) != "" {
 				parts = append(parts, map[string]any{"text": t})
-			}
-			// content array with text parts
-			for _, p := range contentArrayTexts(m["content"]) {
-				parts = append(parts, map[string]any{"text": p})
 			}
 			for _, tc := range asSlice(m["tool_calls"]) {
 				tcm, _ := tc.(map[string]any)

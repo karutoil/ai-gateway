@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import {
   Card, Button, Input, Field, Badge, Icon, CopyButton, Modal, Confirm, EmptyState,
-  Eyebrow, TableShell, Th, Td, TableSkeleton, useToast,
+  Eyebrow, TableShell, Th, Td, TableSkeleton, useToast, ErrorNote,
 } from '../components/ui'
 
 type Pat = {
@@ -24,6 +24,7 @@ type Pat = {
 export default function ProfileTokens() {
   const toast = useToast()
   const [tokens, setTokens] = useState<Pat[]>([])
+  const [err, setErr] = useState('')
   const [loading, setLoading] = useState(true)
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
@@ -32,7 +33,12 @@ export default function ProfileTokens() {
   const [created, setCreated] = useState<{ secret: string; name: string } | null>(null)
   const [revokeTarget, setRevokeTarget] = useState<Pat | null>(null)
 
-  const load = () => api.profile.tokens().then((t: any) => setTokens(Array.isArray(t) ? t : [])).catch(() => setTokens([])).finally(() => setLoading(false))
+  // A failed fetch must not look like "you have no tokens": that reads as "my
+  // CI token was already deleted". Surface the error and keep the list empty.
+  const load = () => api.profile.tokens()
+    .then((t: any) => { setTokens(Array.isArray(t) ? t : []); setErr('') })
+    .catch((e: any) => setErr(e?.message || 'failed to load tokens'))
+    .finally(() => setLoading(false))
 
   useEffect(() => { load() }, [])
 
@@ -91,6 +97,7 @@ export default function ProfileTokens() {
         </Button>
       </div>
 
+      {err && <ErrorNote message={err} />}
       {loading ? (
         <TableShell>
           <TableSkeleton rows={3} cols={6} />

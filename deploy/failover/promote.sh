@@ -74,7 +74,23 @@ else
   echo "No standby.signal: already primary (or not a replica)"
 fi
 
-ENV_FILE="/etc/ai-gateway/env"
+# The gateway's env file has TWO spellings in this stack: the failover tooling
+# (this script, sync-gateway.sh, podman-compose.standby.yml) uses
+# /etc/ai-gateway/env, while the shipped systemd unit reads
+# /etc/ai-gateway.env. Rewriting only one of them left the promoted service
+# pointed at the dead primary through the old tunnel while this script printed
+# success — the outage simply continued. Resolve the file the running service
+# actually reads, and update every existing copy so both deployment shapes work.
+ENV_FILES=()
+for candidate in /etc/ai-gateway.env /etc/ai-gateway/env; do
+  if sudo test -f "$candidate"; then
+    ENV_FILES+=("$candidate")
+  fi
+done
+if [[ ${#ENV_FILES[@]} -eq 0 ]]; then
+  ENV_FILES=("/etc/ai-gateway.env")
+fi
+ENV_FILE="${ENV_FILES[0]}"
 if sudo grep -q "^DATABASE_URL=postgres" "$ENV_FILE" 2>/dev/null; then
   # Reuse the gateway DB password already in the env; only retarget the host.
   # The password is never passed on any command line (no ps/argv exposure):
@@ -86,16 +102,28 @@ if sudo grep -q "^DATABASE_URL=postgres" "$ENV_FILE" 2>/dev/null; then
     REPL_FILE="$(mktemp)"
     printf 'DATABASE_URL=postgres://gateway:%s@localhost:%s/gateway?sslmode=disable\n' "$GW_PW" "$PGPORT" >"$REPL_FILE"
     NEW_ENV="$(mktemp)"
-    if sudo cat "$ENV_FILE" | awk -v replfile="$REPL_FILE" '
-      BEGIN { line = ""; have = 0; while ((getline l < replfile) > 0) { line = l; have = 1 } }
-      have != 1 { exit 3 }
-      /^DATABASE_URL=/ { print line; replaced = 1; next }
-      { print }
-      END { if (replaced != 1) exit 4 }
-    ' >"$NEW_ENV"; then
-      sudo cp "$NEW_ENV" "$ENV_FILE"
-      sudo chmod 600 "$ENV_FILE"
-      echo "DATABASE_URL now points at local promoted primary (port $PGPORT)"
+    rewrote=0
+    for target in "${ENV_FILES[@]}"; do
+      if ! sudo grep -q "^DATABASE_URL=postgres" "$target" 2>/dev/null; then
+        continue
+      fi
+      if sudo cat "$target" | awk -v replfile="$REPL_FILE" '
+        BEGIN { line = ""; have = 0; while ((getline l < replfile) > 0) { line = l; have = 1 } }
+        have != 1 { exit 3 }
+        /^DATABASE_URL=/ { print line; replaced = 1; next }
+        { print }
+        END { if (replaced != 1) exit 4 }
+      ' >"$NEW_ENV"; then
+        sudo cp "$NEW_ENV" "$target"
+        sudo chmod 600 "$target"
+        rewrote=$((rewrote + 1))
+      else
+        echo "Could not rewrite $target; fix DATABASE_URL manually:" >&2
+        echo "  DATABASE_URL=postgres://gateway:<password>@localhost:$PGPORT/gateway?sslmode=disable" >&2
+      fi
+    done
+    if [[ "$rewrote" -gt 0 ]]; then
+      echo "DATABASE_URL now points at local promoted primary (port $PGPORT) in: ${ENV_FILES[*]}"
     else
       echo "Could not rewrite $ENV_FILE; fix DATABASE_URL manually:" >&2
       echo "  DATABASE_URL=postgres://gateway:<password>@localhost:$PGPORT/gateway?sslmode=disable" >&2
@@ -111,10 +139,29 @@ else
 fi
 
 echo "Restarting gateway"
-systemctl restart ai-gateway 2>/dev/null || podman restart ai-gateway-prod 2>/dev/null || true
-sleep 3
-if ! curl -fsS http://localhost:8090/health && ! curl -fsS http://localhost:8080/health; then
-  echo "promote: gateway health check failed — check service logs" >&2
+if ! systemctl restart ai-gateway 2>/dev/null; then
+  podman restart ai-gateway-prod 2>/dev/null || {
+    echo "promote: could not restart the gateway service — promotion FAILED" >&2
+    exit 1
+  }
+fi
+
+# Wait for the promoted gateway to actually serve. A promotion that leaves
+# nothing answering is a failed promotion, and it MUST exit non-zero: the
+# watchdog writes its "promoted" marker (which suppresses all further attempts)
+# only when this script succeeds, so exiting 0 here marked a dead standby as
+# handled and the outage silently continued.
+ready=0
+for _ in $(seq 1 30); do
+  if curl -fsS http://localhost:8090/health >/dev/null 2>&1 || curl -fsS http://localhost:8080/health >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$ready" != 1 ]]; then
+  echo "promote: gateway did not become healthy within 60s — promotion FAILED (check: journalctl -u ai-gateway)" >&2
+  exit 1
 fi
 echo
 # Dedicated ai-gateway tunnel: safe to start here (ingress covers only the

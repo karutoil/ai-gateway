@@ -287,6 +287,14 @@ WorkingDirectory=${dir}
 ExecStart=${dir}/gateway
 Restart=on-failure
 RestartSec=3
+# Drain invariant (deploy/README.md §1):
+#   TimeoutStopSec > SHUTDOWN_GRACE_SECONDS >= IMAGE_TIMEOUT_SECONDS
+# The gateway drains in-flight work for SHUTDOWN_GRACE_SECONDS (written into the
+# generated .env as 330) and an image generation may take IMAGE_TIMEOUT_SECONDS
+# (300). systemd's DEFAULT is 90s, which equals the binary's default grace and is
+# a third of the image budget: every `systemctl restart` would SIGKILL a running
+# generation and lose its billing row. 360 leaves 30s of slack.
+TimeoutStopSec=360
 # The gateway loads .env from its own directory and persists state under
 # WorkingDirectory; everything else can stay read-only.
 NoNewPrivileges=true
@@ -337,16 +345,37 @@ find_gateway_pids() { # find_gateway_pids <dir> -> space-separated pids
   printf '%s' "$pids"
 }
 
-# stop_gateway_processes <dir> — TERM, wait, then KILL if still alive
+# stop_gateway_processes <dir> — TERM, wait out the DRAIN window, then KILL.
+#
+# The wait used to be a fixed 10 seconds, which is shorter than a single
+# streaming completion and a fraction of the 300s image budget: `install.sh
+# update` (the documented upgrade path) truncated every in-flight request, and
+# because the process was SIGKILLed after database.Close() the request_logs
+# billing row was never written while the provider had already charged for it.
+# The window is now read from the installed .env so it tracks the operator's
+# configuration, with the same 330s default the installer writes.
 stop_gateway_processes() {
-  local pids pid
+  local pids pid grace
   pids="$(find_gateway_pids "$1")"
   [ -n "$pids" ] || return 0
+  grace=330
+  if [ -r "$1/.env" ]; then
+    local configured
+    configured="$(grep -E '^SHUTDOWN_GRACE_SECONDS=' "$1/.env" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')"
+    case "$configured" in
+      ''|*[!0-9]*) : ;;
+      *) grace="$configured" ;;
+    esac
+  fi
+  # +30s of slack so the binary's own drain finishes before we escalate.
+  local deadline=$((grace + 30))
   # shellcheck disable=SC2086
   kill -TERM $pids 2>/dev/null || true
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  local waited=0
+  while [ "$waited" -lt "$deadline" ]; do
     [ -z "$(find_gateway_pids "$1")" ] && return 0
     sleep 1
+    waited=$((waited + 1))
   done
   pids="$(find_gateway_pids "$1")"
   # shellcheck disable=SC2086
@@ -428,6 +457,16 @@ CORS_ALLOWED_ORIGINS=${cors}
 DATABASE_URL=${database_url}
 # Optional Redis for shared cache + rate limiting: redis://host:6379
 REDIS_URL=${redis_url}
+
+# Drain invariant (deploy/README.md §1):
+#   TimeoutStopSec (360, in the unit) > SHUTDOWN_GRACE_SECONDS >= IMAGE_TIMEOUT_SECONDS
+# An image generation may take IMAGE_TIMEOUT_SECONDS, so the drain window must be
+# at least that long or every restart truncates a running generation and loses
+# its billing row. These were previously absent, leaving 90 == 90 < 300.
+SHUTDOWN_GRACE_SECONDS=330
+IMAGE_TIMEOUT_SECONDS=300
+# Max buffered client request body; 0 disables the cap.
+#MAX_PROXY_BODY_MB=64
 
 # Debug/observability
 LOG_BODIES=${log_bodies}

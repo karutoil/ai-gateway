@@ -104,8 +104,10 @@ sub-router with the same chain, because a browser refresh on the dashboard's
 `serveWeb`.
 
 - `forwardedHeaders` honors `X-Forwarded-*` / `CF-Connecting-IP` **only** from loopback peers or `TRUSTED_PROXIES` CIDRs (`"*"` = trust all). Rate limiting and logging see the real client IP.
+- A dashboard session JWT is accepted on the proxy plane only if its role carries `proxy:use` (`admin`/`support`/`member`); `readonly` is refused. Session spend is attributed per user and can be capped with `SESSION_MONTHLY_BUDGET_USD`.
+- `X-Gateway-MCP-Round` is **not** a client-settable control: the gateway-side MCP tool loop marks its internal rounds in the request *context* (`proxy.withMCPRound`), never in a header.
 - Rate limiting: in-memory `middleware.RateLimiter` uses **fixed-window buckets** with atomic all-windows-pass admission; when `REDIS_URL` is set, `RedisRateLimiter` (INCR+TTL sliding-window variant) shares the same windows across replicas and falls back to memory on Redis errors.
-- `audit.Middleware` writes an audit row for every mutating `/api/*` request (actor from the verified JWT subject or gateway-key prefix — `X-Actor` headers are never trusted) and fans out to the webhook sink.
+- `audit.Middleware` writes an audit row for every **authenticated, non-401/403** mutating `/api/*` request (actor from the verified JWT subject or gateway-key prefix — `X-Actor` headers are never trusted, and the verified identity is handed up through `auth.WithActorBox` because the auth middleware sits below it in the chain) and fans out to the webhook sink. Unauthenticated probes are not audited, so the trail is not free to flood.
 - `securityHeaders` sets nosniff / DENY / no-referrer / baseline CSP.
 - CORS: permissive `*` by default (tunnel/dev convenience); `PUBLIC_URL` or `CORS_ALLOWED_ORIGINS` lock it down, and production refuses wildcard.
 
@@ -113,7 +115,7 @@ sub-router with the same chain, because a browser refresh on the dashboard's
 
 ## Data Model
 
-Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 034_request_client.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). The highest embedded version is reported by `db.LatestMigrationVersion()`. Highlights:
+Authoritative DDL lives in `internal/db/migrations/001_initial.sql … 037_mcp_key_configured.sql` (embedded, applied at boot through `schema_migrations`; a failed migration marks the version **dirty** and boot aborts until an operator intervenes). The highest embedded version is reported by `db.LatestMigrationVersion()`. Highlights:
 
 - `providers` (AES-GCM `api_key_enc`, `base_url`, `health_status`, optional `org_id`)
 - `gateway_keys` (prefix + SHA256 hash, RPM/RPH/RPD/TPM, daily/monthly token & cost limits, `allowed_models`, optional `org_id`)

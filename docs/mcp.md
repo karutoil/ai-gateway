@@ -236,12 +236,32 @@ listed on the MCP Servers page; `GET /api/mcp/calls` returns them as JSON.
 | `MCP_CALL_TIMEOUT_SECONDS` | `90` | Timeout for one connect/list/call and for one LLM round inside the loop. |
 | `MCP_LOOP_TIMEOUT_SECONDS` | `600` | Total budget for the gateway-side loop. |
 | `MCP_HEALTH_INTERVAL_SECONDS` | `60` | Background probe/reconnect interval. |
+| `MCP_STDIO_ENABLED` | `false` | Allow `stdio`-transport servers, which spawn a local binary as the gateway user. Even when enabled, only a **global admin** may create one. |
+| `MCP_ALLOW_PRIVATE_UPSTREAMS` | `false` in production | Allow server URLs that resolve to loopback / RFC1918 / link-local / cloud-metadata addresses. Off in production (SSRF guard); on outside production so a local sidecar works. |
 
 No extra secret is needed: MCP credentials use `MASTER_KEY`, the same AES-GCM
 key that protects provider API keys.
 
 ## 7. Security notes
 
+- `env` / `headers` are **tri-state** on update: omit the field to keep the
+  stored blob, send `{}` to clear it. A blank `auth_value` keeps the stored
+  credential. (An update used to write NULL over both blobs, so renaming a
+  server destroyed its `GITHUB_TOKEN` and static auth headers irrecoverably.)
+- A spawned `stdio` server inherits only an allowlist of harmless process
+  variables (PATH/HOME/locale/proxy/cache), minus anything credential-shaped.
+  It never sees `MASTER_KEY`, `JWT_SECRET`, `DATABASE_URL` or the provider keys
+  in the gateway's environment — a third-party `npx -y @vendor/…-mcp` package is
+  freshly downloaded code and must not be able to exfiltrate them.
+- Revoking every grant from a key denies everything. "No grant rows" and "never
+  configured" used to be indistinguishable, and an unconfigured key is allowed
+  every enabled tool — so "revoke all" granted the widest possible access.
+- Grants are re-checked at **call time**, so an edit takes effect on live
+  sessions instead of only on the next `initialize`.
+- A tool call is retried only on a genuine transport error (`io.EOF`,
+  `ECONNRESET`, `net.Error`, …). Matching on the error *text* retried upstream
+  tool failures that merely mentioned "session" or "closed", duplicating
+  committed side effects.
 - Credentials are encrypted at rest and never serialized to the dashboard; the
   API only reports *whether* a credential is configured (`has_auth`,
   `has_headers`, `has_env`).

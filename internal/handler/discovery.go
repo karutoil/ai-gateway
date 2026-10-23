@@ -6,9 +6,11 @@ import (
 	"net/http"
 
 	"ai-gateway/internal/discovery"
+	"ai-gateway/internal/imagegen"
 	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/models"
 	"ai-gateway/internal/rbac"
+	"ai-gateway/internal/videogen"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -43,6 +45,25 @@ func (h *DiscoveryHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	if list == nil {
 		list = []models.ProviderModel{}
+	}
+	// Derive the capability flags the dashboard needs to keep pure generators out
+	// of the text modes. Computed here (not stored) so a catalog/modality change
+	// is reflected immediately; the helpers are the same ones /v1/models uses.
+	for i := range list {
+		if list[i].Image {
+			if list[i].Modalities != "" {
+				list[i].ImageOnly = imagegen.ImageOnlyFromModalities(list[i].Modalities)
+			} else {
+				list[i].ImageOnly = imagegen.IsImageOnlyModel(list[i].ModelID)
+			}
+		}
+		if list[i].Video {
+			if list[i].Modalities != "" {
+				list[i].VideoOnly = videogen.VideoOnlyFromModalities(list[i].Modalities)
+			} else {
+				list[i].VideoOnly = videogen.IsVideoOnlyModel(list[i].ModelID)
+			}
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"data": list, "total": len(list)})

@@ -126,23 +126,59 @@ func (h *AdminHandler) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 // Logout clears the HttpOnly session cookie client-side control cannot
-// remove. Token remains valid until expiry (stateless JWT) but revocation on
-// credential changes covers the abuse window.
+// remove, and revokes the session server-side.
+//
+// SECURITY: this route is registered in the PUBLIC part of the router (it must
+// work with an expired/just-cleared token), so no auth middleware ever put a
+// subject in the request context and the revocation below was dead code — the
+// "logged out" JWT stayed valid for its full 24h TTL on both the dashboard and
+// the proxy plane. The subject is therefore resolved from the token itself.
 func (h *AdminHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	// Resolve the subject BEFORE clearing the cookie.
+	subject := auth.GetSubject(r)
+	if subject == "" {
+		subject = h.subjectFromSessionToken(r)
+	}
 	clearSessionCookie(w, r)
-	// Best-effort session revocation: bump the user's token_version so the
-	// just-logged-out JWT (and any copies) stop working on both the dashboard
-	// and the proxy plane, instead of living until expiry. Stateless-JWT
-	// logouts previously only cleared the cookie.
-	if h.UserStore != nil {
-		if subject := auth.GetSubject(r); subject != "" {
-			if u, _, err := h.UserStore.GetByUsername(subject); err == nil {
-				_ = h.UserStore.BumpTokenVersion(u.ID)
+	// Bump the user's token_version so the just-logged-out JWT (and any
+	// copies) stop working on both the dashboard and the proxy plane,
+	// instead of living until expiry.
+	if h.UserStore != nil && subject != "" {
+		if u, _, err := h.UserStore.GetByUsername(subject); err == nil && u != nil {
+			if err := h.UserStore.BumpTokenVersion(u.ID); err != nil {
+				log.Warn().Err(err).Str("user", subject).Msg("logout: session revocation failed")
 			}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// subjectFromSessionToken returns the verified subject of the caller's session
+// token (bearer or gw_token cookie), or "" when absent/invalid. Verification
+// is signature-based only: an already-revoked or expired token yields "" and
+// there is nothing left to revoke.
+func (h *AdminHandler) subjectFromSessionToken(r *http.Request) string {
+	tok := ""
+	if hdr := r.Header.Get("Authorization"); strings.HasPrefix(hdr, "Bearer ") {
+		tok = strings.TrimSpace(strings.TrimPrefix(hdr, "Bearer "))
+	}
+	if tok == "" {
+		if c, err := r.Cookie(SessionCookieName); err == nil {
+			tok = c.Value
+		}
+	}
+	if tok == "" || h.Config == nil {
+		return ""
+	}
+	claims, err := auth.VerifyToken(h.Config.JWTSecret, tok)
+	if err != nil {
+		return ""
+	}
+	if sub, ok := claims["sub"].(string); ok {
+		return sub
+	}
+	return ""
 }
 
 func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -296,6 +332,30 @@ func (h *AdminHandler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 		role = "admin"
 	}
 
+	// ADMISSION: only auto-provision subjects the operator has allowed.
+	//
+	// OIDC verification proves the token came from the configured issuer; it
+	// says nothing about whether that person should have a gateway account.
+	// Without a gate, pointing OIDC_ISSUER at a self-service or corporate IdP
+	// meant anyone who could obtain a token from it (every employee, every
+	// contractor, every self-registered user of a public tenant) self-provisioned
+	// a `member` — and `member` carries keys:create/rotate/delete/limits,
+	// providers:write, mcp:write and logs:read_bodies. An allowlist is the only
+	// thing between "has an account somewhere" and "can read every stored
+	// prompt and mint gateway keys".
+	//
+	// Existing dashboard users are always admitted (an operator created them
+	// deliberately). New subjects must match OIDC_ALLOWED_SUBJECTS or
+	// OIDC_ALLOWED_DOMAINS, and when neither is set, provisioning is REFUSED
+	// (fail closed) — an unset allowlist must not mean "everyone".
+	if getErr != nil {
+		if !h.oidcSubjectAllowed(subject, claims) {
+			log.Warn().Str("subject", subject).Msg("OIDC login refused: subject is not in the allowlist")
+			httperr.Forbidden(w, "this identity is not permitted to use the gateway (set OIDC_ALLOWED_SUBJECTS or OIDC_ALLOWED_DOMAINS)")
+			return
+		}
+	}
+
 	if getErr != nil {
 		// Auto-provision with an unguessable unusable password hash.
 		pwSeed, _ := auth.RandomSecret()
@@ -321,6 +381,51 @@ func (h *AdminHandler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	setSessionCookie(w, r, token)
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
+}
+
+// oidcSubjectAllowed reports whether a NEW OIDC subject may be auto-provisioned.
+//
+// Rules, all server-side:
+//   - OIDC_ALLOWED_SUBJECTS: exact (case-insensitive) subject match.
+//   - OIDC_ALLOWED_DOMAINS: the email claim's domain must match, and the token
+//     must assert email_verified (a domain gate over an unverified email is
+//     trivially spoofable by an IdP tenant that lets users set their own email).
+//   - Neither configured: REFUSE. Failing closed is deliberate; an unset
+//     allowlist previously meant "any subject from the issuer".
+func (h *AdminHandler) oidcSubjectAllowed(subject string, claims map[string]any) bool {
+	subjects := strings.TrimSpace(os.Getenv("OIDC_ALLOWED_SUBJECTS"))
+	domains := strings.TrimSpace(os.Getenv("OIDC_ALLOWED_DOMAINS"))
+	if subjects == "" && domains == "" {
+		return false
+	}
+	for _, s := range strings.Split(subjects, ",") {
+		if strings.EqualFold(strings.TrimSpace(s), subject) {
+			return true
+		}
+	}
+	if domains == "" {
+		return false
+	}
+	email, _ := claims["email"].(string)
+	if email == "" {
+		return false
+	}
+	// Require a verified email when the domain gate is the admission criterion.
+	if verified, ok := claims["email_verified"].(bool); ok && !verified {
+		return false
+	}
+	at := strings.LastIndex(email, "@")
+	if at < 0 || at == len(email)-1 {
+		return false
+	}
+	emailDomain := strings.ToLower(strings.TrimSpace(email[at+1:]))
+	for _, d := range strings.Split(domains, ",") {
+		d = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(d), "@"))
+		if d != "" && emailDomain == d {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveScope returns the org scope for the request and whether it may
@@ -356,6 +461,20 @@ func (h *AdminHandler) globalScopeAllowed() bool {
 		return true
 	}
 	return cnt == 0
+}
+
+// isGlobalAdmin reports whether the caller is an admin whose token carries NO
+// org claim. This is the codebase's definition of "global admin" (see
+// requireWriteTarget's orgID=="" branch, providerInCallerScope and
+// TestAdminOrgScopeSymmetry): an admin whose JWT carries an org claim is a
+// TENANT admin and is confined to that org for every org-scoped resource.
+//
+// Creation handlers must use this instead of `role != "admin"`: with the role
+// check alone, a tenant admin's POST /api/providers (or /api/keys) accepted a
+// client-supplied org_id and planted a provider or key in ANOTHER org — the
+// exact boundary requireWriteTarget enforces on PUT/DELETE for the same rows.
+func isGlobalAdmin(r *http.Request) bool {
+	return auth.GetRole(r) == rbac.RoleAdmin && auth.GetOrgID(r) == ""
 }
 
 // requireWriteTarget enforces ownership of an id-addressed resource for
@@ -428,14 +547,13 @@ func (h *AdminHandler) CreateProvider(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "name or base_url too long")
 		return
 	}
-	// Tenant-scoped callers may only create providers inside their own org —
-	// client-supplied org_id values are overridden by the verified claim for
-	// non-admins (a member of org A must not plant providers in org B). Only
-	// admins may create global (unscoped) providers or target another org.
-	if auth.GetRole(r) != "admin" {
+	// Tenant-scoped callers — INCLUDING admins whose token carries an org claim —
+	// may only create providers inside their own org. Only a global admin may
+	// create a global (unscoped) provider or target another org.
+	if !isGlobalAdmin(r) {
 		body.OrgID = auth.GetOrgID(r)
 	}
-	if body.OrgID == "" && auth.GetRole(r) != "admin" {
+	if body.OrgID == "" && !isGlobalAdmin(r) {
 		httperr.Forbidden(w, "org scope required")
 		return
 	}
@@ -650,32 +768,47 @@ func (h *AdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 // RotateKey regenerates a key's secret in place. Permission model:
-// holders of keys:rotate may rotate any key; callers with only
-// keys:read_own may rotate **their own** keys (the requested feature —
-// a user can rotate credentials assigned to them without broader access).
-// The old secret keeps authenticating for a short grace window.
+// holders of keys:rotate may rotate any key **within their org**; callers
+// with only keys:read_own may rotate **their own** keys (the requested
+// feature — a user can rotate credentials assigned to them without broader
+// access). The old secret keeps authenticating for a short grace window.
+//
+// SECURITY: rotation returns a live plaintext `sk-gw-…` secret, so it is a
+// WRITE on the key, not a read. It previously had no org predicate at all:
+// `keys:rotate` is a default for the `member` role, so any ordinary dashboard
+// user could POST another tenant's (or the admin's) key id and walk away with
+// a working credential for that tenant's provider spend. Every other key
+// route enforces requireWriteTarget; this one now enforces the same tenancy.
 func (h *AdminHandler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
 	// Resolve the key first so ownership scoping can apply.
-	var createdBy string
-	err := h.DB.QueryRow(db.Q(`SELECT COALESCE(created_by,'') FROM gateway_keys WHERE id=? AND revoked_at IS NULL`), id).Scan(&createdBy)
+	var createdBy, keyOrgID string
+	err := h.DB.QueryRow(db.Q(`SELECT COALESCE(created_by,''), COALESCE(org_id,'') FROM gateway_keys WHERE id=? AND revoked_at IS NULL`), id).Scan(&createdBy, &keyOrgID)
 	if err != nil {
-		http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
+		httperr.NotFound(w, "key not found")
 		return
 	}
 
-	// Permission resolution: keys:rotate = any key; else keys:read_own
-	// restricts to keys the caller created. RequireAnyPerm guarantees one.
+	// Permission resolution: keys:rotate = any key in the caller's org; else
+	// keys:read_own restricts to keys the caller created. RequireAnyPerm
+	// guarantees the caller holds at least one of the two.
 	role := auth.GetRole(r)
 	perms := auth.GetPerms(r)
 	if role != "admin" {
 		if perms == nil {
 			perms = rbac.Defaults(role)
 		}
+		// Tenant isolation first: an org-scoped caller may only rotate keys
+		// that belong to their org. A caller with no org claim is
+		// single-tenant and is governed by the created_by rule below.
+		if callerOrg := auth.GetOrgID(r); callerOrg != "" && keyOrgID != callerOrg {
+			httperr.NotFound(w, "key not found")
+			return
+		}
 		if !rbac.Has(perms, rbac.PermKeysRotate) {
 			if !rbac.Has(perms, rbac.PermKeysReadOwn) || createdBy == "" || createdBy != h.callerUserID(r) {
-				http.Error(w, `{"error":"forbidden: you can only rotate your own keys"}`, http.StatusForbidden)
+				httperr.Forbidden(w, "you can only rotate your own keys")
 				return
 			}
 		}
@@ -747,14 +880,14 @@ func (h *AdminHandler) CreateKey(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, "name too long (max 64)")
 		return
 	}
-	// Same cross-org guard as CreateProvider: non-admins always get their own
-	// verified claim org; admins may target any org or global. Unscoped
-	// creation (no org claim) is allowed only while the deployment has no
-	// organizations — same contract as resolveScope's single-tenant mode.
-	if auth.GetRole(r) != "admin" {
+	// Same cross-org guard as CreateProvider: a tenant-scoped caller (including
+	// a tenant ADMIN) always gets its own verified claim org; only a global admin
+	// may target another org or create a global key. Unscoped creation is allowed
+	// only while the deployment has no organizations (single-tenant mode).
+	if !isGlobalAdmin(r) {
 		body.OrgID = auth.GetOrgID(r)
 	}
-	if body.OrgID == "" && auth.GetRole(r) != "admin" && !h.globalScopeAllowed() {
+	if body.OrgID == "" && !isGlobalAdmin(r) && !h.globalScopeAllowed() {
 		httperr.Forbidden(w, "org scope required")
 		return
 	}
@@ -1795,7 +1928,9 @@ func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
 	// billing export webhook (Phase 3): emit audit-style webhook for exports
 	if webhook.Global != nil {
 		webhook.Global.Emit("billing.export", map[string]any{
-			"actor":  "admin",
+			// The ACTUAL caller, not a literal: a keys:read_own user exporting
+			// billing data must not be recorded as "admin did it".
+			"actor":  auth.GetSubject(r),
 			"action": "export",
 			"range":  r.URL.Query().Get("range"),
 			"path":   r.URL.Path,
@@ -1826,10 +1961,14 @@ func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
 	if scopeSQL != "" {
 		scopeAll = " AND " + scopeSQL
 	}
+	// Bounded like /api/logs/export: an unbounded export over a 30-day window on
+	// a busy gateway holds one DB connection and an open cursor for minutes,
+	// streams to a client that may already be gone, and (on SQLite) blocks the
+	// single writer the /v1 path needs. The +1 row detects truncation.
 	if orgID != "" {
-		rows, err = h.DB.Query(db.Q(`SELECT rl.id, rl.key_prefix, rl.provider_id, rl.model, rl.endpoint, rl.status, rl.latency_ms, rl.created_at, rl.prompt_tokens, rl.completion_tokens, rl.total_tokens, rl.cost_usd FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE p.org_id=? AND rl.created_at >= ?`+scopeAll+` ORDER BY rl.created_at DESC`), append([]any{orgID, start}, scopeArgs...)...)
+		rows, err = h.DB.Query(db.Q(`SELECT rl.id, rl.key_prefix, rl.provider_id, rl.model, rl.endpoint, rl.status, rl.latency_ms, rl.created_at, rl.prompt_tokens, rl.completion_tokens, rl.total_tokens, rl.cost_usd FROM request_logs rl JOIN providers p ON rl.provider_id=p.id WHERE p.org_id=? AND rl.created_at >= ?`+scopeAll+` ORDER BY rl.created_at DESC LIMIT ?`), append(append([]any{orgID, start}, scopeArgs...), logsExportMaxRows+1)...)
 	} else {
-		rows, err = h.DB.Query(db.Q(`SELECT id, key_prefix, provider_id, model, endpoint, status, latency_ms, created_at, prompt_tokens, completion_tokens, total_tokens, cost_usd FROM request_logs WHERE created_at >= ?`+scopeAll+` ORDER BY created_at DESC`), append([]any{start}, scopeArgs...)...)
+		rows, err = h.DB.Query(db.Q(`SELECT id, key_prefix, provider_id, model, endpoint, status, latency_ms, created_at, prompt_tokens, completion_tokens, total_tokens, cost_usd FROM request_logs WHERE created_at >= ?`+scopeAll+` ORDER BY created_at DESC LIMIT ?`), append(append([]any{start}, scopeArgs...), logsExportMaxRows+1)...)
 	}
 	if err != nil {
 		http.Error(w, `{"error":"query failed"}`, http.StatusInternalServerError)
@@ -1839,15 +1978,16 @@ func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", "attachment; filename=\"billing-"+rangeStr+".csv\"")
 	w.WriteHeader(http.StatusOK)
-	// RFC 4180 quoting: model names / error-ish fields may contain commas.
-	q := func(s string) string {
-		if strings.ContainsAny(s, ",\"\n") {
-			return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
-		}
-		return s
-	}
 	w.Write([]byte("id,key_prefix,provider_id,model,endpoint,status,latency_ms,created_at,prompt_tokens,completion_tokens,total_tokens,cost_usd\n"))
+	written := 0
+	skipped := 0
 	for rows.Next() {
+		if written >= logsExportMaxRows {
+			// In-band trailer: a CSV comment most parsers skip, plus the count,
+			// so a consumer can tell "exactly N rows" from "truncated at N".
+			w.Write([]byte(fmt.Sprintf("# truncated at %d rows\n", logsExportMaxRows)))
+			break
+		}
 		var id, keyPrefix, providerID, model, endpoint string
 		var createdAt sql.NullTime
 		var status int
@@ -1856,14 +1996,30 @@ func (h *AdminHandler) BillingExport(w http.ResponseWriter, r *http.Request) {
 		var costUSD float64
 		// DATETIME columns must scan into time values; scanning into string
 		// errors on every row and previously shipped header-only CSVs.
-		if err := rows.Scan(&id, &keyPrefix, &providerID, &model, &endpoint, &status, &latencyMs, &createdAt, &promptTokens, &completionTokens, &totalTokens, &costUSD); err == nil {
-			ts := ""
-			if createdAt.Valid {
-				ts = createdAt.Time.UTC().Format(time.RFC3339)
-			}
-			line := fmt.Sprintf("%s,%s,%s,%s,%s,%d,%d,%s,%d,%d,%d,%.6f\n",
-				q(id), q(keyPrefix), q(providerID), q(model), q(endpoint), status, latencyMs, ts, promptTokens, completionTokens, totalTokens, costUSD)
-			w.Write([]byte(line))
+		if err := rows.Scan(&id, &keyPrefix, &providerID, &model, &endpoint, &status, &latencyMs, &createdAt, &promptTokens, &completionTokens, &totalTokens, &costUSD); err != nil {
+			// A silently skipped row is a silently wrong invoice. Count them and
+			// report at the end rather than pretending the export is complete.
+			skipped++
+			continue
 		}
+		ts := ""
+		if createdAt.Valid {
+			ts = createdAt.Time.UTC().Format(time.RFC3339)
+		}
+		line := fmt.Sprintf("%s,%s,%s,%s,%s,%d,%d,%s,%d,%d,%d,%.6f\n",
+			csvQuote(id), csvQuote(keyPrefix), csvQuote(providerID), csvQuote(model), csvQuote(endpoint), status, latencyMs, ts, promptTokens, completionTokens, totalTokens, costUSD)
+		// Stop as soon as the client is gone: continuing to pull rows from an
+		// open cursor after a write failure pins the connection for nothing.
+		if _, werr := w.Write([]byte(line)); werr != nil {
+			return
+		}
+		written++
+	}
+	if rerr := rows.Err(); rerr != nil {
+		log.Warn().Err(rerr).Msg("billing export: row iteration failed")
+	}
+	if skipped > 0 {
+		log.Warn().Int("skipped", skipped).Msg("billing export: rows skipped due to scan errors")
+		w.Write([]byte(fmt.Sprintf("# %d rows skipped (scan error)\n", skipped)))
 	}
 }

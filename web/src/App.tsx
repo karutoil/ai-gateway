@@ -19,6 +19,7 @@ import WebhooksPage from './pages/Webhooks'
 import Audit from './pages/Audit'
 import Profile from './pages/Profile'
 import { authenticatePasskey } from './lib/webauthn'
+import { clearTranscript, scopeTranscript } from './lib/playground/persist'
 import { extractApiError } from './lib/api'
 import { requestSearchFocus } from './lib/searchFocus'
 import { setCurrentPermissions, can, type Perm } from './lib/permissions'
@@ -52,12 +53,15 @@ function useAuth() {
   }, [])
 
   useEffect(() => {
-    const onUnauthorized = () => { setUser(null); setCurrentPermissions(null, '') }
+    const onUnauthorized = () => { clearTranscript(); setUser(null); setCurrentPermissions(null, '') }
     window.addEventListener('gw:unauthorized', onUnauthorized)
     return () => window.removeEventListener('gw:unauthorized', onUnauthorized)
   }, [])
 
   const applyIdentity = (u: Partial<SessionUser>|undefined) => {
+    // Bind the Playground transcript store to this account BEFORE the
+    // Playground mounts, so restore() can never read another user's history.
+    scopeTranscript(u?.username || '')
     setUser({ username: u?.username || '', role: u?.role || '', permissions: u?.permissions })
     setCurrentPermissions((u?.permissions as Perm[] | undefined) ?? null, u?.role || '')
   }
@@ -92,6 +96,10 @@ function useAuth() {
 
   const logout = (message?: string) => {
     fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(()=>{})
+    // The Playground transcript is raw conversation text persisted to
+    // localStorage; clearing the cookie does not clear it, so the next account on
+    // this workstation would inherit the previous user's prompts and answers.
+    clearTranscript()
     setUser(null)
     setNotice(message || '')
   }

@@ -11,6 +11,7 @@ import (
 	"ai-gateway/internal/auth"
 	"ai-gateway/internal/config"
 	"ai-gateway/internal/httperr"
+	"ai-gateway/internal/middleware"
 	"ai-gateway/internal/pat"
 	"ai-gateway/internal/rbac"
 	"ai-gateway/internal/user"
@@ -27,14 +28,22 @@ type UsersHandler struct {
 }
 
 func (h *UsersHandler) Routes(r chi.Router) {
-	r.Get("/admin/users", h.ListUsers)
-	r.Post("/admin/users", h.CreateUser)
+	// Every route carries an explicit RequirePerm so the RBAC middleware
+	// resolves (and caches in context) the caller's EFFECTIVE permission set.
+	// Without it `auth.GetPerms` was nil and requirePermFor fell back to role
+	// DEFAULTS, silently ignoring per-user grants and revokes — an admin who
+	// revoked users:write from a compromised account saw no effect here.
+	//
+	// /admin/users/me is deliberately ungated beyond authentication: every
+	// signed-in user must be able to read their own profile.
+	r.With(middleware.RequirePerm(rbac.PermUsersRead)).Get("/admin/users", h.ListUsers)
+	r.With(middleware.RequirePerm(rbac.PermUsersWrite)).Post("/admin/users", h.CreateUser)
 	r.Get("/admin/users/me", h.GetMe)
-	r.Get("/admin/users/{id}/permissions", h.GetUserPermissions)
-	r.Put("/admin/users/{id}/permissions", h.PutUserPermissions)
-	r.Put("/admin/users/{id}", h.UpdateUser)
-	r.Delete("/admin/users/{id}", h.DeleteUser)
-	r.Post("/admin/users/{id}/reset-password", h.ResetPassword)
+	r.With(middleware.RequirePerm(rbac.PermUsersRead)).Get("/admin/users/{id}/permissions", h.GetUserPermissions)
+	r.With(middleware.RequirePerm(rbac.PermUsersWrite)).Put("/admin/users/{id}/permissions", h.PutUserPermissions)
+	r.With(middleware.RequirePerm(rbac.PermUsersWrite)).Put("/admin/users/{id}", h.UpdateUser)
+	r.With(middleware.RequirePerm(rbac.PermUsersWrite)).Delete("/admin/users/{id}", h.DeleteUser)
+	r.With(middleware.RequirePerm(rbac.PermUsersWrite)).Post("/admin/users/{id}/reset-password", h.ResetPassword)
 }
 
 // requirePermFor checks one permission against the caller's effective set,
@@ -228,6 +237,22 @@ func (h *UsersHandler) PutUserPermissions(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// audit writes an attributable row for a user-management action. Unlike the
+// generic audit middleware (which only sees the HTTP verb and the path), this
+// records WHICH account was touched and WHAT changed — the only record that
+// answers "which account did the attacker create or reset".
+func (h *UsersHandler) audit(r *http.Request, action, targetID string, meta map[string]any) {
+	if h.Recorder == nil {
+		return
+	}
+	actor := auth.GetSubject(r)
+	if actor == "" {
+		actor = auth.GetRole(r)
+	}
+	b, _ := json.Marshal(meta)
+	_ = h.Recorder.Log(actor, action, "user", targetID, string(b))
+}
+
 func (h *UsersHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	if !requirePermFor(r, "users:write") {
 		http.Error(w, `{"error":"forbidden: admin only"}`, http.StatusForbidden)
@@ -259,6 +284,10 @@ func (h *UsersHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		httperr.Invalid(w, err.Error())
 		return
 	}
+	// Explicit audit row: the generic audit middleware only records the HTTP
+	// verb and the path, so "who created which account, with what role" — the
+	// one thing an operator needs after an account is abused — was absent.
+	h.audit(r, "user.create", u.ID, map[string]any{"username": u.Username, "role": u.Role})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(u)
@@ -338,6 +367,20 @@ func (h *UsersHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
+	changed := map[string]any{"username": u.Username}
+	if body.Role != nil {
+		changed["role"] = *body.Role
+	}
+	if body.Disabled != nil {
+		changed["disabled"] = *body.Disabled
+	}
+	if body.Password != nil && *body.Password != "" {
+		changed["password_reset"] = true
+	}
+	if body.DisplayName != nil {
+		changed["display_name"] = true
+	}
+	h.audit(r, "user.update", id, changed)
 	json.NewEncoder(w).Encode(u)
 	if body.Disabled != nil && *body.Disabled {
 		emitWebhook("user.disabled", map[string]any{
@@ -376,10 +419,15 @@ func (h *UsersHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"cannot delete last admin"}`, http.StatusBadRequest)
 		return
 	}
+	username := ""
+	if target, err := h.Store.GetByID(id); err == nil && target != nil {
+		username = target.Username
+	}
 	if err := h.Store.Delete(id); err != nil {
 		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
 		return
 	}
+	h.audit(r, "user.delete", id, map[string]any{"username": username})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -401,6 +449,13 @@ func (h *UsersHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"failed"}`, http.StatusInternalServerError)
 		return
 	}
+	// A password reset is the highest-value account action in the system; it
+	// must be attributable by name, not just by "put /api/admin/users/<uuid>".
+	username := ""
+	if target, err := h.Store.GetByID(id); err == nil && target != nil {
+		username = target.Username
+	}
+	h.audit(r, "user.reset_password", id, map[string]any{"username": username})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }

@@ -2063,6 +2063,486 @@ paths:
                   duration_ms: { type: integer }
         '403': { description: 'Tool is not available to this key on that server' }
         '502': { description: 'The upstream MCP server failed' }
+  # ---------------------------------------------------------------------------
+  # Webhook endpoints. A webhook URL embeds its delivery credential
+  # (Slack/Discord/Teams), so this surface is gated on settings:write for READ
+  # as well as write — see internal/handler/webhooks.go.
+  # ---------------------------------------------------------------------------
+  /api/webhooks:
+    get:
+      summary: List webhook endpoints (settings:write — the URL is a credential)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: webhook endpoints
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Webhook' }
+        '403': { description: settings:write required }
+    post:
+      summary: Create a webhook endpoint (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, url]
+              properties:
+                name: { type: string, maxLength: 128 }
+                url: { type: string, maxLength: 2048, description: http(s) only }
+                events: { type: string, example: "key.created,billing.over_quota", description: 'comma-separated event names' }
+                format: { type: string, enum: [json, discord, slack], default: json }
+                secret: { type: string, description: 'HMAC signing secret; response X-Webhook-Signature' }
+                enabled: { type: boolean, default: true }
+      responses:
+        '201': { description: created }
+        '400': { description: invalid name/url/events/format }
+  /api/webhooks/{id}:
+    put:
+      summary: Update a webhook endpoint (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                url: { type: string }
+                events: { type: string }
+                format: { type: string, enum: [json, discord, slack] }
+                secret: { type: string }
+                enabled: { type: boolean }
+      responses:
+        '200': { description: updated }
+        '404': { description: not found }
+    delete:
+      summary: Delete a webhook endpoint (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '404': { description: not found }
+  /api/webhooks/{id}/test:
+    post:
+      summary: Send a test delivery to one webhook endpoint
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'delivery attempted; body reports the upstream status' }
+        '404': { description: not found }
+
+  # ---------------------------------------------------------------------------
+  # MCP server registry (operator-facing). Each mutation requires mcp:write;
+  # stdio-transport servers additionally require a GLOBAL admin and
+  # MCP_STDIO_ENABLED=true, because they execute a local binary as the gateway
+  # user (see handler.requireStdioAllowed).
+  # ---------------------------------------------------------------------------
+  /api/mcp/servers:
+    get:
+      summary: List MCP servers visible to the caller's org
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: servers (env/headers/auth values are never returned)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MCPServer' }
+    post:
+      summary: Register an MCP server (audited)
+      description: |
+        Validates and stores a server, then discovers its tools. `env` and
+        `headers` are encrypted at rest and are write-only. A `stdio` transport
+        spawns `command` with `args` as the gateway user and is refused unless
+        the caller is a global admin and MCP_STDIO_ENABLED=true.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MCPServerInput' }
+      responses:
+        '201': { description: created }
+        '400': { description: invalid payload, or stdio disabled on this deployment }
+        '403': { description: 'stdio requires a global admin; or org scope required' }
+  /api/mcp/servers/{id}:
+    get:
+      summary: Get one MCP server
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: server }
+        '404': { description: 'not found, or outside the caller''s org' }
+    put:
+      summary: Update an MCP server (audited)
+      description: |
+        `env` / `headers` are tri-state: omit the field to keep the stored blob,
+        send `{}` to clear it. A blank `auth_value` keeps the stored credential.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MCPServerInput' }
+      responses:
+        '200': { description: updated }
+        '403': { description: 'stdio requires a global admin' }
+        '404': { description: not found }
+    delete:
+      summary: Delete an MCP server and its key grants (audited)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '404': { description: not found }
+  /api/mcp/servers/{id}/enable:
+    post:
+      summary: Enable an MCP server
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: enabled }
+        '404': { description: not found }
+  /api/mcp/servers/{id}/disable:
+    post:
+      summary: Disable an MCP server (its tools disappear from /mcp for every key)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: disabled }
+        '404': { description: not found }
+  /api/mcp/servers/{id}/test:
+    post:
+      summary: Connect to the server and report health
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'health result (up/down plus the last error)' }
+        '404': { description: not found }
+  /api/mcp/servers/{id}/discover:
+    post:
+      summary: Re-run tool discovery for one server
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'discovered tool count' }
+        '404': { description: not found }
+  /api/mcp/servers/{id}/tools:
+    get:
+      summary: List the tools one server exposes
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: tools }
+        '404': { description: not found }
+  /api/mcp/tools:
+    get:
+      summary: List every tool across the servers visible to the caller
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: tools }
+  /api/mcp/status:
+    get:
+      summary: MCP subsystem status (server counts, health, bridge limits)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: status }
+  /api/mcp/calls:
+    get:
+      summary: Recent gateway-side MCP tool calls (bounded, newest first)
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        '200': { description: calls }
+  /api/keys/{id}/mcp:
+    get:
+      summary: Per-key MCP grants, expanded to every server in scope
+      description: |
+        Returns each server the caller can see with its grant state, so the UI can
+        render an allowlist editor in one call. Org-scoped callers only see their
+        own org's servers and keys (404 otherwise).
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'key_id, explicit, servers[]' }
+        '403': { description: org scope required }
+        '404': { description: 'key not in the caller''s org' }
+    put:
+      summary: Replace a key's MCP grants (audited)
+      description: 'Grants take effect immediately, including on live /mcp sessions.'
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grants:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      server_id: { type: string }
+                      enabled: { type: boolean }
+                      allowed_tools: { type: array, items: { type: string }, description: 'empty = every tool on that server' }
+      responses:
+        '200': { description: updated }
+        '404': { description: 'key not in the caller''s org' }
+  /api/keys/{id}/rotate:
+    post:
+      summary: Rotate a key secret (audited)
+      description: |
+        Returns a NEW plaintext `sk-gw-…` secret exactly once. The previous secret
+        keeps authenticating for a grace window so callers can roll over.
+        Requires keys:rotate within the key's org, or keys:read_own for a key the
+        caller created.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: new secret plus grace window
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: { type: string, example: sk-gw-… }
+                  prefix: { type: string }
+                  grace_window: { type: string, example: 24h0m0s }
+                  note: { type: string }
+        '403': { description: forbidden }
+        '404': { description: 'key not found, or outside the caller''s org' }
+  /api/keys/{id}/owner:
+    put:
+      summary: Reassign a key's owner (audited)
+      description: Sets `created_by`, which is what keys:read_own scoping compares.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string, nullable: true, description: 'null/empty clears the owner' }
+      responses:
+        '200': { description: updated }
+        '404': { description: not found }
+
+  # ---------------------------------------------------------------------------
+  # Profile, personal access tokens, organizations, analytics.
+  # ---------------------------------------------------------------------------
+  /api/profile/tokens:
+    get:
+      summary: List the caller's personal access tokens (never the secret)
+      tags: [profile]
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: tokens }
+    post:
+      summary: Create a personal access token
+      description: |
+        Returns the `gwp_…` secret ONCE. `scopes` can only NARROW the caller's own
+        permissions, never exceed them.
+      tags: [profile]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                expires_days: { type: integer, description: 'omit for no expiry' }
+                scopes: { type: string, description: 'comma-separated permission names' }
+      responses:
+        '201': { description: created, includes the secret once }
+        '400': { description: invalid name/scopes }
+  /api/profile/tokens/{id}:
+    delete:
+      summary: Revoke a personal access token
+      tags: [profile]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: revoked }
+        '404': { description: 'not found, or not the caller''s token' }
+
+  /api/orgs/{id}/members:
+    get:
+      summary: List an organization's memberships
+      description: |
+        Tenant-scoped: a non-admin sees only its own org (404 for any other), so
+        another tenant's user ids and roles are not enumerable.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: memberships }
+        '404': { description: 'not found, or outside the caller''s org' }
+    post:
+      summary: Add a user to an organization (audited)
+      description: Bumps the user's token_version so the new org claim is minted.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, role]
+              properties:
+                user_id: { type: string }
+                role: { type: string, example: member }
+      responses:
+        '201': { description: created }
+        '400': { description: invalid user_id/role }
+  /api/orgs/{id}:
+    delete:
+      summary: Delete an organization (audited)
+      description: |
+        Revokes the org's gateway keys, disables its providers, deletes the
+        memberships and bumps every affected user's token_version. Keys are NOT
+        promoted to global — deleting a tenant ends its access.
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted }
+        '404': { description: not found }
+
+  /api/analytics/cost:
+    get:
+      summary: Cost breakdown over a window
+      tags: [analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: range, in: query, schema: { type: string, enum: [24h, 7d, 30d], default: 7d } }
+        - { name: key_prefix, in: query, schema: { type: string } }
+        - { name: provider_id, in: query, schema: { type: string } }
+      responses:
+        '200': { description: 'totals plus per-day / per-model / per-provider series' }
+  /api/analytics/performance:
+    get:
+      summary: Latency and throughput over a window
+      tags: [analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: range, in: query, schema: { type: string, enum: [24h, 7d, 30d], default: 7d } }
+      responses:
+        '200': { description: 'p50/p95/p99 latency, TTFB, error rate, throughput' }
+  /api/analytics/attribution:
+    get:
+      summary: Spend and traffic grouped by end_user / app / client
+      tags: [analytics]
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: range, in: query, schema: { type: string, enum: [24h, 7d, 30d], default: 7d } }
+      responses:
+        '200': { description: 'attribution rows' }
+
+  /api/providers/test:
+    post:
+      summary: Test a provider credential without saving it
+      tags: [admin]
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [base_url]
+              properties:
+                type: { type: string, description: provider type; defaults to an OpenAI-compatible probe }
+                base_url: { type: string }
+                api_key: { type: string }
+      responses:
+        '200': { description: 'reachable plus a model count or the upstream error' }
+        '400': { description: invalid base_url }
+
+  /openapi.yaml:
+    get:
+      summary: This document (embedded in the binary)
+      security: []
+      responses:
+        '200': { description: 'the OpenAPI 3 document' }
+
+  /provider-models:
+    get:
+      summary: Provider model inventory for the dashboard (gateway-key auth)
+      description: |
+        Unlike /api/provider-models this is the PUBLIC-plane alias served to the
+        UI; it returns the same rows including the derived `image_only` /
+        `video_only` capability flags.
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: models }
+  /provider-models/excluded:
+    get:
+      summary: Models the operator excluded from discovery
+      security: [{ gatewayKey: [] }]
+      responses:
+        '200': { description: excluded models }
+
 components:
   responses:
     LBRuleSaved:
@@ -2093,6 +2573,69 @@ components:
       name: gw_token
       description: 'HttpOnly dashboard session cookie (set by /api/auth/login, /api/auth/oidc and the passkey flows). Accepted on /api/* in place of the Bearer JWT for dashboard-origin calls; cross-site mutations must pass the CSRF origin check.'
   schemas:
+    Webhook:
+      type: object
+      description: |
+        A registered webhook endpoint. `url` embeds its delivery credential, so
+        this object requires settings:write to read.
+      properties:
+        id: { type: string }
+        name: { type: string }
+        url: { type: string }
+        events: { type: string }
+        format: { type: string, enum: [json, discord, slack] }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        last_status: { type: string, nullable: true }
+        last_fired_at: { type: string, format: date-time, nullable: true }
+    MCPServer:
+      type: object
+      description: |
+        An MCP server registration as returned by the API. `env`, `headers` and
+        the auth value are encrypted at rest and are never echoed back — only the
+        `has_env` / `has_headers` booleans are.
+      properties:
+        id: { type: string }
+        name: { type: string }
+        slug: { type: string }
+        transport: { type: string, enum: [http, sse, stdio] }
+        url: { type: string, nullable: true }
+        command: { type: string, nullable: true }
+        args: { type: array, items: { type: string } }
+        auth_type: { type: string, enum: [none, bearer, header, query] }
+        auth_header: { type: string, nullable: true }
+        has_env: { type: boolean }
+        has_headers: { type: boolean }
+        enabled: { type: boolean }
+        tool_count: { type: integer }
+        health_status: { type: string, enum: [unknown, up, down] }
+        last_error: { type: string, nullable: true }
+        org_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    MCPServerInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        slug: { type: string, description: 'derived from name when omitted; must be unique' }
+        transport: { type: string, enum: [http, sse, stdio], default: http }
+        url: { type: string, description: 'required for http/sse' }
+        command: { type: string, description: 'required for stdio' }
+        args: { type: array, items: { type: string } }
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: 'encrypted at rest; write-only. Omit on update to keep the stored blob, send {} to clear'
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: 'encrypted at rest; write-only. Same tri-state as env'
+        auth_type: { type: string, enum: [none, bearer, header, query] }
+        auth_header: { type: string }
+        auth_value: { type: string, description: 'write-only; blank on update keeps the stored credential' }
+        enabled: { type: boolean, default: true }
+        org_id: { type: string, description: 'global admins only; a tenant-scoped caller is pinned to its own org' }
     LBRule:
       type: object
       required: [model, providers]

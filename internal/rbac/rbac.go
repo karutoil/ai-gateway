@@ -64,6 +64,15 @@ const (
 
 	// Gateway-wide settings
 	PermSettingsWrite = "settings:write"
+
+	// Proxy plane (the /v1/* spend surface).
+	//
+	// This exists because a dashboard session JWT is accepted on /v1/*: without
+	// a permission gate, a `readonly` account could open the Playground (or
+	// replay its session cookie) and spend the operator's provider money on the
+	// most expensive model, with no per-user budget to stop it. Read-only means
+	// read-only.
+	PermProxyUse = "proxy:use"
 )
 
 // All is the full catalog. Order is presentation order for the UI.
@@ -78,6 +87,7 @@ var All = []string{
 	PermMCPRead, PermMCPWrite,
 	PermAuditRead,
 	PermSettingsWrite,
+	PermProxyUse,
 }
 
 // Valid reports whether p is a known catalog entry. Unknown permissions must
@@ -119,6 +129,7 @@ var roleDefaults = map[string]map[string]bool{
 		PermLogsRead, PermLogsReadBodies, PermAnalyticsRead,
 		PermCatalogRead, PermOrgsRead,
 		PermMCPRead, PermMCPWrite,
+		PermProxyUse,
 	),
 
 	RoleMember: set(
@@ -127,6 +138,7 @@ var roleDefaults = map[string]map[string]bool{
 		PermLogsRead, PermLogsReadBodies, PermAnalyticsRead,
 		PermCatalogRead, PermOrgsRead,
 		PermMCPRead, PermMCPWrite,
+		PermProxyUse,
 	),
 
 	RoleReadonly: set(

@@ -407,7 +407,7 @@ export default function McpServers() {
 
   const endpoint = useMemo(() => `${origin || ''}/mcp`, [origin])
 
-  const formToPayload = (f: FormState) => {
+  const formToPayload = (f: FormState, opts?: { editing?: boolean; hadEnv?: boolean; hadHeaders?: boolean }) => {
     const payload: Record<string, unknown> = {
       name: f.name.trim(),
       slug: f.slug.trim(),
@@ -415,12 +415,18 @@ export default function McpServers() {
       url: f.url.trim(),
       command: f.command.trim(),
       args: f.argsText.split('\n').map((l) => l.trim()).filter(Boolean),
-      env: parseKV(f.envText),
-      headers: parseKV(f.headersText),
       auth_type: f.authType,
       auth_header: f.authHeader.trim(),
       enabled: f.enabled,
     }
+    // env / headers are WRITE-ONLY secrets: the API never returns them, so the
+    // edit form starts blank. Omitting the field entirely means "keep what is
+    // stored"; sending {} means "clear it". Sending {} on an unrelated edit
+    // (a rename) would destroy the server's token and static headers.
+    const envEmpty = f.envText.trim() === ''
+    const headersEmpty = f.headersText.trim() === ''
+    if (!opts?.editing || !envEmpty) payload.env = parseKV(f.envText)
+    if (!opts?.editing || !headersEmpty) payload.headers = parseKV(f.headersText)
     if (f.authValue) payload.auth_value = f.authValue
     return payload
   }
@@ -462,7 +468,7 @@ export default function McpServers() {
     if (!editTarget) return
     setSaving(true)
     try {
-      await api.mcp.update(editTarget.id, formToPayload(form))
+      await api.mcp.update(editTarget.id, formToPayload(form, { editing: true }))
       toast.success('MCP server updated — reconnecting…')
       setEditTarget(null)
       await load()
